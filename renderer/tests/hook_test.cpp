@@ -1,12 +1,15 @@
 // hook_test: exercises the inline hook engine in-process on a naked x86
 // function that starts with the same prologue as FUN_0046e630
-// (push ebp / mov ebp,esp / sub esp,42Ch) and uses the same __fastcall ABI.
+// (push ebp / mov ebp,esp / sub esp,42Ch) and uses the same __fastcall ABI,
+// plus pure unit tests for ParseFilterMode and ComputeLetterboxViewport.
 #include <windows.h>
 
 #include <cstdio>
 #include <cstring>
 
 #include "../src/hook.h"
+#include "../src/config.h"
+#include "../src/presenter.h"
 
 namespace {
 
@@ -99,6 +102,34 @@ int main() {
           "RemoveHook restores the original prologue bytes");
     Check(call(1, 2, 3) == 6, "unhooked call executes original directly");
     Check(g_detourCalls == 1, "detour is not called after RemoveHook");
+
+    // Filter parsing unit tests (T3b hardening).
+    FilterMode mode = FilterMode::Bilinear;
+    Check(ParseFilterMode(L"nearest", mode) && mode == FilterMode::Nearest,
+          "ParseFilterMode('nearest') -> Nearest");
+    Check(ParseFilterMode(L"BILINEAR", mode) && mode == FilterMode::Bilinear,
+          "ParseFilterMode('BILINEAR') -> Bilinear");
+    Check(ParseFilterMode(L"Sharp-Bilinear", mode) && mode == FilterMode::SharpBilinear,
+          "ParseFilterMode('Sharp-Bilinear') -> SharpBilinear");
+    Check(!ParseFilterMode(L"invalid-filter", mode) && mode == FilterMode::Bilinear,
+          "ParseFilterMode('invalid-filter') returns false and defaults to Bilinear");
+
+    // Letterbox viewport math unit tests (T3b hardening).
+    const LetterboxViewport vp1080 = ComputeLetterboxViewport(640, 480, 1920, 1080);
+    Check(vp1080.x == 240 && vp1080.y == 0 && vp1080.width == 1440 && vp1080.height == 1080,
+          "ComputeLetterboxViewport(640x480 -> 1920x1080) == {240, 0, 1440, 1080}");
+
+    const LetterboxViewport vp1024 = ComputeLetterboxViewport(640, 480, 1280, 1024);
+    Check(vp1024.x == 0 && vp1024.y == 32 && vp1024.width == 1280 && vp1024.height == 960,
+          "ComputeLetterboxViewport(640x480 -> 1280x1024) == {0, 32, 1280, 960}");
+
+    const LetterboxViewport vpNative = ComputeLetterboxViewport(640, 480, 640, 480);
+    Check(vpNative.x == 0 && vpNative.y == 0 && vpNative.width == 640 && vpNative.height == 480,
+          "ComputeLetterboxViewport(640x480 -> 640x480) == {0, 0, 640, 480}");
+
+    const LetterboxViewport vpZero = ComputeLetterboxViewport(640, 480, 0, 0);
+    Check(vpZero.width == 1 && vpZero.height == 1,
+          "ComputeLetterboxViewport(640x480 -> 0x0) clamps to width=1, height=1");
 
     std::printf("%s (%d failure(s))\n", g_failures == 0 ? "OK" : "FAILED", g_failures);
     return g_failures == 0 ? 0 : 1;

@@ -57,6 +57,8 @@ Status: completed; verified with forward_test, hook_test, check_hook_sites, and 
 
 ## B3: Draw-list capture (task T4)
 
+Status: completed; verified with forward_test, hook_test, check_hook_sites, verify_frame_dump --self-test, and live game run (Capture.Enabled=0 leaves capture hooks uninstalled).
+
 - **Goal:** hook `FUN_004688e0` (quad list) and the cel placement path (`FUN_0046d790`, `FUN_00422630`, `FUN_004227f0`). Record per frame: draw order, full-precision 16.16 corners (before snapping), texture pointer + PDAT header, UV box, mip info, flags, clip rect. Find every code path that writes to the 8bpp framebuffer *outside* the rasterizer (horizon blit, HUD, bikes, dashboard, text). Add a hotkey (F11) that dumps the current frame's list to `frame_<n>.json` and the framebuffer to `frame_<n>.png`.
 - **Attach:** B2 output; decomp excerpts of `FUN_004688e0`, `FUN_0042e850`, `FUN_0042e4d0`, `FUN_0046d790`, `FUN_00422630`, `FUN_004227f0`, `FUN_00422b40`, `FUN_0045ac50` (race frame) and its callees list; CCB struct notes.
 - **Review checks:** a dumped frame JSON re-rendered by a Python script matches the framebuffer PNG (drawn-pixel coverage within tolerance); a list of non-rasterizer writers with function addresses.

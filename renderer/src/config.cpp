@@ -29,15 +29,22 @@ static LogLevel ParseLogLevel(const wchar_t* str) {
     return LogLevel::Info;
 }
 
-static FilterMode ParseFilterMode(const wchar_t* str) {
+bool ParseFilterMode(const wchar_t* str, FilterMode& outMode) {
     std::wstring s = ToLowerTrimmed(str);
     if (s == L"nearest" || s == L"point") {
-        return FilterMode::Nearest;
+        outMode = FilterMode::Nearest;
+        return true;
+    }
+    if (s == L"bilinear" || s == L"linear") {
+        outMode = FilterMode::Bilinear;
+        return true;
     }
     if (s == L"sharp-bilinear" || s == L"sharp_bilinear" || s == L"sharpbilinear") {
-        return FilterMode::SharpBilinear;
+        outMode = FilterMode::SharpBilinear;
+        return true;
     }
-    return FilterMode::Bilinear;
+    outMode = FilterMode::Bilinear;
+    return false;
 }
 
 const char* FilterModeToString(FilterMode mode) {
@@ -65,10 +72,22 @@ void ConfigInit(const std::wstring& iniFilePath) {
 
     wchar_t filterBuf[64] = {0};
     GetPrivateProfileStringW(L"Presenter", L"Filter", generalFilterBuf, filterBuf, 64, iniFilePath.c_str());
-    g_config.filter = ParseFilterMode(filterBuf);
+    if (!ParseFilterMode(filterBuf, g_config.filter)) {
+        g_config.unknownFilterWarning = true;
+        g_config.rawFilterString = filterBuf;
+    } else {
+        g_config.unknownFilterWarning = false;
+        g_config.rawFilterString.clear();
+    }
 
     UINT vsyncVal = GetPrivateProfileIntW(L"Presenter", L"VSync", 0, iniFilePath.c_str());
     g_config.vsync = (vsyncVal != 0);
+
+    UINT captureEnabledVal = GetPrivateProfileIntW(L"Capture", L"Enabled", 0, iniFilePath.c_str());
+    g_config.captureEnabled = (captureEnabledVal != 0);
+
+    UINT autoDumpVal = GetPrivateProfileIntW(L"Capture", L"AutoDumpFrame", 0, iniFilePath.c_str());
+    g_config.captureAutoDumpFrame = static_cast<int>(autoDumpVal);
 }
 
 const Config& GetConfig() {

@@ -14,8 +14,13 @@ struct Config {
     bool presenterEnabled = true;
     FilterMode filter = FilterMode::Bilinear;
     bool vsync = false;
+    bool unknownFilterWarning = false;
+    std::wstring rawFilterString;
+    bool captureEnabled = false;
+    int captureAutoDumpFrame = 0;
 };
 
 void ConfigInit(const std::wstring& iniFilePath);
 const Config& GetConfig();
+bool ParseFilterMode(const wchar_t* str, FilterMode& outMode);
 const char* FilterModeToString(FilterMode mode);

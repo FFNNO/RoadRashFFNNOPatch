@@ -11,6 +11,28 @@
 
 using Microsoft::WRL::ComPtr;
 
+LetterboxViewport ComputeLetterboxViewport(int srcW, int srcH, int clientW, int clientH) {
+    if (srcW <= 0 || srcH <= 0 || clientW <= 0 || clientH <= 0) {
+        return {0, 0, 1, 1};
+    }
+    int vpW = clientW;
+    int vpH = clientH;
+    const int prod1 = srcW * clientH;
+    const int prod2 = srcH * clientW;
+    if (prod2 <= prod1) {
+        vpW = clientW;
+        vpH = prod2 / srcW;
+    } else {
+        vpW = prod1 / srcH;
+        vpH = clientH;
+    }
+    if (vpW < 1) vpW = 1;
+    if (vpH < 1) vpH = 1;
+    const int vpX = (clientW - vpW) / 2;
+    const int vpY = (clientH - vpH) / 2;
+    return {vpX, vpY, vpW, vpH};
+}
+
 namespace {
 
 const char* kVertexShaderSrc = R"(
@@ -82,7 +104,16 @@ struct alignas(16) PresentConstants {
 
 class D3D11Presenter {
 public:
+    static constexpr int kMaxConsecutiveFailures = 3;
+
+    bool IsLatchedOff() const {
+        return m_latchedFailure;
+    }
+
     bool Present8bpp(HWND hwnd, const uint8_t* surface, int pitch, const uint8_t* palette, int width, int height) {
+        if (m_latchedFailure) {
+            return false;
+        }
         if (!hwnd || !surface || !palette || width <= 0 || height <= 0) {
             return false;
         }
@@ -100,7 +131,7 @@ public:
         HRESULT hr = m_context->Map(m_tex8bpp.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedSurf);
         if (FAILED(hr)) {
             LOG_ERROR("D3D11 Map(tex8bpp) failed: 0x%08lX", static_cast<unsigned long>(hr));
-            return false;
+            return RecordFailure();
         }
         uint8_t* dstRows = static_cast<uint8_t*>(mappedSurf.pData);
         const uint8_t* srcRows = surface;
@@ -116,7 +147,7 @@ public:
         hr = m_context->Map(m_texPalette.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedPal);
         if (FAILED(hr)) {
             LOG_ERROR("D3D11 Map(texPalette) failed: 0x%08lX", static_cast<unsigned long>(hr));
-            return false;
+            return RecordFailure();
         }
         uint8_t* dstPal = static_cast<uint8_t*>(mappedPal.pData);
         for (int i = 0; i < 256; ++i) {
@@ -131,6 +162,9 @@ public:
     }
 
     bool PresentBgra(HWND hwnd, const uint32_t* dib, int width, int height) {
+        if (m_latchedFailure) {
+            return false;
+        }
         if (!hwnd || !dib || width <= 0 || height <= 0) {
             return false;
         }
@@ -147,7 +181,7 @@ public:
         HRESULT hr = m_context->Map(m_texBgra.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
         if (FAILED(hr)) {
             LOG_ERROR("D3D11 Map(texBgra) failed: 0x%08lX", static_cast<unsigned long>(hr));
-            return false;
+            return RecordFailure();
         }
         uint8_t* dstRows = static_cast<uint8_t*>(mapped.pData);
         const uint8_t* srcRows = reinterpret_cast<const uint8_t*>(dib);
@@ -189,10 +223,21 @@ public:
     }
 
 private:
+    bool RecordFailure() {
+        Shutdown();
+        ++m_consecutiveFailures;
+        if (!m_latchedFailure && m_consecutiveFailures >= kMaxConsecutiveFailures) {
+            m_latchedFailure = true;
+            LOG_ERROR("D3D11 presenter latched off after %d consecutive failures; staying on GDI for this session",
+                      m_consecutiveFailures);
+        }
+        return false;
+    }
+
     bool PrepareFrame(HWND hwnd, int srcW, int srcH, int& outClientW, int& outClientH) {
         RECT rc = {};
         if (!GetClientRect(hwnd, &rc)) {
-            return false;
+            return RecordFailure();
         }
         outClientW = rc.right - rc.left;
         outClientH = rc.bottom - rc.top;
@@ -203,19 +248,18 @@ private:
         if (!m_device || m_hwnd != hwnd) {
             Shutdown();
             if (!InitializeDeviceAndSwapChain(hwnd, outClientW, outClientH)) {
-                Shutdown();
-                return false;
+                return RecordFailure();
             }
         } else if (outClientW != m_backbufferWidth || outClientH != m_backbufferHeight || m_windowChangePending) {
             if (!ResizeBackbuffer(outClientW, outClientH)) {
-                return false;
+                return RecordFailure();
             }
             m_windowChangePending = false;
         }
 
         if (srcW != m_srcWidth || srcH != m_srcHeight || !m_tex8bpp || !m_texBgra) {
             if (!CreateSourceTextures(srcW, srcH)) {
-                return false;
+                return RecordFailure();
             }
         }
         return true;
@@ -478,34 +522,19 @@ private:
     }
 
     bool DrawAndPresent(int srcW, int srcH, int clientW, int clientH, bool useBgra) {
-        // Compute aspect-preserving 4:3 letterbox/pillarbox viewport matching FUN_0046e0f0
-        int vpW = clientW;
-        int vpH = clientH;
-        const int prod1 = srcW * clientH;
-        const int prod2 = srcH * clientW;
-        if (prod2 <= prod1) {
-            vpW = clientW;
-            vpH = prod2 / srcW;
-        } else {
-            vpW = prod1 / srcH;
-            vpH = clientH;
-        }
-        if (vpW < 1) vpW = 1;
-        if (vpH < 1) vpH = 1;
-        const int vpX = (clientW - vpW) / 2;
-        const int vpY = (clientH - vpH) / 2;
+        const LetterboxViewport lvp = ComputeLetterboxViewport(srcW, srcH, clientW, clientH);
 
         D3D11_MAPPED_SUBRESOURCE mappedCB = {};
         HRESULT hr = m_context->Map(m_constantBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedCB);
         if (FAILED(hr)) {
             LOG_ERROR("D3D11 Map(constantBuffer) failed: 0x%08lX", static_cast<unsigned long>(hr));
-            return false;
+            return RecordFailure();
         }
         auto* cb = static_cast<PresentConstants*>(mappedCB.pData);
         cb->srcSize[0] = static_cast<float>(srcW);
         cb->srcSize[1] = static_cast<float>(srcH);
-        cb->dstSize[0] = static_cast<float>(vpW);
-        cb->dstSize[1] = static_cast<float>(vpH);
+        cb->dstSize[0] = static_cast<float>(lvp.width);
+        cb->dstSize[1] = static_cast<float>(lvp.height);
         cb->filterMode = static_cast<uint32_t>(GetConfig().filter);
         cb->useBgra = useBgra ? 1u : 0u;
         cb->pad[0] = 0.0f;
@@ -517,10 +546,10 @@ private:
         m_context->ClearRenderTargetView(m_rtv.Get(), clearBlack);
 
         D3D11_VIEWPORT vp = {};
-        vp.TopLeftX = static_cast<FLOAT>(vpX);
-        vp.TopLeftY = static_cast<FLOAT>(vpY);
-        vp.Width = static_cast<FLOAT>(vpW);
-        vp.Height = static_cast<FLOAT>(vpH);
+        vp.TopLeftX = static_cast<FLOAT>(lvp.x);
+        vp.TopLeftY = static_cast<FLOAT>(lvp.y);
+        vp.Width = static_cast<FLOAT>(lvp.width);
+        vp.Height = static_cast<FLOAT>(lvp.height);
         vp.MinDepth = 0.0f;
         vp.MaxDepth = 1.0f;
         m_context->RSSetViewports(1, &vp);
@@ -546,13 +575,14 @@ private:
         const UINT syncInterval = GetConfig().vsync ? 1u : 0u;
         hr = m_swapChain->Present(syncInterval, 0);
         if (hr == DXGI_STATUS_OCCLUDED) {
+            m_consecutiveFailures = 0;
             return true;
         }
         if (FAILED(hr)) {
             LOG_ERROR("SwapChain::Present failed: 0x%08lX", static_cast<unsigned long>(hr));
-            Shutdown();
-            return false;
+            return RecordFailure();
         }
+        m_consecutiveFailures = 0;
         return true;
     }
 
@@ -562,6 +592,8 @@ private:
     int m_srcWidth = 0;
     int m_srcHeight = 0;
     bool m_windowChangePending = false;
+    int m_consecutiveFailures = 0;
+    bool m_latchedFailure = false;
 
     ComPtr<ID3D11Device> m_device;
     ComPtr<ID3D11DeviceContext> m_context;
@@ -589,6 +621,10 @@ bool PresenterPresent8bpp(HWND hwnd, const uint8_t* surface, int pitch, const ui
 
 bool PresenterPresentBgra(HWND hwnd, const uint32_t* dib, int width, int height) {
     return g_presenter.PresentBgra(hwnd, dib, width, height);
+}
+
+bool PresenterIsLatchedOff() {
+    return g_presenter.IsLatchedOff();
 }
 
 void PresenterNotifyWindowChange() {

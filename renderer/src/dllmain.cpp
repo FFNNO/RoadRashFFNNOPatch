@@ -6,6 +6,7 @@
 #include "config.h"
 #include "exe_identity.h"
 #include "hook_sites.h"
+#include "capture.h"
 
 static HMODULE g_hModule = nullptr;
 static HMODULE g_systemDDraw = nullptr;
@@ -62,12 +63,18 @@ static void InitializeProxy() {
         LogInit(logPath, cfg.logLevel);
 
         LOG_INFO("rr95gpu proxy ddraw.dll loaded");
-        LOG_INFO("Config: Enabled=%d, LogLevel=%d, Presenter.Enabled=%d, Filter=%s, VSync=%d",
+        if (cfg.unknownFilterWarning) {
+            LOG_WARN("Unknown Filter value '%ls' in rr95gpu.ini; defaulting to bilinear",
+                     cfg.rawFilterString.c_str());
+        }
+        LOG_INFO("Config: Enabled=%d, LogLevel=%d, Presenter.Enabled=%d, Filter=%s, VSync=%d, Capture.Enabled=%d, Capture.AutoDumpFrame=%d",
                  cfg.enabled ? 1 : 0,
                  static_cast<int>(cfg.logLevel),
                  cfg.presenterEnabled ? 1 : 0,
                  FilterModeToString(cfg.filter),
-                 cfg.vsync ? 1 : 0);
+                 cfg.vsync ? 1 : 0,
+                 cfg.captureEnabled ? 1 : 0,
+                 cfg.captureAutoDumpFrame);
 
         if (!LoadSystemDirectDraw()) {
             LOG_ERROR("Failed to initialize system DirectDraw forwarding");
@@ -88,6 +95,10 @@ static void InitializeProxy() {
 
         const char* buildName = (id.build == ExeBuild::Original) ? "Original" : "Patched";
         LOG_INFO("Detected supported game build: %s (%s)", buildName, id.sha256Hex.c_str());
+
+        if (cfg.captureEnabled) {
+            CaptureInit(GetModuleHandleW(nullptr), dir);
+        }
 
         if (InstallHooks(id.build)) {
             HMODULE pinned = nullptr;

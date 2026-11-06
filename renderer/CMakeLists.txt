@@ -24,6 +24,7 @@ add_library(ddraw SHARED
   src/hook.cpp
   src/hook_sites.cpp
   src/presenter.cpp
+  src/capture.cpp
   src/ddraw.def
 )
 set_target_properties(ddraw PROPERTIES OUTPUT_NAME "ddraw" PREFIX "")
@@ -38,10 +39,11 @@ target_compile_definitions(forward_test PRIVATE ${RR95_COMMON_DEFINITIONS}
   RR95_PROXY_PATH=L"$<TARGET_FILE:ddraw>")
 add_dependencies(forward_test ddraw)
 
-# Hook engine test (in-process, links the engine sources directly) -----------
-add_executable(hook_test tests/hook_test.cpp src/hook.cpp src/log.cpp)
+# Hook engine & pure math/config test -----------------------------------------
+add_executable(hook_test tests/hook_test.cpp src/hook.cpp src/log.cpp src/config.cpp src/presenter.cpp)
 target_compile_options(hook_test PRIVATE ${RR95_COMMON_OPTIONS})
 target_compile_definitions(hook_test PRIVATE ${RR95_COMMON_DEFINITIONS})
+target_link_libraries(hook_test PRIVATE d3d11 dxgi d3dcompiler)
 target_link_options(hook_test PRIVATE /INCREMENTAL:NO)
 
 enable_testing()
