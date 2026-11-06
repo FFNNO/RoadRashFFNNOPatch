@@ -41,7 +41,7 @@ Return complete files (not fragments) plus a short list of the exact checks you 
 
 ## B1: Proxy ddraw.dll skeleton + hook engine (task T2)
 
-Status: being written locally by Claude; skip unless that work is discarded.
+Status: completed; verified with forward_test, hook_test, check_hook_sites, and live game run.
 
 - **Goal:** CMake project `renderer/` producing a 32-bit proxy `ddraw.dll`: forwards `DirectDrawCreate` to the system DLL, `rr95gpu.ini` (`[General] Enabled, LogLevel`), `rr95gpu.log`, exe SHA-256 check, inline hook engine, and one pass-through hook on `FUN_0046e630` that logs FPS every 5 s. Includes `renderer/build.bat` and `renderer/tests/forward_test.cpp` (loads the DLL in a non-game process, expects S_OK and a "hooks skipped" log line).
 - **Attach:** decomp excerpts of `FUN_0046e630`, `FUN_00467b80` and their call sites; first 32 bytes at each hook VA from both exes.

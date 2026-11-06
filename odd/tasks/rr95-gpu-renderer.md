@@ -39,7 +39,7 @@ Local-only git repository (`mods-rr`, branch `feat/gpu-renderer`), no remote: pu
 ## Tasks
 - [x] T0 Repository setup: git repo, `.gitignore`, existing scripts and tools committed. Route: inline. Check: `git status` clean except ignored paths. Evidence: commit `08f5f66`, status clean.
 - [x] T1 Texture dump tool (`tools/texdump.py`): decode all PDAT mip chains and GLOBAL cels to PNG with stable IDs (crc32 of level-0 pixels + size) and a manifest. Route: inline (one file, understood format). Check: every PDAT found is dumped, IDs unique per content, spot-check images render recognisable buildings. Evidence: 302 unique textures (276 families, 16 global, 10 horizons) from 813 uses; contact sheet shows facades, road strips and colour-key transparency. Findings: palette is RGBx, index 0 is the colour key; horizons are 720x320 (hi) / 360x160 (lo) 8bpp, not 640x360; GLOBAL.RSC chunks are stored uncompressed (famrsc.get now validates the header).
-- [ ] T2 Proxy `ddraw.dll` skeleton: forwards `DirectDrawCreate`, logs to `rr95gpu.log`, verifies exe hash and hook-site bytes, inline hook helper. Route: delegated writer (2+ non-trivial files). Check: builds with MSVC x86; game runs unchanged with the DLL; log lists hooks.
+- [x] T2 Proxy `ddraw.dll` skeleton: forwards `DirectDrawCreate`, logs to `rr95gpu.log`, verifies exe hash and hook-site bytes, inline hook helper. Route: delegated writer (2+ non-trivial files). Check: builds with MSVC x86; game runs unchanged with the DLL; log lists hooks. Evidence: forward_test and hook_test pass; dumpbin confirms 32-bit x86 DirectDrawCreate export; check_hook_sites confirms byte match on both original and patched exes; game launches and logs detected patched build with FUN_0046e630 hook installed.
 - [ ] T3 D3D11 presenter: hook the race/menu present, upload 8bpp buffer + palette, draw with a filtered scaling shader into the window. Route: delegated writer. Check: game playable, 60 fps, image correct, toggle via config.
 - [ ] T4 Draw-list capture: record quads/cels per frame with full-precision corners, texture pointer, UVs and flags; dump one frame for analysis; identify non-rasterizer framebuffer writers (horizon, HUD, bikes). Route: delegated explorer + writer.
 - [ ] T5 GPU world rendering at 1440x1080 in engine draw order, HUD composited from the software buffer. Route: delegated writer.
@@ -56,4 +56,4 @@ Local-only git repository (`mods-rr`, branch `feat/gpu-renderer`), no remote: pu
 - 2026-11-05: Exe byte patch (sub-pixel HiRes snap + HALFTONE present) installed and confirmed by the user to improve jitter with unchanged performance.
 
 ## Next step
-T0 then T1.
+T3 D3D11 presenter (Batch B2).
