@@ -86,7 +86,8 @@ def get(d, ent):
     _, rid, off, length = ent
     raw = d[off:off+length]
     usize, csize, crc, method = struct.unpack_from('<IIII', raw, 0)
-    if method != 1: return raw, None
+    # Stored (uncompressed) chunks start directly with a chunk tag, so require a consistent header.
+    if method != 1 or csize != length - 16 or usize == 0: return raw, None
     out = explode(raw[16:16+csize])
     return out, (usize, len(out), crc, zlib.crc32(out))
 
