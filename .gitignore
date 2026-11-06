@@ -1,0 +1,20 @@
+# Copyrighted game binaries and derived analysis stay local only.
+original/
+patched/
+ghidra/
+ghidra-home/
+out/
+dumps/
+texture-pack/
+
+# Build output
+build/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+
+__pycache__/
+*.pyc
