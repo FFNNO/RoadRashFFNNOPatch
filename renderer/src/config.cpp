@@ -4,15 +4,49 @@
 
 static Config g_config;
 
-static LogLevel ParseLogLevel(const wchar_t* str) {
-    std::wstring s = str;
+static std::wstring ToLowerTrimmed(const wchar_t* str) {
+    std::wstring s = str ? str : L"";
+    size_t start = 0;
+    while (start < s.size() && std::iswspace(s[start])) {
+        ++start;
+    }
+    size_t end = s.size();
+    while (end > start && std::iswspace(s[end - 1])) {
+        --end;
+    }
+    s = s.substr(start, end - start);
     for (auto& c : s) {
         c = static_cast<wchar_t>(std::towlower(c));
     }
+    return s;
+}
+
+static LogLevel ParseLogLevel(const wchar_t* str) {
+    std::wstring s = ToLowerTrimmed(str);
     if (s == L"debug") return LogLevel::Debug;
     if (s == L"warn")  return LogLevel::Warn;
     if (s == L"error") return LogLevel::Error;
     return LogLevel::Info;
+}
+
+static FilterMode ParseFilterMode(const wchar_t* str) {
+    std::wstring s = ToLowerTrimmed(str);
+    if (s == L"nearest" || s == L"point") {
+        return FilterMode::Nearest;
+    }
+    if (s == L"sharp-bilinear" || s == L"sharp_bilinear" || s == L"sharpbilinear") {
+        return FilterMode::SharpBilinear;
+    }
+    return FilterMode::Bilinear;
+}
+
+const char* FilterModeToString(FilterMode mode) {
+    switch (mode) {
+        case FilterMode::Nearest:       return "nearest";
+        case FilterMode::Bilinear:      return "bilinear";
+        case FilterMode::SharpBilinear: return "sharp-bilinear";
+    }
+    return "bilinear";
 }
 
 void ConfigInit(const std::wstring& iniFilePath) {
@@ -22,6 +56,19 @@ void ConfigInit(const std::wstring& iniFilePath) {
     wchar_t levelBuf[64] = {0};
     GetPrivateProfileStringW(L"General", L"LogLevel", L"info", levelBuf, 64, iniFilePath.c_str());
     g_config.logLevel = ParseLogLevel(levelBuf);
+
+    UINT presenterEnabledVal = GetPrivateProfileIntW(L"Presenter", L"Enabled", 1, iniFilePath.c_str());
+    g_config.presenterEnabled = (presenterEnabledVal != 0);
+
+    wchar_t generalFilterBuf[64] = {0};
+    GetPrivateProfileStringW(L"General", L"Filter", L"bilinear", generalFilterBuf, 64, iniFilePath.c_str());
+
+    wchar_t filterBuf[64] = {0};
+    GetPrivateProfileStringW(L"Presenter", L"Filter", generalFilterBuf, filterBuf, 64, iniFilePath.c_str());
+    g_config.filter = ParseFilterMode(filterBuf);
+
+    UINT vsyncVal = GetPrivateProfileIntW(L"Presenter", L"VSync", 0, iniFilePath.c_str());
+    g_config.vsync = (vsyncVal != 0);
 }
 
 const Config& GetConfig() {

@@ -23,12 +23,13 @@ add_library(ddraw SHARED
   src/exe_identity.cpp
   src/hook.cpp
   src/hook_sites.cpp
+  src/presenter.cpp
   src/ddraw.def
 )
 set_target_properties(ddraw PROPERTIES OUTPUT_NAME "ddraw" PREFIX "")
 target_compile_options(ddraw PRIVATE ${RR95_COMMON_OPTIONS})
 target_compile_definitions(ddraw PRIVATE ${RR95_COMMON_DEFINITIONS})
-target_link_libraries(ddraw PRIVATE bcrypt)
+target_link_libraries(ddraw PRIVATE bcrypt d3d11 dxgi d3dcompiler)
 
 # Forwarding test -------------------------------------------------------------
 add_executable(forward_test tests/forward_test.cpp)
@@ -41,6 +42,7 @@ add_dependencies(forward_test ddraw)
 add_executable(hook_test tests/hook_test.cpp src/hook.cpp src/log.cpp)
 target_compile_options(hook_test PRIVATE ${RR95_COMMON_OPTIONS})
 target_compile_definitions(hook_test PRIVATE ${RR95_COMMON_DEFINITIONS})
+target_link_options(hook_test PRIVATE /INCREMENTAL:NO)
 
 enable_testing()
 add_test(NAME forward_test COMMAND forward_test)

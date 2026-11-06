@@ -62,7 +62,12 @@ static void InitializeProxy() {
         LogInit(logPath, cfg.logLevel);
 
         LOG_INFO("rr95gpu proxy ddraw.dll loaded");
-        LOG_INFO("Config: Enabled=%d, LogLevel=%d", cfg.enabled ? 1 : 0, static_cast<int>(cfg.logLevel));
+        LOG_INFO("Config: Enabled=%d, LogLevel=%d, Presenter.Enabled=%d, Filter=%s, VSync=%d",
+                 cfg.enabled ? 1 : 0,
+                 static_cast<int>(cfg.logLevel),
+                 cfg.presenterEnabled ? 1 : 0,
+                 FilterModeToString(cfg.filter),
+                 cfg.vsync ? 1 : 0);
 
         if (!LoadSystemDirectDraw()) {
             LOG_ERROR("Failed to initialize system DirectDraw forwarding");
@@ -85,7 +90,11 @@ static void InitializeProxy() {
         LOG_INFO("Detected supported game build: %s (%s)", buildName, id.sha256Hex.c_str());
 
         if (InstallHooks(id.build)) {
-            LOG_INFO("All hooks installed successfully");
+            HMODULE pinned = nullptr;
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                               reinterpret_cast<LPCWSTR>(&InitializeProxy),
+                               &pinned);
+            LOG_INFO("All hooks installed successfully (proxy module pinned)");
         } else {
             LOG_WARN("Hook installation failed, running in unhooked mode");
         }
@@ -108,13 +117,8 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         DisableThreadLibraryCalls(hinstDLL);
         g_hModule = hinstDLL;
     } else if (fdwReason == DLL_PROCESS_DETACH) {
+        // Never call FreeLibrary or unpatch code under the loader lock.
         if (lpvReserved == nullptr) {
-            RemoveHooks();
-            if (g_systemDDraw) {
-                FreeLibrary(g_systemDDraw);
-                g_systemDDraw = nullptr;
-                g_realDirectDrawCreate = nullptr;
-            }
             LogClose();
         }
     }

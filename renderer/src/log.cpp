@@ -3,38 +3,40 @@
 #include <cstdarg>
 #include <share.h>
 
-static CRITICAL_SECTION g_logCs;
-static bool g_logCsInitialized = false;
-static FILE* g_logFile = nullptr;
-static LogLevel g_minLogLevel = LogLevel::Info;
+namespace {
+
+struct LogLock {
+    CRITICAL_SECTION cs;
+    LogLock() {
+        InitializeCriticalSection(&cs);
+    }
+};
+
+LogLock g_logLock;
+FILE* g_logFile = nullptr;
+LogLevel g_minLogLevel = LogLevel::Info;
+
+}  // namespace
 
 void LogInit(const std::wstring& logFilePath, LogLevel level) {
-    if (!g_logCsInitialized) {
-        InitializeCriticalSection(&g_logCs);
-        g_logCsInitialized = true;
-    }
-
-    EnterCriticalSection(&g_logCs);
+    EnterCriticalSection(&g_logLock.cs);
     g_minLogLevel = level;
     if (g_logFile) {
         fclose(g_logFile);
         g_logFile = nullptr;
     }
     g_logFile = _wfsopen(logFilePath.c_str(), L"a+", _SH_DENYNO);
-    LeaveCriticalSection(&g_logCs);
+    LeaveCriticalSection(&g_logLock.cs);
 }
 
 void LogClose() {
-    if (g_logCsInitialized) {
-        EnterCriticalSection(&g_logCs);
-        if (g_logFile) {
-            fclose(g_logFile);
-            g_logFile = nullptr;
-        }
-        LeaveCriticalSection(&g_logCs);
-        DeleteCriticalSection(&g_logCs);
-        g_logCsInitialized = false;
+    EnterCriticalSection(&g_logLock.cs);
+    if (g_logFile) {
+        std::fflush(g_logFile);
+        fclose(g_logFile);
+        g_logFile = nullptr;
     }
+    LeaveCriticalSection(&g_logLock.cs);
 }
 
 void LogWrite(LogLevel level, const char* fmt, ...) {
@@ -42,12 +44,7 @@ void LogWrite(LogLevel level, const char* fmt, ...) {
         return;
     }
 
-    if (!g_logCsInitialized) {
-        InitializeCriticalSection(&g_logCs);
-        g_logCsInitialized = true;
-    }
-
-    EnterCriticalSection(&g_logCs);
+    EnterCriticalSection(&g_logLock.cs);
     if (g_logFile) {
         SYSTEMTIME st;
         GetLocalTime(&st);
@@ -71,5 +68,5 @@ void LogWrite(LogLevel level, const char* fmt, ...) {
         std::fprintf(g_logFile, "\n");
         std::fflush(g_logFile);
     }
-    LeaveCriticalSection(&g_logCs);
+    LeaveCriticalSection(&g_logLock.cs);
 }

@@ -49,6 +49,8 @@ Status: completed; verified with forward_test, hook_test, check_hook_sites, and 
 
 ## B2: D3D11 presenter (task T3)
 
+Status: completed; verified with forward_test, hook_test, check_hook_sites, and live game run (D3D11 FL 11_0, gdi_blits=0).
+
 - **Goal:** replace the GDI present. Hook the race present (`FUN_0046e630`/`FUN_00467b80`) and the menu present (`FUN_0046e470`/`FUN_0046ded0`). Create a D3D11 device and a flip-model swap chain on the game window ("RashRoot"). Each frame upload the 640x480 8bpp buffer as an R8_UINT texture plus the 256-entry palette as a 256x1 texture. Expand it in a pixel shader, aspect-fit to the window with black bars, filter selectable in the ini (`Filter=nearest|bilinear|sharp-bilinear`). Upload menus as RGB565. Handle window resize and the windowed/borderless toggle (`FUN_00460b00`). On any D3D failure, fall back to the original GDI path.
 - **Attach:** B1 output; decomp excerpts of `FUN_00467b80`, `FUN_0046e630`, `FUN_0046e470`, `FUN_0046ded0`, `FUN_0046e0f0`, `FUN_00460b00`, `FUN_0046e390`; the present-path report from B1.
 - **Review checks:** build; race and menus display correctly; 60 fps; `Enabled=0` restores GDI; alt-tab and window toggle do not crash; no GDI `StretchDIBits` calls while the presenter is active (log counter).

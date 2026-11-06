@@ -55,11 +55,15 @@ int main() {
     volatile TargetFn call = &Target;
     Check(call(1, 2, 3) == 6, "target works before hooking");
 
-    // Decoding validation rejects relative instructions and bad spans.
+    // Decoding validation rejects relative instructions (including prefixed ones) and bad spans.
     rr95::HookSite relative{"relative", 0, {0x55, 0xE8, 0, 0, 0, 0}, 6, {1, 5}, nullptr, nullptr, false};
     Check(rr95::ValidateHookDecoding(relative) != nullptr, "call rel32 inside the span is refused");
+    rr95::HookSite prefixedRel{"prefixed_rel", 0, {0x55, 0x66, 0xE8, 0, 0, 0, 0}, 7, {1, 6}, nullptr, nullptr, false};
+    Check(rr95::ValidateHookDecoding(prefixedRel) != nullptr, "prefixed call rel inside the span is refused");
     rr95::HookSite jcc{"jcc", 0, {0x55, 0x0F, 0x84, 0, 0, 0, 0}, 7, {1, 6}, nullptr, nullptr, false};
     Check(rr95::ValidateHookDecoding(jcc) != nullptr, "jcc rel32 inside the span is refused");
+    rr95::HookSite prefixedJcc{"prefixed_jcc", 0, {0x55, 0x3E, 0x74, 0x04, 0x90}, 5, {1, 3, 1}, nullptr, nullptr, false};
+    Check(rr95::ValidateHookDecoding(prefixedJcc) != nullptr, "segment-prefixed jcc rel8 inside the span is refused");
     rr95::HookSite shortSpan{"short", 0, {0x55, 0x8B, 0xEC}, 3, {1, 2}, nullptr, nullptr, false};
     Check(rr95::ValidateHookDecoding(shortSpan) != nullptr, "span shorter than 5 bytes is refused");
     rr95::HookSite mismatch{"mismatch", 0, {0x55, 0x8B, 0xEC, 0x81, 0xEC, 0x2C, 0x04, 0x00, 0x00}, 9, {1, 2, 5},
@@ -86,6 +90,15 @@ int main() {
     Check(call(1, 2, 3) == 60, "hooked call goes through detour and trampoline");
     Check(g_detourCalls == 1, "detour called exactly once");
     Check(g_original != nullptr && g_original(4, 5, 6) == 15, "trampoline runs the original");
+
+    // RemoveHook restores original bytes, clears trampoline pointer, and unhooks execution.
+    rr95::RemoveHook(site, self);
+    Check(!site.installed, "RemoveHook marks site uninstalled");
+    Check(g_original == nullptr, "RemoveHook nulls the trampoline pointer");
+    Check(std::memcmp(before, reinterpret_cast<const void*>(&Target), sizeof(before)) == 0,
+          "RemoveHook restores the original prologue bytes");
+    Check(call(1, 2, 3) == 6, "unhooked call executes original directly");
+    Check(g_detourCalls == 1, "detour is not called after RemoveHook");
 
     std::printf("%s (%d failure(s))\n", g_failures == 0 ? "OK" : "FAILED", g_failures);
     return g_failures == 0 ? 0 : 1;

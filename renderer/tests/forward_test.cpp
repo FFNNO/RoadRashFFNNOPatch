@@ -1,11 +1,12 @@
 // forward_test: loads the built proxy ddraw.dll by full path, calls its
 // DirectDrawCreate and checks that it forwards to the system DirectDraw.
-// The test process is not RoadRash95.exe, so the proxy must log that the host
-// is unknown and that hooks were skipped.
+// Exercises both Enabled=0 (config-disabled forwarding) and default Enabled=1
+// (unknown host -> hooks skipped).
 #include <windows.h>
 #include <ddraw.h>
 
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -37,6 +38,11 @@ std::string ReadAll(const std::wstring& path) {
     return ss.str();
 }
 
+void WriteText(const std::wstring& path, const char* content) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out << content;
+}
+
 bool HasLineWith(const std::string& text, const char* a, const char* b) {
     std::istringstream lines(text);
     std::string line;
@@ -48,17 +54,8 @@ bool HasLineWith(const std::string& text, const char* a, const char* b) {
     return false;
 }
 
-}  // namespace
-
-int main() {
-    const std::wstring proxyPath = RR95_PROXY_PATH;
-    const std::wstring logPath = SiblingPath(proxyPath, L"rr95gpu.log");
-    const std::wstring iniPath = SiblingPath(proxyPath, L"rr95gpu.ini");
-
-    // Start from a clean state: defaults (no ini) and no stale log.
-    DeleteFileW(logPath.c_str());
-    DeleteFileW(iniPath.c_str());
-
+int RunProxyCheck(const std::wstring& proxyPath, const std::wstring& logPath,
+                  const char* expectedA, const char* expectedB) {
     HMODULE proxy = LoadLibraryW(proxyPath.c_str());
     Check(proxy != nullptr, "LoadLibraryW(proxy ddraw.dll)");
     if (proxy == nullptr) {
@@ -81,10 +78,52 @@ int main() {
 
     const std::string log = ReadAll(logPath);
     Check(!log.empty(), "rr95gpu.log exists next to the proxy");
-    Check(HasLineWith(log, "Host unknown", "hooks skipped"),
-          "log states the host is unknown and hooks were skipped");
+    Check(HasLineWith(log, expectedA, expectedB), "log contains expected status line");
 
     FreeLibrary(proxy);
+    return g_failures == 0 ? 0 : 1;
+}
+
+bool RunDisabledChildProcess() {
+    wchar_t selfPath[MAX_PATH] = {0};
+    if (GetModuleFileNameW(nullptr, selfPath, MAX_PATH) == 0) {
+        return false;
+    }
+    std::wstring cmdLine = std::wstring(L"\"") + selfPath + L"\" --check-disabled";
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
+    if (!CreateProcessW(selfPath, cmdLine.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        return false;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return exitCode == 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    const std::wstring proxyPath = RR95_PROXY_PATH;
+    const std::wstring logPath = SiblingPath(proxyPath, L"rr95gpu.log");
+    const std::wstring iniPath = SiblingPath(proxyPath, L"rr95gpu.ini");
+
+    if (argc > 1 && std::strcmp(argv[1], "--check-disabled") == 0) {
+        return RunProxyCheck(proxyPath, logPath, "disabled by config", "hooks skipped");
+    }
+
+    // 1. Test Enabled=0 in a fresh child process.
+    DeleteFileW(logPath.c_str());
+    WriteText(iniPath, "[General]\r\nEnabled=0\r\n");
+    Check(RunDisabledChildProcess(), "Enabled=0 child process forwards DirectDrawCreate and skips hooks");
+
+    // 2. Test default Enabled=1 (no ini) in this process.
+    DeleteFileW(logPath.c_str());
+    DeleteFileW(iniPath.c_str());
+    RunProxyCheck(proxyPath, logPath, "Host unknown", "hooks skipped");
 
     std::printf("%s (%d failure(s))\n", g_failures == 0 ? "OK" : "FAILED", g_failures);
     return g_failures == 0 ? 0 : 1;

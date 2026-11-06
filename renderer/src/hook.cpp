@@ -4,6 +4,29 @@
 
 namespace rr95 {
 
+namespace {
+
+bool IsLegacyPrefix(uint8_t b) {
+    switch (b) {
+        case 0x66:  // Operand-size override
+        case 0x67:  // Address-size override
+        case 0xF0:  // LOCK
+        case 0xF2:  // REPNE/REPNZ
+        case 0xF3:  // REP/REPE/REPZ
+        case 0x26:  // ES segment override
+        case 0x2E:  // CS segment override
+        case 0x36:  // SS segment override
+        case 0x3E:  // DS segment override
+        case 0x64:  // FS segment override
+        case 0x65:  // GS segment override
+            return true;
+        default:
+            return false;
+    }
+}
+
+}  // namespace
+
 const char* ValidateHookDecoding(const HookSite& site) {
     if (site.spanLength < 5) {
         return "span shorter than 5 bytes is refused";
@@ -26,7 +49,16 @@ const char* ValidateHookDecoding(const HookSite& site) {
     size_t offset = 0;
     for (size_t len : site.instructionLengths) {
         const uint8_t* insn = site.expected + offset;
-        const uint8_t op = insn[0];
+        size_t p = 0;
+        while (p < len && IsLegacyPrefix(insn[p])) {
+            ++p;
+        }
+        if (p == len) {
+            return "instruction consists solely of prefixes";
+        }
+
+        const uint8_t op = insn[p];
+        const size_t rem = len - p;
 
         // E8: CALL rel32
         // E9: JMP rel32
@@ -43,8 +75,8 @@ const char* ValidateHookDecoding(const HookSite& site) {
         }
 
         // 0F 80..0F 8F: Jcc rel32
-        if (op == 0x0F && len >= 2) {
-            const uint8_t op2 = insn[1];
+        if (op == 0x0F && rem >= 2) {
+            const uint8_t op2 = insn[p + 1];
             if (op2 >= 0x80 && op2 <= 0x8F) {
                 return "jcc rel32 inside the span is refused";
             }
