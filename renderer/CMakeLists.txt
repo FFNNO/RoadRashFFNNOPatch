@@ -39,8 +39,15 @@ target_compile_definitions(forward_test PRIVATE ${RR95_COMMON_DEFINITIONS}
   RR95_PROXY_PATH=L"$<TARGET_FILE:ddraw>")
 add_dependencies(forward_test ddraw)
 
-# Hook engine & pure math/config test -----------------------------------------
-add_executable(hook_test tests/hook_test.cpp src/hook.cpp src/log.cpp src/config.cpp src/presenter.cpp)
+# Hook engine, presenter math/latch, config, and capture writers test ---------
+add_executable(hook_test
+  tests/hook_test.cpp
+  src/hook.cpp
+  src/log.cpp
+  src/config.cpp
+  src/presenter.cpp
+  src/capture.cpp
+)
 target_compile_options(hook_test PRIVATE ${RR95_COMMON_OPTIONS})
 target_compile_definitions(hook_test PRIVATE ${RR95_COMMON_DEFINITIONS})
 target_link_libraries(hook_test PRIVATE d3d11 dxgi d3dcompiler)

@@ -13,47 +13,32 @@ constexpr uint32_t kMaxCapturedQuads = 4096;
 constexpr uint32_t kCrcCacheSize     = 512;  // Power of two for open-addressed table
 
 // Engine globals (preferred VAs in RoadRash95.exe):
+// 0x00596a90: uint8_t[0xde][256] sprite CLUT remap tables (DAT_00596a90)
+// 0x005aaa04: const uint8_t* dynamic sprite template PDAT pointer (DAT_005aaa04)
 // 0x005aaa14: int32_t  snap shift (DAT_005aaa14; 15 in original HiRes, 16 in patched)
 // 0x005aaa18: uint32_t snap mask  (DAT_005aaa18; 0xfffffffe in original HiRes, 0xffffffff in patched)
+// 0x005ca79c: uint32_t global RSC file handle (DAT_005ca79c)
+// 0x005ca7a0: uint32_t track/level RSC file handle (DAT_005ca7a0)
+// 0x005cab48: uint32_t biker sprite resource buffer (DAT_005cab48)
 // 0x006036c0: int32_t[4] clip rect [xmin, ymin, xmax, ymax] (DAT_006036c0..0x006036cc)
-// 0x00618540: int32_t[4] quad bbox [xmin, ymin, xmax, ymax] (DAT_00618540..0x0061854c)
+// 0x006036e8: uint32_t race tick counter (DAT_006036e8)
+// 0x00603740: uint32_t[4] streaming sprite family slot IDs (DAT_00603740..0x0060374c)
 // 0x00618580: int16_t[16] 4 vertices {x, y, u, v} (DAT_00618580..0x0061859e)
 // 0x006185a4: const uint8_t* active mip level texel pointer set by FUN_0042e850 (DAT_006185a4)
 // 0x006185e0: const uint8_t* current render node poly = ccb + 0x68 (DAT_006185e0)
-constexpr uint32_t kVaSnapShift    = 0x005aaa14;
-constexpr uint32_t kVaSnapMask     = 0x005aaa18;
-constexpr uint32_t kVaClipRect     = 0x006036c0;
-constexpr uint32_t kVaQuadBBox     = 0x00618540;
-constexpr uint32_t kVaVertsInt16   = 0x00618580;
-constexpr uint32_t kVaActiveMipPtr = 0x006185a4;
-constexpr uint32_t kVaCurrentPoly  = 0x006185e0;
-
-// CCB layout (168 bytes = 0xa8 per slot in DAT_005ce844; poly = ccb + 0x68):
-// ccb + 0x00 (uint32_t): ccb_flags
-// ccb + 0x08 (void*):    source PDAT / sprite table pointer
-// ccb + 0x44 (int32_t[8]): 4 corners in 16.16 fixed point [x0, y0, x1, y1, x2, y2, x3, y3]
-// ccb + 0x64 (uint8_t):  hflip
-// ccb + 0x65 (uint8_t):  vflip
-// ccb + 0x66 (uint8_t):  is_flat_color
-// ccb + 0x67 (uint8_t):  flat_color_index
-//
-// Render node layout (poly = ccb + 0x68):
-// poly + 0x00 (void*):      next render node in batch linked list
-// poly + 0x04 (uint8_t*):   resolved PDAT pointer (or &DAT_005aa9d4 for flat color, or DAT_005aaa04 for sprite)
-// poly + 0x08 (int32_t[4]): UV box [u0, v0, u1, v1]
-// poly + 0x18 (int32_t[8]): snapped pixel corners [x0, y0, x1, y1, x2, y2, x3, y3]
-// poly + 0x38 (int32_t):    sprite_index (when (pdat_flags & 0x2000) != 0)
-// poly + 0x3c (uint8_t):    flat_color or sprite_clut
-// poly + 0x3d (uint8_t):    u_flip
-// poly + 0x3e (uint8_t):    v_flip
-//
-// PDAT header layout:
-// pdat + 0x00 (uint32_t): magic (0x00bc614e for textured PDAT, 0x00000010 for flat &DAT_005aa9d4)
-// pdat + 0x0c (uint32_t): pdat_flags (0x02 = color-key 0, 0x40 = road/ground, 0x2000 = dynamic sprite)
-// pdat + 0x20 (int32_t):  width
-// pdat + 0x24 (int32_t):  height
-// pdat + 0x28 (int32_t):  mip_levels
-// pdat + 0x38 + i * 0x0c (const uint8_t*): runtime pointer to level-i 8bpp texels
+constexpr uint32_t kVaSpriteClutTable = 0x00596a90;
+constexpr uint32_t kVaSpritePdatPtr   = 0x005aaa04;
+constexpr uint32_t kVaSnapShift       = 0x005aaa14;
+constexpr uint32_t kVaSnapMask        = 0x005aaa18;
+constexpr uint32_t kVaGlobalRscHandle = 0x005ca79c;
+constexpr uint32_t kVaTrackRscHandle  = 0x005ca7a0;
+constexpr uint32_t kVaBikerSprBuf     = 0x005cab48;
+constexpr uint32_t kVaClipRect        = 0x006036c0;
+constexpr uint32_t kVaRaceTick        = 0x006036e8;
+constexpr uint32_t kVaFamilySlots     = 0x00603740;
+constexpr uint32_t kVaVertsInt16      = 0x00618580;
+constexpr uint32_t kVaActiveMipPtr    = 0x006185a4;
+constexpr uint32_t kVaCurrentPoly     = 0x006185e0;
 
 HMODULE g_hostModule = nullptr;
 std::wstring g_dumpDir;
@@ -64,6 +49,18 @@ uint32_t g_overflowCount = 0;
 uint32_t g_batchIndex = 0;
 uint32_t g_raceFrameNumber = 0;
 bool g_f11WasDown = false;
+
+struct LevelStateSnapshot {
+    bool initialized = false;
+    uint32_t globalRsc = 0;
+    uint32_t trackRsc = 0;
+    uint32_t spritePdat = 0;
+    uint32_t bikerBuf = 0;
+    uint32_t familySlots[4] = {0, 0, 0, 0};
+    uint32_t lastRaceTick = 0;
+};
+
+LevelStateSnapshot g_levelSnapshot;
 
 struct CrcCacheEntry {
     uint32_t keyA;
@@ -92,17 +89,53 @@ void EnsureCrcTable() {
     g_crcTableReady = true;
 }
 
-uint32_t ComputeCrc32(const uint8_t* data, size_t len, uint32_t seed = 0u) {
+uint32_t UpdateCrc32(uint32_t runningCrc, const uint8_t* data, size_t len) {
     EnsureCrcTable();
-    uint32_t c = seed ^ 0xFFFFFFFFu;
+    uint32_t c = runningCrc ^ 0xFFFFFFFFu;
     for (size_t i = 0; i < len; ++i) {
         c = g_crcTable[(c ^ data[i]) & 0xFFu] ^ (c >> 8);
     }
     return c ^ 0xFFFFFFFFu;
 }
 
-uint32_t LookupOrComputeLevel0Crc32(uint32_t keyA, uint32_t keyB, const uint8_t* level0Ptr, int32_t width, int32_t height) {
-    if (!level0Ptr || width <= 0 || height <= 0 || width > 4096 || height > 4096) {
+uint32_t ComputeCrc32(const uint8_t* data, size_t len) {
+    return UpdateCrc32(0u, data, len);
+}
+
+uint32_t ComputeTextureRectCrc32(const uint8_t* level0Ptr,
+                                 int32_t width,
+                                 int32_t height,
+                                 int32_t rowPitch,
+                                 const uint8_t* extraData,
+                                 size_t extraLen) {
+    if (!level0Ptr || width <= 0 || height <= 0 || rowPitch < width) {
+        return 0;
+    }
+    uint32_t crc = 0u;
+    if (rowPitch == width) {
+        crc = UpdateCrc32(crc, level0Ptr, static_cast<size_t>(width) * static_cast<size_t>(height));
+    } else {
+        for (int32_t y = 0; y < height; ++y) {
+            crc = UpdateCrc32(crc,
+                              level0Ptr + static_cast<size_t>(y) * static_cast<size_t>(rowPitch),
+                              static_cast<size_t>(width));
+        }
+    }
+    if (extraData && extraLen > 0) {
+        crc = UpdateCrc32(crc, extraData, extraLen);
+    }
+    return crc;
+}
+
+uint32_t LookupOrComputeLevel0Crc32(uint32_t keyA,
+                                    uint32_t keyB,
+                                    const uint8_t* level0Ptr,
+                                    int32_t width,
+                                    int32_t height,
+                                    int32_t rowPitch,
+                                    const uint8_t* extraData,
+                                    size_t extraLen) {
+    if (!level0Ptr || width <= 0 || height <= 0 || width > 4096 || height > 4096 || rowPitch < width) {
         return 0;
     }
     uint32_t hash = (keyA * 2654435761u) ^ (keyB * 2246822519u) ^
@@ -115,7 +148,7 @@ uint32_t LookupOrComputeLevel0Crc32(uint32_t keyA, uint32_t keyB, const uint8_t*
             entry.keyB = keyB;
             entry.width = width;
             entry.height = height;
-            entry.crc32 = ComputeCrc32(level0Ptr, static_cast<size_t>(width) * static_cast<size_t>(height));
+            entry.crc32 = ComputeTextureRectCrc32(level0Ptr, width, height, rowPitch, extraData, extraLen);
             entry.occupied = true;
             return entry.crc32;
         }
@@ -124,7 +157,7 @@ uint32_t LookupOrComputeLevel0Crc32(uint32_t keyA, uint32_t keyB, const uint8_t*
         }
         idx = (idx + 1u) & (kCrcCacheSize - 1u);
     }
-    return ComputeCrc32(level0Ptr, static_cast<size_t>(width) * static_cast<size_t>(height));
+    return ComputeTextureRectCrc32(level0Ptr, width, height, rowPitch, extraData, extraLen);
 }
 
 uintptr_t Rebase(uint32_t preferredVa) {
@@ -134,6 +167,54 @@ uintptr_t Rebase(uint32_t preferredVa) {
 template <typename T>
 T* GlobalPtr(uint32_t preferredVa) {
     return reinterpret_cast<T*>(Rebase(preferredVa));
+}
+
+void CheckAndInvalidateCacheOnLevelChange() {
+    if (!g_hostModule) {
+        return;
+    }
+    const uint32_t globalRsc = *GlobalPtr<const uint32_t>(kVaGlobalRscHandle);
+    const uint32_t trackRsc = *GlobalPtr<const uint32_t>(kVaTrackRscHandle);
+    const uint32_t spritePdat = *GlobalPtr<const uint32_t>(kVaSpritePdatPtr);
+    const uint32_t bikerBuf = *GlobalPtr<const uint32_t>(kVaBikerSprBuf);
+    const uint32_t* families = GlobalPtr<const uint32_t>(kVaFamilySlots);
+    const uint32_t raceTick = *GlobalPtr<const uint32_t>(kVaRaceTick);
+
+    if (!g_levelSnapshot.initialized) {
+        g_levelSnapshot.initialized = true;
+        g_levelSnapshot.globalRsc = globalRsc;
+        g_levelSnapshot.trackRsc = trackRsc;
+        g_levelSnapshot.spritePdat = spritePdat;
+        g_levelSnapshot.bikerBuf = bikerBuf;
+        for (int i = 0; i < 4; ++i) {
+            g_levelSnapshot.familySlots[i] = families[i];
+        }
+        g_levelSnapshot.lastRaceTick = raceTick;
+        return;
+    }
+
+    bool changed = (globalRsc != g_levelSnapshot.globalRsc) ||
+                   (trackRsc != g_levelSnapshot.trackRsc) ||
+                   (spritePdat != g_levelSnapshot.spritePdat) ||
+                   (bikerBuf != g_levelSnapshot.bikerBuf) ||
+                   (raceTick < g_levelSnapshot.lastRaceTick);
+    for (int i = 0; i < 4; ++i) {
+        if (families[i] != g_levelSnapshot.familySlots[i]) {
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        CaptureInvalidateCache();
+        g_levelSnapshot.globalRsc = globalRsc;
+        g_levelSnapshot.trackRsc = trackRsc;
+        g_levelSnapshot.spritePdat = spritePdat;
+        g_levelSnapshot.bikerBuf = bikerBuf;
+        for (int i = 0; i < 4; ++i) {
+            g_levelSnapshot.familySlots[i] = families[i];
+        }
+    }
+    g_levelSnapshot.lastRaceTick = raceTick;
 }
 
 void WriteBe32(std::vector<uint8_t>& out, uint32_t val) {
@@ -156,6 +237,15 @@ void WritePngChunk(std::vector<uint8_t>& out, const char type[4], const uint8_t*
     const uint32_t crc = ComputeCrc32(out.data() + typeOffset, 4 + len);
     WriteBe32(out, crc);
 }
+
+bool WriteFrameJson(const std::wstring& path, uint32_t frameNum, int width, int height) {
+    const int32_t snapShift = g_hostModule ? *GlobalPtr<int32_t>(kVaSnapShift) : 16;
+    const uint32_t snapMask = g_hostModule ? *GlobalPtr<uint32_t>(kVaSnapMask) : 0xFFFFFFFFu;
+    return WriteFrameJsonFromQuads(
+        path, frameNum, width, height, snapShift, snapMask, g_capturedQuads, g_capturedCount, g_overflowCount);
+}
+
+}  // namespace
 
 bool WriteIndexedPng(const std::wstring& path, const uint8_t* surface, int pitch, const uint8_t* palette, int width, int height) {
     if (!surface || !palette || width <= 0 || height <= 0) {
@@ -249,14 +339,19 @@ bool WriteIndexedPng(const std::wstring& path, const uint8_t* surface, int pitch
     return written == png.size();
 }
 
-bool WriteFrameJson(const std::wstring& path, uint32_t frameNum, int width, int height) {
+bool WriteFrameJsonFromQuads(const std::wstring& path,
+                             uint32_t frameNum,
+                             int width,
+                             int height,
+                             int32_t snapShift,
+                             uint32_t snapMask,
+                             const CapturedQuad* quads,
+                             uint32_t quadCount,
+                             uint32_t overflowCount) {
     FILE* fp = nullptr;
     if (_wfopen_s(&fp, path.c_str(), L"wb") != 0 || !fp) {
         return false;
     }
-
-    const int32_t snapShift = *GlobalPtr<int32_t>(kVaSnapShift);
-    const uint32_t snapMask = *GlobalPtr<uint32_t>(kVaSnapMask);
 
     std::fprintf(fp, "{\n");
     std::fprintf(fp, "  \"frame_number\": %u,\n", frameNum);
@@ -264,8 +359,8 @@ bool WriteFrameJson(const std::wstring& path, uint32_t frameNum, int width, int 
     std::fprintf(fp, "  \"height\": %d,\n", height);
     std::fprintf(fp, "  \"snap_shift\": %d,\n", snapShift);
     std::fprintf(fp, "  \"snap_mask\": \"0x%08X\",\n", snapMask);
-    std::fprintf(fp, "  \"quad_count\": %u,\n", g_capturedCount);
-    std::fprintf(fp, "  \"overflow_count\": %u,\n", g_overflowCount);
+    std::fprintf(fp, "  \"quad_count\": %u,\n", quadCount);
+    std::fprintf(fp, "  \"overflow_count\": %u,\n", overflowCount);
     std::fprintf(fp, "  \"non_rasterizer_writers\": [\n");
     std::fprintf(fp, "    {\"va\": \"0x00469770\", \"role\": \"horizon_sky_scroll_blit\", \"discovery\": \"FUN_0045ac50 callee; BltFast from sky surfaces DAT_005cd4c4/DAT_005cd4c8 into DAT_005cd4bc\"},\n");
     std::fprintf(fp, "    {\"va\": \"0x00468780\", \"role\": \"windowed_border_bitmap_copy\", \"discovery\": \"FUN_00469770 callee; locks DAT_005cd4bc via FUN_00436420 and copies border bitmap\"},\n");
@@ -278,8 +373,8 @@ bool WriteFrameJson(const std::wstring& path, uint32_t frameNum, int width, int 
     std::fprintf(fp, "  ],\n");
     std::fprintf(fp, "  \"quads\": [\n");
 
-    for (uint32_t i = 0; i < g_capturedCount; ++i) {
-        const CapturedQuad& q = g_capturedQuads[i];
+    for (uint32_t i = 0; i < quadCount; ++i) {
+        const CapturedQuad& q = quads[i];
         char texId[64];
         if (q.kind == QuadKind::Flat) {
             std::snprintf(texId, sizeof(texId), "flat_%u", static_cast<unsigned int>(q.flatColor));
@@ -337,7 +432,7 @@ bool WriteFrameJson(const std::wstring& path, uint32_t frameNum, int width, int 
             static_cast<int>(q.verts[2].u), static_cast<int>(q.verts[2].v),
             static_cast<int>(q.verts[3].x), static_cast<int>(q.verts[3].y),
             static_cast<int>(q.verts[3].u), static_cast<int>(q.verts[3].v),
-            (i + 1 < g_capturedCount) ? "," : "");
+            (i + 1 < quadCount) ? "," : "");
     }
 
     std::fprintf(fp, "  ]\n");
@@ -345,8 +440,6 @@ bool WriteFrameJson(const std::wstring& path, uint32_t frameNum, int width, int 
     std::fclose(fp);
     return true;
 }
-
-}  // namespace
 
 void CaptureInit(HMODULE hostModule, const std::wstring& dumpDir) {
     g_hostModule = hostModule;
@@ -356,11 +449,17 @@ void CaptureInit(HMODULE hostModule, const std::wstring& dumpDir) {
     g_batchIndex = 0;
     g_raceFrameNumber = 0;
     g_f11WasDown = false;
-    std::memset(g_crcCache, 0, sizeof(g_crcCache));
+    g_levelSnapshot = LevelStateSnapshot{};
+    CaptureInvalidateCache();
     EnsureCrcTable();
 }
 
+void CaptureInvalidateCache() {
+    std::memset(g_crcCache, 0, sizeof(g_crcCache));
+}
+
 void CaptureOnBatchStart() {
+    CheckAndInvalidateCacheOnLevelChange();
     ++g_batchIndex;
 }
 
@@ -425,20 +524,43 @@ int CaptureTexturedQuadBefore() {
         q.pdatPtr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pdat));
         q.pdatMagic = *reinterpret_cast<const uint32_t*>(pdat + 0x00);
         q.pdatFlags = *reinterpret_cast<const uint32_t*>(pdat + 0x0c);
-        q.texWidth = *reinterpret_cast<const int32_t*>(pdat + 0x20);
-        q.texHeight = *reinterpret_cast<const int32_t*>(pdat + 0x24);
+        const int32_t pdatPitch = *reinterpret_cast<const int32_t*>(pdat + 0x20);
+        const int32_t pdatHeight = *reinterpret_cast<const int32_t*>(pdat + 0x24);
         q.mipLevels = *reinterpret_cast<const int32_t*>(pdat + 0x28);
         const uint8_t* level0Ptr = *reinterpret_cast<const uint8_t* const*>(pdat + 0x38);
-        uint32_t keyB = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(level0Ptr));
+
         if ((q.pdatFlags & 0x2000u) != 0) {
-            keyB = (static_cast<uint32_t>(q.spriteClut) << 24) |
-                   (static_cast<uint32_t>(q.spriteIndex) & 0x00FFFFFFu);
+            // Dynamic sprite unpacked by FUN_00458f30 into top-left spriteW x spriteH of DAT_005aaa04 (stride pdatPitch=256).
+            int32_t spriteW = q.uvBox[2] - q.uvBox[0];
+            int32_t spriteH = q.uvBox[3] - q.uvBox[1];
+            if (spriteW <= 0 || spriteW > pdatPitch) spriteW = pdatPitch;
+            if (spriteH <= 0 || spriteH > pdatHeight) spriteH = pdatHeight;
+            q.texWidth = spriteW;
+            q.texHeight = spriteH;
+
+            uint8_t clutDescriptor[257];
+            clutDescriptor[0] = q.spriteClut;
+            size_t clutLen = 1;
+            if (q.spriteClut < 0xdeu) {
+                const uint8_t* clutRow = GlobalPtr<const uint8_t>(kVaSpriteClutTable) +
+                                         static_cast<size_t>(q.spriteClut) * 256u;
+                std::memcpy(clutDescriptor + 1, clutRow, 256u);
+                clutLen = 257u;
+            }
+            const uint32_t keyB = (static_cast<uint32_t>(q.spriteClut) << 24) |
+                                  (static_cast<uint32_t>(q.spriteIndex) & 0x00FFFFFFu);
+            q.level0Crc32 = LookupOrComputeLevel0Crc32(
+                q.pdatPtr, keyB, level0Ptr, spriteW, spriteH, pdatPitch, clutDescriptor, clutLen);
+        } else {
+            q.texWidth = pdatPitch;
+            q.texHeight = pdatHeight;
+            const uint32_t keyB = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(level0Ptr));
+            q.level0Crc32 = LookupOrComputeLevel0Crc32(
+                q.pdatPtr, keyB, level0Ptr, pdatPitch, pdatHeight, pdatPitch, nullptr, 0);
         }
-        q.level0Crc32 = LookupOrComputeLevel0Crc32(q.pdatPtr, keyB, level0Ptr, q.texWidth, q.texHeight);
     }
 
-    // Clear active mip texel pointer so we can detect early-return or chosen mip after FUN_0042e850.
-    *GlobalPtr<const uint8_t*>(kVaActiveMipPtr) = nullptr;
+    // Observation-only: never write to engine globals.
     return static_cast<int>(slot);
 }
 
@@ -447,8 +569,27 @@ void CaptureTexturedQuadAfter(int slotIndex) {
         return;
     }
     CapturedQuad& q = g_capturedQuads[slotIndex];
+
+    int16_t minX = q.verts[0].x;
+    int16_t maxX = q.verts[0].x;
+    int16_t minY = q.verts[0].y;
+    int16_t maxY = q.verts[0].y;
+    for (int i = 1; i < 4; ++i) {
+        if (q.verts[i].x < minX) minX = q.verts[i].x;
+        if (q.verts[i].x > maxX) maxX = q.verts[i].x;
+        if (q.verts[i].y < minY) minY = q.verts[i].y;
+        if (q.verts[i].y > maxY) maxY = q.verts[i].y;
+    }
+
+    // In FUN_0042e850, local_c == local_18 (minY == maxY) is the only early return before DAT_006185a4 is written.
+    if (minY == maxY || q.pdatPtr == 0) {
+        q.chosenMip = -1;
+        q.culled = true;
+        return;
+    }
+
     const uint8_t* activeMip = *GlobalPtr<const uint8_t*>(kVaActiveMipPtr);
-    if (!activeMip || q.pdatPtr == 0) {
+    if (!activeMip) {
         q.chosenMip = -1;
         q.culled = true;
         return;
@@ -465,20 +606,13 @@ void CaptureTexturedQuadAfter(int slotIndex) {
         }
     }
 
-    // Check if the Y span was completely outside clip_rect[1..3].
-    int16_t minY = q.verts[0].y;
-    int16_t maxY = q.verts[0].y;
-    for (int i = 1; i < 4; ++i) {
-        if (q.verts[i].y < minY) minY = q.verts[i].y;
-        if (q.verts[i].y > maxY) maxY = q.verts[i].y;
-    }
-    if (minY == maxY || maxY < q.clipRect[1] || minY > q.clipRect[3]) {
+    if (maxY < q.clipRect[1] || minY > q.clipRect[3] || maxX < q.clipRect[0] || minX > q.clipRect[2]) {
         q.culled = true;
     }
 }
 
-int CaptureFlatQuadBefore() {
-    if (!g_hostModule) {
+int CaptureFlatQuadBefore(const int32_t* polyVerts, int edxArg) {
+    if (!g_hostModule || !polyVerts) {
         return -1;
     }
     if (g_capturedCount >= kMaxCapturedQuads) {
@@ -486,10 +620,8 @@ int CaptureFlatQuadBefore() {
         return -1;
     }
 
-    const uint8_t* poly = *GlobalPtr<const uint8_t*>(kVaCurrentPoly);
-    if (!poly) {
-        return -1;
-    }
+    // In FUN_004688e0 (0x00468a7e..0x00468aa3), ECX (polyVerts) is poly + 0x18, and DL (edxArg & 0xFF) is flatColor.
+    const uint8_t* poly = reinterpret_cast<const uint8_t*>(polyVerts) - 0x18;
     const uint8_t* ccb = poly - 0x68;
     const uint8_t* pdat = *reinterpret_cast<const uint8_t* const*>(poly + 0x04);
 
@@ -506,6 +638,7 @@ int CaptureFlatQuadBefore() {
     q.uFlip = *(poly + 0x3d);
     q.vFlip = *(poly + 0x3e);
     q.spriteIndex = -1;
+    q.flatColor = static_cast<uint8_t>(edxArg & 0xFF);
 
     const int32_t shift = *GlobalPtr<int32_t>(kVaSnapShift);
     const uint32_t mask = *GlobalPtr<uint32_t>(kVaSnapMask);
@@ -514,6 +647,13 @@ int CaptureFlatQuadBefore() {
         q.corners16_16[i] = corners16[i];
         q.snappedPreFix[i] = static_cast<int32_t>(
             static_cast<uint32_t>(corners16[i] >> (static_cast<uint8_t>(shift) & 0x1Fu)) & mask);
+    }
+
+    for (int i = 0; i < 4; ++i) {
+        q.verts[i].x = static_cast<int16_t>(polyVerts[i * 2 + 0]);
+        q.verts[i].y = static_cast<int16_t>(polyVerts[i * 2 + 1]);
+        q.verts[i].u = 0;
+        q.verts[i].v = 0;
     }
 
     const int32_t* clipRect = GlobalPtr<const int32_t>(kVaClipRect);
@@ -525,41 +665,40 @@ int CaptureFlatQuadBefore() {
         q.pdatPtr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pdat));
         q.pdatMagic = *reinterpret_cast<const uint32_t*>(pdat + 0x00);
         q.pdatFlags = *reinterpret_cast<const uint32_t*>(pdat + 0x0c);
-        if (q.pdatMagic == 0x10u) {
-            q.flatColor = *(poly + 0x3c);
-        } else {
-            q.flatColor = *(pdat + 0x10);
-        }
     }
 
     return static_cast<int>(slot);
 }
 
-void CaptureFlatQuadAfter(int slotIndex) {
-    if (slotIndex < 0 || static_cast<uint32_t>(slotIndex) >= g_capturedCount) {
-        return;
-    }
-    const uint8_t* poly = *GlobalPtr<const uint8_t*>(kVaCurrentPoly);
-    if (!poly) {
+void CaptureFlatQuadAfter(int slotIndex, const int32_t* polyVerts) {
+    if (slotIndex < 0 || static_cast<uint32_t>(slotIndex) >= g_capturedCount || !polyVerts) {
         return;
     }
 
     CapturedQuad& q = g_capturedQuads[slotIndex];
-    const int32_t* postVerts = reinterpret_cast<const int32_t*>(poly + 0x18);
     for (int i = 0; i < 4; ++i) {
-        q.verts[i].x = static_cast<int16_t>(postVerts[i * 2 + 0]);
-        q.verts[i].y = static_cast<int16_t>(postVerts[i * 2 + 1]);
+        q.verts[i].x = static_cast<int16_t>(polyVerts[i * 2 + 0]);
+        q.verts[i].y = static_cast<int16_t>(polyVerts[i * 2 + 1]);
         q.verts[i].u = 0;
         q.verts[i].v = 0;
     }
 
-    int16_t minY = q.verts[0].y;
-    int16_t maxY = q.verts[0].y;
+    int32_t minX = q.verts[0].x;
+    int32_t maxX = q.verts[0].x;
+    int32_t minY = q.verts[0].y;
+    int32_t maxY = q.verts[0].y;
     for (int i = 1; i < 4; ++i) {
+        if (q.verts[i].x < minX) minX = q.verts[i].x;
+        if (q.verts[i].x > maxX) maxX = q.verts[i].x;
         if (q.verts[i].y < minY) minY = q.verts[i].y;
         if (q.verts[i].y > maxY) maxY = q.verts[i].y;
     }
-    if (minY == maxY || maxY < q.clipRect[1] || minY > q.clipRect[3]) {
+
+    // Note: in FUN_00467cb0, minY == maxY takes the single-scanline FUN_00468ce0 fast path (not culled!)
+    // as long as the horizontal span [max(minX, clip_xmin) .. min(maxX, clip_xmax)] is non-empty.
+    const int32_t clipL = (minX > q.clipRect[0]) ? minX : q.clipRect[0];
+    const int32_t clipR = (maxX < q.clipRect[2]) ? maxX : q.clipRect[2];
+    if (maxY < q.clipRect[1] || minY > q.clipRect[3] || clipL >= clipR) {
         q.culled = true;
     }
 }

@@ -328,11 +328,11 @@ void __cdecl Detour_FUN_0042e850() {
 }
 
 void __fastcall Detour_FUN_00467cb0(int* polyVerts, int edxArg) {
-    const int slot = CaptureFlatQuadBefore();
+    const int slot = CaptureFlatQuadBefore(polyVerts, edxArg);
     if (g_orig_FUN_00467cb0) {
         g_orig_FUN_00467cb0(polyVerts, edxArg);
     }
-    CaptureFlatQuadAfter(slot);
+    CaptureFlatQuadAfter(slot, polyVerts);
 }
 
 }  // namespace

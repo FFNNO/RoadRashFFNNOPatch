@@ -42,10 +42,22 @@ struct CapturedQuad {
 };
 
 void CaptureInit(HMODULE hostModule, const std::wstring& dumpDir);
+void CaptureInvalidateCache();
 void CaptureOnBatchStart();
 int CaptureTexturedQuadBefore();
 void CaptureTexturedQuadAfter(int slotIndex);
-int CaptureFlatQuadBefore();
-void CaptureFlatQuadAfter(int slotIndex);
+int CaptureFlatQuadBefore(const int32_t* polyVerts, int edxArg);
+void CaptureFlatQuadAfter(int slotIndex, const int32_t* polyVerts);
 void CaptureOnRacePresent(const uint8_t* surface, int pitch, const uint8_t* palette, int width, int height);
 void CaptureEndFrame();
+
+bool WriteIndexedPng(const std::wstring& path, const uint8_t* surface, int pitch, const uint8_t* palette, int width, int height);
+bool WriteFrameJsonFromQuads(const std::wstring& path,
+                             uint32_t frameNum,
+                             int width,
+                             int height,
+                             int32_t snapShift,
+                             uint32_t snapMask,
+                             const CapturedQuad* quads,
+                             uint32_t quadCount,
+                             uint32_t overflowCount);
