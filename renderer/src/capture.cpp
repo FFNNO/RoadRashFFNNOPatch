@@ -4,6 +4,8 @@
 #include "log.h"
 #include "presenter.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <unordered_map>
@@ -412,6 +414,93 @@ bool ShouldCullFlatQuad(const CapturedVertex verts[4],
     const int32_t clipR = (maxX < clipRect[2]) ? maxX : clipRect[2];
     const int32_t clipB = (maxY < clipRect[3]) ? maxY : clipRect[3];
     return (clipL >= clipR) || (clipT > clipB);
+}
+
+SubPixelVertices ResolveSubPixelVertices(const CapturedQuad& q) {
+    SubPixelVertices out;
+    for (int i = 0; i < 4; ++i) {
+        out.x[i] = static_cast<float>(q.verts[i].x);
+        out.y[i] = static_cast<float>(q.verts[i].y);
+    }
+    int16_t minY = q.verts[0].y;
+    int16_t maxY = q.verts[0].y;
+    for (int i = 1; i < 4; ++i) {
+        minY = (q.verts[i].y < minY) ? q.verts[i].y : minY;
+        maxY = (q.verts[i].y > maxY) ? q.verts[i].y : maxY;
+    }
+    const int32_t shift = q.snapShift & 0x1F;
+    if (minY == maxY || shift == 0) {
+        return out;
+    }
+    out.eligible = true;
+    const float scale = 1.0f / static_cast<float>(1u << shift);
+    float cx[4];
+    float cy[4];
+    for (int c = 0; c < 4; ++c) {
+        cx[c] = static_cast<float>(q.corners16_16[c * 2 + 0]) * scale;
+        cy[c] = static_cast<float>(q.corners16_16[c * 2 + 1]) * scale;
+    }
+
+    // match[i][c]: snapped corner c equals vertex i exactly (int16 store in FUN_004688e0).
+    bool match[4][4];
+    for (int i = 0; i < 4; ++i) {
+        for (int c = 0; c < 4; ++c) {
+            match[i][c] = static_cast<int16_t>(q.snappedPreFix[c * 2 + 0]) == q.verts[i].x &&
+                          static_cast<int16_t>(q.snappedPreFix[c * 2 + 1]) == q.verts[i].y;
+        }
+    }
+
+    int best[4] = {-1, -1, -1, -1};
+    float bestCost = 0.0f;
+    int perm[4] = {0, 1, 2, 3};
+    // Enumerate the 24 permutations in lexicographic order (deterministic tie-break order).
+    for (int p0 = 0; p0 < 4; ++p0) {
+        for (int p1 = 0; p1 < 4; ++p1) {
+            for (int p2 = 0; p2 < 4; ++p2) {
+                const int p3 = 6 - p0 - p1 - p2;
+                if (p0 == p1 || p0 == p2 || p1 == p2 || p3 < 0 || p3 > 3 || p3 == p0 || p3 == p1 || p3 == p2) {
+                    continue;
+                }
+                perm[0] = p0;
+                perm[1] = p1;
+                perm[2] = p2;
+                perm[3] = p3;
+                bool ok = true;
+                float cost = 0.0f;
+                for (int i = 0; i < 4 && ok; ++i) {
+                    ok = match[i][perm[i]];
+                    const float dx = cx[perm[i]] - (out.x[i] + 0.5f);
+                    const float dy = cy[perm[i]] - (out.y[i] + 0.5f);
+                    cost += dx * dx + dy * dy;
+                }
+                if (ok && (best[0] < 0 || cost < bestCost)) {
+                    for (int i = 0; i < 4; ++i) best[i] = perm[i];
+                    bestCost = cost;
+                }
+            }
+        }
+    }
+    if (best[0] < 0) {
+        return out;
+    }
+
+    const float maxAllowed = kSubPixelMaxDeltaPx + (((q.snapMask & 1u) == 0) ? 1.0f : 0.0f);
+    float maxDelta = 0.0f;
+    for (int i = 0; i < 4; ++i) {
+        maxDelta = std::max(maxDelta, std::fabs(cx[best[i]] - out.x[i]));
+        maxDelta = std::max(maxDelta, std::fabs(cy[best[i]] - out.y[i]));
+    }
+    if (maxDelta > maxAllowed) {
+        return out;
+    }
+    out.useCorners = true;
+    out.maxDelta = maxDelta;
+    for (int i = 0; i < 4; ++i) {
+        out.permutation[i] = best[i];
+        out.x[i] = cx[best[i]];
+        out.y[i] = cy[best[i]];
+    }
+    return out;
 }
 
 uint8_t HudSentinelActive(const HudSentinelState& state) {
@@ -872,6 +961,8 @@ int CaptureTexturedQuadBefore() {
     const int32_t shift = *GlobalPtr<int32_t>(kVaSnapShift);
     const uint32_t mask = *GlobalPtr<uint32_t>(kVaSnapMask);
     const int32_t* corners16 = reinterpret_cast<const int32_t*>(ccb + 0x44);
+    q.snapShift = shift;
+    q.snapMask = mask;
     for (int i = 0; i < 8; ++i) {
         q.corners16_16[i] = corners16[i];
         q.snappedPreFix[i] = static_cast<int32_t>(
@@ -1025,6 +1116,8 @@ int CaptureFlatQuadBefore(const int32_t* polyVerts, int edxArg) {
     const int32_t shift = *GlobalPtr<int32_t>(kVaSnapShift);
     const uint32_t mask = *GlobalPtr<uint32_t>(kVaSnapMask);
     const int32_t* corners16 = reinterpret_cast<const int32_t*>(ccb + 0x44);
+    q.snapShift = shift;
+    q.snapMask = mask;
     for (int i = 0; i < 8; ++i) {
         q.corners16_16[i] = corners16[i];
         q.snappedPreFix[i] = static_cast<int32_t>(

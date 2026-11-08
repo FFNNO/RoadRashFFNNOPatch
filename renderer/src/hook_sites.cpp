@@ -188,6 +188,16 @@ void RecordFrameAndLogFps(bool presentedByD3D) {
                      presentedByD3D ? "d3d11" : "gdi",
                      FilterModeToString(GetConfig().filter));
         }
+        const PresenterSubPixelStats sp = PresenterTakeSubPixelStats();
+        if (GetConfig().gpuWorld && GetConfig().subPixel && sp.frames > 0) {
+            LOG_INFO("SubPixel: %llu GPU world frames, %.1f quads/frame at 16.16 corners, %.2f fallback quads/frame "
+                     "(%llu total, max %u in one frame)",
+                     sp.frames,
+                     static_cast<double>(sp.floatQuads) / static_cast<double>(sp.frames),
+                     static_cast<double>(sp.fallbackQuads) / static_cast<double>(sp.frames),
+                     sp.fallbackQuads,
+                     sp.maxFallbackPerFrame);
+        }
         s_frameCount = 0;
         s_lastTime = now;
     }

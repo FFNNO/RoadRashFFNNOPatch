@@ -403,6 +403,12 @@ public:
         m_windowChangePending = true;
     }
 
+    PresenterSubPixelStats TakeSubPixelStats() {
+        const PresenterSubPixelStats s = m_subPixelStats;
+        m_subPixelStats = PresenterSubPixelStats{};
+        return s;
+    }
+
     void Shutdown() {
         m_worldTexSrvCache.clear();
         m_srvWorld.Reset();
@@ -1160,6 +1166,9 @@ private:
             m_context->Unmap(m_constantBuffer.Get(), 0);
         }
 
+        const bool subPixel = GetConfig().subPixel;
+        uint32_t frameFloatQuads = 0;
+        uint32_t frameFallbackQuads = 0;
         for (uint32_t qi = 0; qi < quadCount; ++qi) {
             const CapturedQuad& q = quads[qi];
             if (q.culled) {
@@ -1187,14 +1196,29 @@ private:
             ID3D11ShaderResourceView* srv = m_srvWhite.Get();
             ID3D11SamplerState* sampler = m_samplerClamp.Get();
 
-            float p01[4] = {
-                static_cast<float>(q.verts[0].x), static_cast<float>(q.verts[0].y),
-                static_cast<float>(q.verts[1].x), static_cast<float>(q.verts[1].y)
-            };
-            float p23[4] = {
-                static_cast<float>(q.verts[2].x), static_cast<float>(q.verts[2].y),
-                static_cast<float>(q.verts[3].x), static_cast<float>(q.verts[3].y)
-            };
+            // Vertex positions in 640x480 pixels: the engine's snapped int16 vertices, or with
+            // [World] SubPixel=1 the captured 16.16 corners they were snapped from (T6).
+            float posX[4];
+            float posY[4];
+            for (int i = 0; i < 4; ++i) {
+                posX[i] = static_cast<float>(q.verts[i].x);
+                posY[i] = static_cast<float>(q.verts[i].y);
+            }
+            if (subPixel) {
+                const SubPixelVertices spv = ResolveSubPixelVertices(q);
+                if (spv.useCorners) {
+                    for (int i = 0; i < 4; ++i) {
+                        posX[i] = spv.x[i];
+                        posY[i] = spv.y[i];
+                    }
+                    ++frameFloatQuads;
+                } else if (spv.eligible) {
+                    ++frameFallbackQuads;
+                }
+            }
+
+            float p01[4] = {posX[0], posY[0], posX[1], posY[1]};
+            float p23[4] = {posX[2], posY[2], posX[3], posY[3]};
             float uv01[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             float uv23[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             float uvClamp[4] = {0.0f, 0.0f, 1.0f, 1.0f};
@@ -1232,8 +1256,8 @@ private:
                     vx[3] = xL; vy[3] = yB;
                 } else {
                     for (int i = 0; i < 4; ++i) {
-                        vx[i] = static_cast<float>(q.verts[i].x) * invSrcW * 2.0f - 1.0f;
-                        vy[i] = 1.0f - static_cast<float>(q.verts[i].y) * invSrcH * 2.0f;
+                        vx[i] = posX[i] * invSrcW * 2.0f - 1.0f;
+                        vy[i] = 1.0f - posY[i] * invSrcH * 2.0f;
                     }
                 }
             } else {
@@ -1270,8 +1294,8 @@ private:
                 }
 
                 for (int i = 0; i < 4; ++i) {
-                    vx[i] = static_cast<float>(q.verts[i].x) * invSrcW * 2.0f - 1.0f;
-                    vy[i] = 1.0f - static_cast<float>(q.verts[i].y) * invSrcH * 2.0f;
+                    vx[i] = posX[i] * invSrcW * 2.0f - 1.0f;
+                    vy[i] = 1.0f - posY[i] * invSrcH * 2.0f;
                 }
             }
 
@@ -1327,6 +1351,13 @@ private:
             batch.startVertex = startVert;
             batch.vertexCount = 6;
             m_worldBatches.push_back(batch);
+        }
+
+        if (subPixel) {
+            ++m_subPixelStats.frames;
+            m_subPixelStats.floatQuads += frameFloatQuads;
+            m_subPixelStats.fallbackQuads += frameFallbackQuads;
+            m_subPixelStats.maxFallbackPerFrame = std::max(m_subPixelStats.maxFallbackPerFrame, frameFallbackQuads);
         }
 
         if (!m_worldVerts.empty()) {
@@ -1453,6 +1484,7 @@ private:
     bool m_windowChangePending = false;
     PresenterFailureState m_failureState = {};
     bool m_inBackoffCooldown = false;
+    PresenterSubPixelStats m_subPixelStats = {};
 
     ComPtr<ID3D11Device> m_device;
     ComPtr<ID3D11DeviceContext> m_context;
@@ -1499,6 +1531,10 @@ private:
 D3D11Presenter g_presenter;
 
 }  // namespace
+
+PresenterSubPixelStats PresenterTakeSubPixelStats() {
+    return g_presenter.TakeSubPixelStats();
+}
 
 std::string PresenterWorldPixelShaderSource() {
     return BuildWorldPixelShaderSource();

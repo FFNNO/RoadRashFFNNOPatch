@@ -22,6 +22,7 @@ struct Config {
     int internalWidth = 1440;
     int internalHeight = 1080;
     uint32_t toggleKey = 0x91;  // VK_SCROLL (Scroll Lock)
+    bool subPixel = true;       // [World] SubPixel: draw world quads at their 16.16 corners
 };
 
 void ConfigInit(const std::wstring& iniFilePath);

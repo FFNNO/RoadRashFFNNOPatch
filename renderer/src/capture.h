@@ -65,6 +65,8 @@ struct CapturedQuad {
     int32_t uvBox[4];
     int32_t corners16_16[8];
     int32_t snappedPreFix[8];
+    int32_t snapShift;   // DAT_005aaa14 at capture time (pixel = corner / 2^snapShift)
+    uint32_t snapMask;   // DAT_005aaa18 at capture time
     CapturedVertex verts[4];
 };
 
@@ -126,6 +128,29 @@ bool ShouldCullTexturedQuad(const CapturedVertex verts[4],
                             uint32_t pdatPtr);
 bool ShouldCullFlatQuad(const CapturedVertex verts[4],
                         const int32_t clipRect[4]);
+
+// Sub-pixel vertices (T6). FUN_00422630/FUN_004227f0 write poly vertex i as corner i (CCB +0x44)
+// >> DAT_005aaa14 & DAT_005aaa18; FUN_00468d60 then reorders those four snapped vertices in place
+// (and for concave or degenerate input replaces one by the midpoint of two others), and
+// FUN_004688e0 copies them in that order, assigning u/v by slot from u_flip/v_flip. So the corner
+// of vertex i is the corner whose snapped value equals vertex i exactly. The permutation is taken
+// from that exact match; when two corners snap to the same point the tie is broken by the smallest
+// distance between each corner and the centre of its snapped pixel. The quad falls back to its
+// snapped vertices when no permutation matches exactly (rebuilt or clipped vertex) or when a
+// matched corner lies farther than kSubPixelMaxDeltaPx (+1 px when the mask snaps to 2 px) from its
+// snapped vertex. Single-scanline quads always use the snapped vertices.
+inline constexpr float kSubPixelMaxDeltaPx = 1.5f;
+
+struct SubPixelVertices {
+    bool eligible = false;    // not single-scanline and a valid snap shift: corners were considered
+    bool useCorners = false;
+    float x[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float y[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float maxDelta = 0.0f;   // max |corner - snapped vertex| over the matched corners, in pixels
+    int permutation[4] = {0, 1, 2, 3};  // vertex i uses corner permutation[i]
+};
+
+SubPixelVertices ResolveSubPixelVertices(const CapturedQuad& q);
 
 void CaptureInit(HMODULE hostModule, const std::wstring& dumpDir);
 void CaptureInvalidateCache();

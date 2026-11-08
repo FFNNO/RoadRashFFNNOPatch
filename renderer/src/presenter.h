@@ -31,6 +31,15 @@ void PresenterRecordSuccess(PresenterFailureState& state);
 // (GpuWorld) only then, so a frame that falls back to GDI always contains the software world.
 bool PresenterStateAllowsGpuWorld(const PresenterFailureState& state);
 
+// Sub-pixel vertex counters (T6) accumulated by GPU world frames since the last call.
+struct PresenterSubPixelStats {
+    uint64_t frames = 0;
+    uint64_t floatQuads = 0;      // quads drawn at their 16.16 corners
+    uint64_t fallbackQuads = 0;   // eligible quads drawn at their snapped vertices
+    uint32_t maxFallbackPerFrame = 0;
+};
+PresenterSubPixelStats PresenterTakeSubPixelStats();
+
 // Full HLSL source of the world pixel shader (shared quad mapping + main), exposed for tests.
 std::string PresenterWorldPixelShaderSource();
 

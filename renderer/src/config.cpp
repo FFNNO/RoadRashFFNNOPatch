@@ -130,6 +130,9 @@ void ConfigInit(const std::wstring& iniFilePath) {
     wchar_t toggleKeyBuf[64] = {0};
     GetPrivateProfileStringW(L"World", L"ToggleKey", L"ScrollLock", toggleKeyBuf, 64, iniFilePath.c_str());
     g_config.toggleKey = ParseVirtualKey(toggleKeyBuf, VK_SCROLL);
+
+    UINT subPixelVal = GetPrivateProfileIntW(L"World", L"SubPixel", 1, iniFilePath.c_str());
+    g_config.subPixel = (subPixelVal != 0);
 }
 
 int ClampInternalHeight(int h) {

@@ -925,6 +925,73 @@ int main() {
         Check(HudSentinelActive(st) == repl, "the replacement becomes the next frame's clear value");
     }
 
+    // 13. Sub-pixel corners (T6): exact snapped-corner matching, permutations, ties, and fallbacks.
+    {
+        auto makeQuad = [](const double cornersPx[8], const int perm[4], uint32_t mask) {
+            CapturedQuad q = {};
+            q.kind = QuadKind::Textured;
+            q.snapShift = 15;
+            q.snapMask = mask;
+            for (int i = 0; i < 8; ++i) {
+                q.corners16_16[i] = static_cast<int32_t>(std::floor(cornersPx[i] * 32768.0));
+                q.snappedPreFix[i] = static_cast<int32_t>(static_cast<uint32_t>(q.corners16_16[i] >> 15) & mask);
+            }
+            for (int i = 0; i < 4; ++i) {
+                q.verts[i].x = static_cast<int16_t>(q.snappedPreFix[perm[i] * 2 + 0]);
+                q.verts[i].y = static_cast<int16_t>(q.snappedPreFix[perm[i] * 2 + 1]);
+            }
+            return q;
+        };
+        const double corners[8] = {100.25, 50.75, 200.5, 50.125, 200.875, 150.25, 100.0, 150.96875};
+        const int identity[4] = {0, 1, 2, 3};
+        const int swapped[4] = {1, 0, 3, 2};
+
+        CapturedQuad q = makeQuad(corners, identity, 0xFFFFFFFFu);
+        SubPixelVertices s = ResolveSubPixelVertices(q);
+        Check(s.eligible && s.useCorners && s.x[0] == 100.25f && s.y[3] == 150.96875f && s.maxDelta < 1.0f,
+              "identity order: vertices use their exact 16.16 corners");
+
+        q = makeQuad(corners, swapped, 0xFFFFFFFFu);
+        s = ResolveSubPixelVertices(q);
+        Check(s.useCorners && s.permutation[0] == 1 && s.permutation[1] == 0 && s.permutation[2] == 3 &&
+                  s.permutation[3] == 2 && s.x[0] == 200.5f && s.y[1] == 50.75f,
+              "FUN_00468d60 reorder (1,0,3,2) is recovered from the exact snapped match");
+
+        // Two corners inside the same pixel: both permutations match, the tie-break must stay valid.
+        const double dupCorners[8] = {100.125, 50.25, 100.875, 50.75, 160.5, 150.5, 60.5, 150.5};
+        q = makeQuad(dupCorners, identity, 0xFFFFFFFFu);
+        s = ResolveSubPixelVertices(q);
+        Check(s.useCorners && s.maxDelta < 1.0f && s.permutation[2] == 2 && s.permutation[3] == 3 &&
+                  ((s.permutation[0] == 0 && s.permutation[1] == 1) || (s.permutation[0] == 1 && s.permutation[1] == 0)),
+              "corners snapping to the same pixel resolve to a valid exact match");
+
+        // Rebuilt vertex (FUN_00468d60 midpoint repair): no exact match, fall back to the snapped vertices.
+        q = makeQuad(corners, identity, 0xFFFFFFFFu);
+        q.verts[2].x = 150;
+        q.verts[2].y = 100;
+        s = ResolveSubPixelVertices(q);
+        Check(s.eligible && !s.useCorners && s.x[2] == 150.0f && s.y[2] == 100.0f,
+              "vertex without an exact corner match falls back to the snapped vertices");
+
+        // 4-pixel snapping puts a corner 3.9 px from its vertex: beyond the tolerance, fall back.
+        const double farCorners[8] = {103.9, 50.0, 200.0, 50.0, 200.0, 150.0, 100.0, 150.0};
+        q = makeQuad(farCorners, identity, 0xFFFFFFFCu);
+        s = ResolveSubPixelVertices(q);
+        Check(s.eligible && !s.useCorners, "matched corner farther than the tolerance falls back to snapped vertices");
+
+        // 2-pixel snapping (original exe mask 0xFFFFFFFE): deltas up to 2 px stay within the widened tolerance.
+        const double evenCorners[8] = {101.9, 51.5, 201.75, 50.5, 201.0, 151.9, 100.5, 151.0};
+        q = makeQuad(evenCorners, identity, 0xFFFFFFFEu);
+        s = ResolveSubPixelVertices(q);
+        Check(s.useCorners && s.maxDelta > 1.5f && s.maxDelta < 2.0f,
+              "2-pixel snap mask widens the tolerance so its corners are still used");
+
+        const double flatCorners[8] = {100.5, 50.5, 200.5, 50.5, 200.5, 50.5, 100.5, 50.5};
+        q = makeQuad(flatCorners, identity, 0xFFFFFFFFu);
+        s = ResolveSubPixelVertices(q);
+        Check(!s.eligible && !s.useCorners, "single-scanline quads keep their snapped vertices");
+    }
+
     // PNG and JSON writer unit tests (B3 item 5).
     RunCaptureWritersTest();
 
