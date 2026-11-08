@@ -18,9 +18,14 @@ struct Config {
     std::wstring rawFilterString;
     bool captureEnabled = false;
     int captureAutoDumpFrame = 0;
+    bool gpuWorld = false;
+    int internalWidth = 1440;
+    int internalHeight = 1080;
 };
 
 void ConfigInit(const std::wstring& iniFilePath);
 const Config& GetConfig();
+bool ToggleGpuWorld();
+int ClampInternalHeight(int h);
 bool ParseFilterMode(const wchar_t* str, FilterMode& outMode);
 const char* FilterModeToString(FilterMode mode);

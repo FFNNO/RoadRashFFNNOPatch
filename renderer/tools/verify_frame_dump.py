@@ -76,31 +76,47 @@ def read_indexed_png(path: pathlib.Path):
 
 
 def rasterize_quad_scanlines(mask, width, height, verts, clip_rect, is_flat=False):
-    c_xmin, c_ymin, c_xmax, c_ymax = clip_rect
-    c_xmin = max(0, c_xmin)
-    c_ymin = max(0, c_ymin)
-    c_xmax = min(width - 1, c_xmax)
-    c_ymax = min(height - 1, c_ymax)
-    if c_xmin > c_xmax or c_ymin > c_ymax:
+    """Rasterize a captured 4-vertex quad into mask[y][x] using integer scanline spans.
+
+    Engine span & clip semantics (reconciled against FUN_00467cb0, FUN_00468ce0, and FUN_0042e850):
+    - X spans are half-open [span_l, span_r):
+      Both FUN_00467cb0 (single-scanline 0x00467cf6..0x00467d2c and multi-scanline 0x00468270..0x004682b8)
+      and FUN_0042e850 compute xL = max(left, clip_xmin) and xR = min(right, clip_xmax) (where
+      DAT_006036c8 = 640 for the 640x480 viewport) and draw (xR - xL) pixels when xL < xR.
+      When xL >= xR, 0 pixels are drawn.
+    - Y scanlines are inclusive [y_min, y_max]:
+      DAT_006036cc = 479 is the inclusive bottom scanline. FUN_0042e850 early-outs when ymin == ymax,
+      whereas FUN_00467cb0 takes the single-scanline FUN_00468ce0 fast path when ymin == ymax.
+    """
+    if len(verts) != 4:
         return 0
 
-    xs_all = [v["x"] for v in verts]
-    ys_all = [v["y"] for v in verts]
+    c_xmin, c_ymin, c_xmax, c_ymax = clip_rect
+    c_xmin = max(0, int(c_xmin))
+    c_ymin = max(0, int(c_ymin))
+    c_xmax = min(width, int(c_xmax))
+    c_ymax = min(height - 1, int(c_ymax))
+    if c_xmin >= c_xmax or c_ymin > c_ymax:
+        return 0
+
+    xs_all = [int(v["x"]) for v in verts]
+    ys_all = [int(v["y"]) for v in verts]
     y_min = max(c_ymin, min(ys_all))
     y_max = min(c_ymax, max(ys_all))
     if y_min > y_max:
         return 0
 
     # Single-scanline flat quads (ymin == ymax) use the FUN_00468ce0 fast path in FUN_00467cb0.
+    # Textured quads (FUN_0042e850) early-out when ymin == ymax.
     if min(ys_all) == max(ys_all):
         if not is_flat:
             return 0
         span_l = max(c_xmin, min(xs_all))
         span_r = min(c_xmax, max(xs_all))
         pixels_written = 0
-        if span_l <= span_r:
+        if span_l < span_r:
             row = mask[y_min]
-            for x in range(span_l, span_r + 1):
+            for x in range(span_l, span_r):
                 if row[x] == 0:
                     row[x] = 1
                     pixels_written += 1
@@ -108,8 +124,8 @@ def rasterize_quad_scanlines(mask, width, height, verts, clip_rect, is_flat=Fals
 
     edges = []
     for i in range(4):
-        x0, y0 = verts[i]["x"], verts[i]["y"]
-        x1, y1 = verts[(i + 1) & 3]["x"], verts[(i + 1) & 3]["y"]
+        x0, y0 = int(verts[i]["x"]), int(verts[i]["y"])
+        x1, y1 = int(verts[(i + 1) & 3]["x"]), int(verts[(i + 1) & 3]["y"])
         if y0 == y1:
             continue
         if y0 > y1:
@@ -130,9 +146,9 @@ def rasterize_quad_scanlines(mask, width, height, verts, clip_rect, is_flat=Fals
             continue
         span_l = max(c_xmin, int(min(xs)))
         span_r = min(c_xmax, int(max(xs)))
-        if span_l <= span_r:
+        if span_l < span_r:
             row = mask[y]
-            for x in range(span_l, span_r + 1):
+            for x in range(span_l, span_r):
                 if row[x] == 0:
                     row[x] = 1
                     pixels_written += 1
@@ -280,7 +296,7 @@ def run_self_test() -> int:
             )
             target.write_bytes(png_bytes)
 
-        # Matching PNG has non-background pixels in y=[120..359] inside clip_rect [0, 80, 639, 359].
+        # Matching PNG has non-background pixels in y=[120..359] inside clip_rect [0, 80, 640, 359].
         write_test_png(png_path, 120, 359)
         # Mismatched PNG has all background (0) inside the viewport so verify_dump must reject it.
         write_test_png(bad_png_path, 400, 470)
@@ -314,14 +330,14 @@ def run_self_test() -> int:
                     "sprite_index": -1,
                     "u_flip": 0,
                     "v_flip": 0,
-                    "clip_rect": [0, 80, 639, 359],
+                    "clip_rect": [0, 80, 640, 359],
                     "uv_box": [0, 0, 0, 0],
                     "corners_16_16": [0, 7864320, 41943040, 7864320, 41943040, 15728640, 0, 15728640],
                     "snapped_pre_fix": [0, 240, 640, 240, 640, 480, 0, 480],
                     "vertices": [
                         {"x": 0, "y": 120, "u": 0, "v": 0},
-                        {"x": 639, "y": 120, "u": 0, "v": 0},
-                        {"x": 639, "y": 240, "u": 0, "v": 0},
+                        {"x": 640, "y": 120, "u": 0, "v": 0},
+                        {"x": 640, "y": 240, "u": 0, "v": 0},
                         {"x": 0, "y": 240, "u": 0, "v": 0},
                     ],
                 },
@@ -344,14 +360,14 @@ def run_self_test() -> int:
                     "sprite_index": 0,
                     "u_flip": 0,
                     "v_flip": 0,
-                    "clip_rect": [0, 80, 639, 359],
+                    "clip_rect": [0, 80, 640, 359],
                     "uv_box": [0, 0, 128, 64],
                     "corners_16_16": [0, 7864320, 41943040, 7864320, 41943040, 15728640, 0, 15728640],
                     "snapped_pre_fix": [0, 240, 640, 240, 640, 480, 0, 480],
                     "vertices": [
                         {"x": 0, "y": 240, "u": 1, "v": 1},
-                        {"x": 639, "y": 240, "u": 127, "v": 1},
-                        {"x": 639, "y": 359, "u": 127, "v": 63},
+                        {"x": 640, "y": 240, "u": 127, "v": 1},
+                        {"x": 640, "y": 359, "u": 127, "v": 63},
                         {"x": 0, "y": 359, "u": 1, "v": 63},
                     ],
                 },
@@ -368,10 +384,41 @@ def run_self_test() -> int:
         return 1
 
 
+def verify_directory(
+    directory: pathlib.Path,
+    bg_index: int = 0,
+    min_precision: float = 0.70,
+    min_recall: float = 0.50,
+) -> int:
+    json_files = sorted(directory.glob("frame_*.json"))
+    if not json_files:
+        print(f"FAIL No frame_*.json files found in {directory}")
+        return 1
+    failures = 0
+    for json_path in json_files:
+        png_path = json_path.with_suffix(".png")
+        if not png_path.exists():
+            print(f"FAIL Missing matching PNG {png_path}")
+            failures += 1
+            continue
+        rc = verify_dump(
+            json_path,
+            png_path,
+            bg_index=bg_index,
+            min_precision=min_precision,
+            min_recall=min_recall,
+        )
+        if rc != 0:
+            failures += 1
+    print(f"Directory summary: {len(json_files) - failures}/{len(json_files)} passed")
+    return 0 if failures == 0 else 1
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description="Verify Road Rash 95 frame dump JSON + PNG")
     parser.add_argument("json_file", nargs="?", help="Path to frame_<n>.json")
     parser.add_argument("png_file", nargs="?", help="Path to frame_<n>.png (defaults to matching .png)")
+    parser.add_argument("--all", dest="all_dir", help="Verify all frame_*.json/png pairs in directory")
     parser.add_argument("--bg-index", type=int, default=0, help="Background palette index (default: 0)")
     parser.add_argument("--min-precision", type=float, default=0.70, help="Minimum precision ratio")
     parser.add_argument("--min-recall", type=float, default=0.50, help="Minimum recall ratio")
@@ -381,8 +428,16 @@ def main(argv):
     if args.self_test:
         return run_self_test()
 
+    if args.all_dir:
+        return verify_directory(
+            pathlib.Path(args.all_dir),
+            bg_index=args.bg_index,
+            min_precision=args.min_precision,
+            min_recall=args.min_recall,
+        )
+
     if not args.json_file:
-        parser.error("json_file is required unless --self-test is specified")
+        parser.error("json_file is required unless --self-test or --all is specified")
 
     json_path = pathlib.Path(args.json_file)
     png_path = pathlib.Path(args.png_file) if args.png_file else json_path.with_suffix(".png")

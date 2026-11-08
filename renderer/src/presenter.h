@@ -19,7 +19,7 @@ struct PresenterFailureState {
 };
 
 constexpr int kPresenterMaxFailuresInWindow = 3;
-constexpr uint64_t kPresenterFailureWindowMs = 2000;
+constexpr uint64_t kPresenterFailureWindowMs = 5000;
 constexpr uint64_t kPresenterRetryBackoffMs = 1000;
 
 bool PresenterCanAttempt(const PresenterFailureState& state, uint64_t nowMs);

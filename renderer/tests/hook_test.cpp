@@ -361,7 +361,7 @@ int main() {
     Check(vpZero.width == 1 && vpZero.height == 1,
           "ComputeLetterboxViewport(640x480 -> 0x0) clamps to width=1, height=1");
 
-    // Time-windowed presenter failure latch & backoff unit tests (B3 item 6).
+    // Time-windowed presenter failure latch & backoff unit tests (B3 item 6 + T4c window fix).
     {
         PresenterFailureState fs = {};
         Check(PresenterCanAttempt(fs, 1000), "presenter can attempt initially");
@@ -377,21 +377,107 @@ int main() {
         Check(fs.failureCount == 0 && !fs.latchedOff,
               "PresenterRecordSuccess resets failure count to 0");
 
-        // Failure window expiration (> 2000ms since first failure resets count to 1).
+        // Failure window expiration (> 5000ms since first failure resets count to 1).
         Check(!PresenterRecordFailure(fs, 3000) && fs.failureCount == 1,
               "failure at t=3000 starts a new window");
-        Check(!PresenterRecordFailure(fs, 4000) && fs.failureCount == 2 && !fs.latchedOff,
-              "second failure at t=4000 increments count to 2");
-        Check(!PresenterRecordFailure(fs, 6000) && fs.failureCount == 1 && !fs.latchedOff,
-              "failure at t=6000 (>2000ms after firstFailureMs=3000) resets window to count=1");
+        Check(!PresenterRecordFailure(fs, 4050) && fs.failureCount == 2 && !fs.latchedOff,
+              "second failure at t=4050 increments count to 2");
+        Check(!PresenterRecordFailure(fs, 9000) && fs.failureCount == 1 && !fs.latchedOff,
+              "failure at t=9000 (>5000ms after firstFailureMs=3000) resets window to count=1");
 
-        // 3 failures within 2000ms window (t=6000, t=7000, t=8000) latches off permanently.
-        Check(!PresenterRecordFailure(fs, 7000) && fs.failureCount == 2 && !fs.latchedOff,
-              "second failure in window at t=7000 sets count=2");
-        Check(PresenterRecordFailure(fs, 8000) && fs.failureCount == 3 && fs.latchedOff,
-              "third failure in 2s window at t=8000 latches presenter off");
-        Check(!PresenterCanAttempt(fs, 20000),
+        // 3 failures spaced by realistic backoff (t=9000, t=10050, t=11100) within 5000ms window latches off permanently.
+        Check(!PresenterRecordFailure(fs, 10050) && fs.failureCount == 2 && !fs.latchedOff,
+              "second failure in window at t=10050 sets count=2");
+        Check(PresenterRecordFailure(fs, 11100) && fs.failureCount == 3 && fs.latchedOff,
+              "third failure in 5s window at t=11100 latches presenter off");
+        Check(!PresenterCanAttempt(fs, 30000),
               "latched presenter stays off even after long delay");
+    }
+
+    // T4c & T5 pure helper unit tests:
+    // 1. ClampInternalHeight
+    Check(ClampInternalHeight(100) == 240 && ClampInternalHeight(1080) == 1080 && ClampInternalHeight(9999) == 4320,
+          "ClampInternalHeight clamps to [240, 4320] and preserves 1080");
+
+    // 2. ComputeTextureRectCrc32 (stride padding invariance + extraData sensitivity)
+    {
+        uint8_t bufA[4 * 8];
+        uint8_t bufB[4 * 8];
+        std::memset(bufA, 0x11, sizeof(bufA));
+        std::memset(bufB, 0xFE, sizeof(bufB));
+        for (int y = 0; y < 4; ++y) {
+            for (int x = 0; x < 5; ++x) {
+                const uint8_t v = static_cast<uint8_t>(y * 10 + x + 1);
+                bufA[y * 8 + x] = v;
+                bufB[y * 8 + x] = v;
+            }
+        }
+        const uint32_t crcA = ComputeTextureRectCrc32(bufA, 5, 4, 8, nullptr, 0);
+        const uint32_t crcB = ComputeTextureRectCrc32(bufB, 5, 4, 8, nullptr, 0);
+        Check(crcA != 0 && crcA == crcB,
+              "ComputeTextureRectCrc32 ignores rowPitch padding bytes outside width");
+
+        const uint8_t extra1[2] = {0x01, 0x02};
+        const uint8_t extra2[2] = {0x01, 0x03};
+        const uint32_t crcE1 = ComputeTextureRectCrc32(bufA, 5, 4, 8, extra1, sizeof(extra1));
+        const uint32_t crcE2 = ComputeTextureRectCrc32(bufA, 5, 4, 8, extra2, sizeof(extra2));
+        Check(crcE1 != crcA && crcE1 != crcE2,
+              "ComputeTextureRectCrc32 incorporates extraData (CLUT descriptor)");
+    }
+
+    // 3. ClampSpriteDimensions
+    {
+        int32_t w = 0, h = 0;
+        const int32_t uvNormal[4] = {0, 0, 64, 48};
+        ClampSpriteDimensions(uvNormal, 256, 256, w, h);
+        Check(w == 64 && h == 48, "ClampSpriteDimensions preserves normal sprite box");
+
+        const int32_t uvInverted[4] = {50, 80, 10, 20};
+        ClampSpriteDimensions(uvInverted, 256, 256, w, h);
+        Check(w == 1 && h == 1, "ClampSpriteDimensions clamps inverted box to 1x1");
+
+        const int32_t uvOversize[4] = {-20, -10, 500, 400};
+        ClampSpriteDimensions(uvOversize, 256, 256, w, h);
+        Check(w == 256 && h == 256, "ClampSpriteDimensions clamps negative/oversize box to pdat bounds");
+    }
+
+    // 4. UpdateLevelStateSnapshot
+    {
+        LevelStateSnapshot snap = {};
+        const uint32_t famA[4] = {10, 20, 30, 40};
+        const uint32_t famB[4] = {10, 20, 99, 40};
+        Check(!UpdateLevelStateSnapshot(snap, 1, 2, 3, 4, famA, 100) && snap.initialized,
+              "first UpdateLevelStateSnapshot initializes snapshot without invalidation");
+        Check(!UpdateLevelStateSnapshot(snap, 1, 2, 3, 4, famA, 101),
+              "monotonic raceTick with identical pointers does not invalidate");
+        Check(UpdateLevelStateSnapshot(snap, 1, 9, 3, 4, famA, 102),
+              "changed trackRsc triggers cache invalidation");
+        Check(UpdateLevelStateSnapshot(snap, 1, 9, 3, 4, famB, 103),
+              "changed familySlots[2] triggers cache invalidation");
+        Check(UpdateLevelStateSnapshot(snap, 1, 9, 3, 4, famB, 50),
+              "decreased raceTick (new race) triggers cache invalidation");
+    }
+
+    // 5. ShouldCullTexturedQuad & ShouldCullFlatQuad
+    {
+        const int32_t clip[4] = {0, 0, 640, 479};
+        const CapturedVertex vValid[4] = {{10, 20, 0, 0}, {50, 20, 0, 0}, {50, 40, 0, 0}, {10, 40, 0, 0}};
+        const CapturedVertex vSingleLine[4] = {{10, 20, 0, 0}, {50, 20, 0, 0}, {50, 20, 0, 0}, {10, 20, 0, 0}};
+        const CapturedVertex vZeroWidth[4] = {{30, 20, 0, 0}, {30, 20, 0, 0}, {30, 40, 0, 0}, {30, 40, 0, 0}};
+        const CapturedVertex vOutsideRight[4] = {{640, 20, 0, 0}, {650, 20, 0, 0}, {650, 40, 0, 0}, {640, 40, 0, 0}};
+
+        Check(!ShouldCullTexturedQuad(vValid, clip, 0x005AAA04u),
+              "ShouldCullTexturedQuad keeps valid inside-clip quad");
+        Check(ShouldCullTexturedQuad(vValid, clip, 0u),
+              "ShouldCullTexturedQuad culls when pdatPtr == 0");
+        Check(ShouldCullTexturedQuad(vSingleLine, clip, 0x005AAA04u),
+              "ShouldCullTexturedQuad culls single-scanline quad (minY == maxY)");
+        Check(!ShouldCullFlatQuad(vSingleLine, clip),
+              "ShouldCullFlatQuad keeps single-scanline flat quad (FUN_00468ce0 fast path)");
+        Check(ShouldCullFlatQuad(vZeroWidth, clip),
+              "ShouldCullFlatQuad culls zero-width flat quad (clipL >= clipR)");
+        Check(ShouldCullFlatQuad(vOutsideRight, clip),
+              "ShouldCullFlatQuad culls quad at x=[640,650) when clip_xmax=640 (half-open X)");
     }
 
     // PNG and JSON writer unit tests (B3 item 5).

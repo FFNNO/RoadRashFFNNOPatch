@@ -2,15 +2,20 @@
 #include "config.h"
 #include "hook.h"
 #include "log.h"
+#include "presenter.h"
 
 #include <cstdio>
 #include <cstring>
+#include <unordered_map>
 #include <vector>
 
 namespace {
 
 constexpr uint32_t kMaxCapturedQuads = 4096;
 constexpr uint32_t kCrcCacheSize     = 512;  // Power of two for open-addressed table
+constexpr size_t   kMaxTexPixelCache = 2048;
+constexpr int32_t  kSurfaceWidth     = 640;
+constexpr int32_t  kSurfaceHeight    = 480;
 
 // Engine globals (preferred VAs in RoadRash95.exe):
 // 0x00596a90: uint8_t[0xde][256] sprite CLUT remap tables (DAT_00596a90)
@@ -20,25 +25,33 @@ constexpr uint32_t kCrcCacheSize     = 512;  // Power of two for open-addressed 
 // 0x005ca79c: uint32_t global RSC file handle (DAT_005ca79c)
 // 0x005ca7a0: uint32_t track/level RSC file handle (DAT_005ca7a0)
 // 0x005cab48: uint32_t biker sprite resource buffer (DAT_005cab48)
+// 0x005ce34c: uint8_t  surface locked flag set by FUN_004688e0 (DAT_005ce34c)
+// 0x006036a4: int32_t  horizon height in scanlines used by FUN_00469770 (DAT_006036a4)
+// 0x006036b8: int32_t  locked 8bpp surface pitch set by FUN_004688e0 (DAT_006036b8)
+// 0x006036bc: uint8_t* locked 8bpp viewport base pointer set by FUN_004688e0 (DAT_006036bc)
 // 0x006036c0: int32_t[4] clip rect [xmin, ymin, xmax, ymax] (DAT_006036c0..0x006036cc)
 // 0x006036e8: uint32_t race tick counter (DAT_006036e8)
 // 0x00603740: uint32_t[4] streaming sprite family slot IDs (DAT_00603740..0x0060374c)
 // 0x00618580: int16_t[16] 4 vertices {x, y, u, v} (DAT_00618580..0x0061859e)
 // 0x006185a4: const uint8_t* active mip level texel pointer set by FUN_0042e850 (DAT_006185a4)
 // 0x006185e0: const uint8_t* current render node poly = ccb + 0x68 (DAT_006185e0)
-constexpr uint32_t kVaSpriteClutTable = 0x00596a90;
-constexpr uint32_t kVaSpritePdatPtr   = 0x005aaa04;
-constexpr uint32_t kVaSnapShift       = 0x005aaa14;
-constexpr uint32_t kVaSnapMask        = 0x005aaa18;
-constexpr uint32_t kVaGlobalRscHandle = 0x005ca79c;
-constexpr uint32_t kVaTrackRscHandle  = 0x005ca7a0;
-constexpr uint32_t kVaBikerSprBuf     = 0x005cab48;
-constexpr uint32_t kVaClipRect        = 0x006036c0;
-constexpr uint32_t kVaRaceTick        = 0x006036e8;
-constexpr uint32_t kVaFamilySlots     = 0x00603740;
-constexpr uint32_t kVaVertsInt16      = 0x00618580;
-constexpr uint32_t kVaActiveMipPtr    = 0x006185a4;
-constexpr uint32_t kVaCurrentPoly     = 0x006185e0;
+constexpr uint32_t kVaSpriteClutTable   = 0x00596a90;
+constexpr uint32_t kVaSpritePdatPtr     = 0x005aaa04;
+constexpr uint32_t kVaSnapShift         = 0x005aaa14;
+constexpr uint32_t kVaSnapMask          = 0x005aaa18;
+constexpr uint32_t kVaGlobalRscHandle   = 0x005ca79c;
+constexpr uint32_t kVaTrackRscHandle    = 0x005ca7a0;
+constexpr uint32_t kVaBikerSprBuf       = 0x005cab48;
+constexpr uint32_t kVaSurfaceLockedFlag = 0x005ce34c;
+constexpr uint32_t kVaHorizonHeight     = 0x006036a4;
+constexpr uint32_t kVaSurfacePitch      = 0x006036b8;
+constexpr uint32_t kVaSurfaceBasePtr    = 0x006036bc;
+constexpr uint32_t kVaClipRect          = 0x006036c0;
+constexpr uint32_t kVaRaceTick          = 0x006036e8;
+constexpr uint32_t kVaFamilySlots       = 0x00603740;
+constexpr uint32_t kVaVertsInt16        = 0x00618580;
+constexpr uint32_t kVaActiveMipPtr      = 0x006185a4;
+constexpr uint32_t kVaCurrentPoly       = 0x006185e0;
 
 HMODULE g_hostModule = nullptr;
 std::wstring g_dumpDir;
@@ -49,16 +62,12 @@ uint32_t g_overflowCount = 0;
 uint32_t g_batchIndex = 0;
 uint32_t g_raceFrameNumber = 0;
 bool g_f11WasDown = false;
+bool g_dumpThisFrame = false;
+bool g_dumpTriggeredCheckedThisFrame = false;
 
-struct LevelStateSnapshot {
-    bool initialized = false;
-    uint32_t globalRsc = 0;
-    uint32_t trackRsc = 0;
-    uint32_t spritePdat = 0;
-    uint32_t bikerBuf = 0;
-    uint32_t familySlots[4] = {0, 0, 0, 0};
-    uint32_t lastRaceTick = 0;
-};
+bool g_horizonCapturedThisFrame = false;
+int32_t g_horizonHeight = 360;
+uint8_t g_horizonBuffer[kSurfaceWidth * kSurfaceHeight];
 
 LevelStateSnapshot g_levelSnapshot;
 
@@ -74,6 +83,15 @@ struct CrcCacheEntry {
 CrcCacheEntry g_crcCache[kCrcCacheSize];
 uint32_t g_crcTable[256];
 bool g_crcTableReady = false;
+
+struct CachedTexturePixels {
+    int32_t width = 0;
+    int32_t height = 0;
+    std::vector<uint8_t> pixels;
+};
+
+std::unordered_map<uint64_t, CachedTexturePixels> g_texPixelCache;
+uint32_t g_cacheGeneration = 1;
 
 void EnsureCrcTable() {
     if (g_crcTableReady) {
@@ -100,31 +118,6 @@ uint32_t UpdateCrc32(uint32_t runningCrc, const uint8_t* data, size_t len) {
 
 uint32_t ComputeCrc32(const uint8_t* data, size_t len) {
     return UpdateCrc32(0u, data, len);
-}
-
-uint32_t ComputeTextureRectCrc32(const uint8_t* level0Ptr,
-                                 int32_t width,
-                                 int32_t height,
-                                 int32_t rowPitch,
-                                 const uint8_t* extraData,
-                                 size_t extraLen) {
-    if (!level0Ptr || width <= 0 || height <= 0 || rowPitch < width) {
-        return 0;
-    }
-    uint32_t crc = 0u;
-    if (rowPitch == width) {
-        crc = UpdateCrc32(crc, level0Ptr, static_cast<size_t>(width) * static_cast<size_t>(height));
-    } else {
-        for (int32_t y = 0; y < height; ++y) {
-            crc = UpdateCrc32(crc,
-                              level0Ptr + static_cast<size_t>(y) * static_cast<size_t>(rowPitch),
-                              static_cast<size_t>(width));
-        }
-    }
-    if (extraData && extraLen > 0) {
-        crc = UpdateCrc32(crc, extraData, extraLen);
-    }
-    return crc;
 }
 
 uint32_t LookupOrComputeLevel0Crc32(uint32_t keyA,
@@ -160,6 +153,40 @@ uint32_t LookupOrComputeLevel0Crc32(uint32_t keyA,
     return ComputeTextureRectCrc32(level0Ptr, width, height, rowPitch, extraData, extraLen);
 }
 
+void CacheTexturePixels(uint32_t pdatPtr,
+                        uint32_t level0Crc32,
+                        const uint8_t* level0Ptr,
+                        int32_t width,
+                        int32_t height,
+                        int32_t rowPitch) {
+    if (!level0Ptr || width <= 0 || height <= 0 || width > 1024 || height > 1024 || rowPitch < width) {
+        return;
+    }
+    const uint64_t key = (static_cast<uint64_t>(pdatPtr) << 32) | level0Crc32;
+    auto it = g_texPixelCache.find(key);
+    if (it != g_texPixelCache.end() && it->second.width == width && it->second.height == height) {
+        return;
+    }
+    if (g_texPixelCache.size() >= kMaxTexPixelCache) {
+        g_texPixelCache.clear();
+        ++g_cacheGeneration;
+    }
+    CachedTexturePixels entry;
+    entry.width = width;
+    entry.height = height;
+    entry.pixels.resize(static_cast<size_t>(width) * static_cast<size_t>(height));
+    if (rowPitch == width) {
+        std::memcpy(entry.pixels.data(), level0Ptr, entry.pixels.size());
+    } else {
+        for (int32_t y = 0; y < height; ++y) {
+            std::memcpy(entry.pixels.data() + static_cast<size_t>(y) * static_cast<size_t>(width),
+                        level0Ptr + static_cast<size_t>(y) * static_cast<size_t>(rowPitch),
+                        static_cast<size_t>(width));
+        }
+    }
+    g_texPixelCache[key] = std::move(entry);
+}
+
 uintptr_t Rebase(uint32_t preferredVa) {
     return reinterpret_cast<uintptr_t>(g_hostModule) + (preferredVa - rr95::kPreferredImageBase);
 }
@@ -180,41 +207,58 @@ void CheckAndInvalidateCacheOnLevelChange() {
     const uint32_t* families = GlobalPtr<const uint32_t>(kVaFamilySlots);
     const uint32_t raceTick = *GlobalPtr<const uint32_t>(kVaRaceTick);
 
-    if (!g_levelSnapshot.initialized) {
-        g_levelSnapshot.initialized = true;
-        g_levelSnapshot.globalRsc = globalRsc;
-        g_levelSnapshot.trackRsc = trackRsc;
-        g_levelSnapshot.spritePdat = spritePdat;
-        g_levelSnapshot.bikerBuf = bikerBuf;
-        for (int i = 0; i < 4; ++i) {
-            g_levelSnapshot.familySlots[i] = families[i];
-        }
-        g_levelSnapshot.lastRaceTick = raceTick;
+    if (UpdateLevelStateSnapshot(g_levelSnapshot, globalRsc, trackRsc, spritePdat, bikerBuf, families, raceTick)) {
+        CaptureInvalidateCache();
+    }
+}
+
+void SnapshotHorizonAndClearSurfaceIfNeeded() {
+    if (g_horizonCapturedThisFrame || !g_hostModule || !CaptureShouldSkipSoftwareRasterizer()) {
+        return;
+    }
+    if (*GlobalPtr<const uint8_t>(kVaSurfaceLockedFlag) == 0) {
+        return;
+    }
+    uint8_t* surfBase = *GlobalPtr<uint8_t*>(kVaSurfaceBasePtr);
+    const int32_t surfPitch = *GlobalPtr<int32_t>(kVaSurfacePitch);
+    if (!surfBase || surfPitch < kSurfaceWidth) {
         return;
     }
 
-    bool changed = (globalRsc != g_levelSnapshot.globalRsc) ||
-                   (trackRsc != g_levelSnapshot.trackRsc) ||
-                   (spritePdat != g_levelSnapshot.spritePdat) ||
-                   (bikerBuf != g_levelSnapshot.bikerBuf) ||
-                   (raceTick < g_levelSnapshot.lastRaceTick);
-    for (int i = 0; i < 4; ++i) {
-        if (families[i] != g_levelSnapshot.familySlots[i]) {
-            changed = true;
+    int32_t horizonH = *GlobalPtr<int32_t>(kVaHorizonHeight);
+    if (horizonH <= 0 || horizonH > kSurfaceHeight) {
+        horizonH = 360;
+    }
+    g_horizonHeight = horizonH;
+
+    // Copy Layer 1 (sky/horizon blitted by FUN_00469770 before FUN_004688e0) into g_horizonBuffer.
+    for (int32_t y = 0; y < horizonH; ++y) {
+        std::memcpy(g_horizonBuffer + static_cast<size_t>(y) * kSurfaceWidth,
+                    surfBase + static_cast<ptrdiff_t>(y) * surfPitch,
+                    kSurfaceWidth);
+    }
+    // Extend bottom horizon scanline across the remaining rows so there is never an uninitialized seam.
+    const uint8_t* fillRow = (horizonH > 0)
+                                 ? (g_horizonBuffer + static_cast<size_t>(horizonH - 1) * kSurfaceWidth)
+                                 : nullptr;
+    for (int32_t y = horizonH; y < kSurfaceHeight; ++y) {
+        uint8_t* dstRow = g_horizonBuffer + static_cast<size_t>(y) * kSurfaceWidth;
+        if (fillRow) {
+            std::memcpy(dstRow, fillRow, kSurfaceWidth);
+        } else {
+            std::memset(dstRow, 0, kSurfaceWidth);
         }
     }
 
-    if (changed) {
-        CaptureInvalidateCache();
-        g_levelSnapshot.globalRsc = globalRsc;
-        g_levelSnapshot.trackRsc = trackRsc;
-        g_levelSnapshot.spritePdat = spritePdat;
-        g_levelSnapshot.bikerBuf = bikerBuf;
-        for (int i = 0; i < 4; ++i) {
-            g_levelSnapshot.familySlots[i] = families[i];
-        }
+    // Clear the locked 8bpp surface to kHudTransparentSentinel (0x7E) so that after FUN_004688e0
+    // finishes and FUN_0045d6d0 draws the dashboard/HUD/gauges/text onto DAT_005cd4bc, only pixels
+    // actually written by Layer 3 (including black index 0 gauge interiors and text drop-shadows)
+    // differ from kHudTransparentSentinel.
+    for (int32_t y = 0; y < kSurfaceHeight; ++y) {
+        std::memset(surfBase + static_cast<ptrdiff_t>(y) * surfPitch, kHudTransparentSentinel, kSurfaceWidth);
     }
-    g_levelSnapshot.lastRaceTick = raceTick;
+
+    g_horizonCapturedThisFrame = true;
 }
 
 void WriteBe32(std::vector<uint8_t>& out, uint32_t val) {
@@ -246,6 +290,158 @@ bool WriteFrameJson(const std::wstring& path, uint32_t frameNum, int width, int 
 }
 
 }  // namespace
+
+uint32_t ComputeTextureRectCrc32(const uint8_t* level0Ptr,
+                                 int32_t width,
+                                 int32_t height,
+                                 int32_t rowPitch,
+                                 const uint8_t* extraData,
+                                 size_t extraLen) {
+    if (!level0Ptr || width <= 0 || height <= 0 || rowPitch < width) {
+        return 0;
+    }
+    uint32_t crc = 0u;
+    if (rowPitch == width) {
+        crc = UpdateCrc32(crc, level0Ptr, static_cast<size_t>(width) * static_cast<size_t>(height));
+    } else {
+        for (int32_t y = 0; y < height; ++y) {
+            crc = UpdateCrc32(crc,
+                              level0Ptr + static_cast<size_t>(y) * static_cast<size_t>(rowPitch),
+                              static_cast<size_t>(width));
+        }
+    }
+    if (extraData && extraLen > 0) {
+        crc = UpdateCrc32(crc, extraData, extraLen);
+    }
+    return crc;
+}
+
+void ClampSpriteDimensions(const int32_t uvBox[4],
+                           int32_t pdatPitch,
+                           int32_t pdatHeight,
+                           int32_t& outW,
+                           int32_t& outH) {
+    const int32_t maxW = (pdatPitch > 0) ? pdatPitch : 1;
+    const int32_t maxH = (pdatHeight > 0) ? pdatHeight : 1;
+    if (!uvBox) {
+        outW = maxW;
+        outH = maxH;
+        return;
+    }
+    int32_t w = uvBox[2] - uvBox[0];
+    int32_t h = uvBox[3] - uvBox[1];
+    if (w < 1) w = 1;
+    if (w > maxW) w = maxW;
+    if (h < 1) h = 1;
+    if (h > maxH) h = maxH;
+    outW = w;
+    outH = h;
+}
+
+bool UpdateLevelStateSnapshot(LevelStateSnapshot& snap,
+                              uint32_t globalRsc,
+                              uint32_t trackRsc,
+                              uint32_t spritePdat,
+                              uint32_t bikerBuf,
+                              const uint32_t familySlots[4],
+                              uint32_t raceTick) {
+    if (!snap.initialized) {
+        snap.initialized = true;
+        snap.globalRsc = globalRsc;
+        snap.trackRsc = trackRsc;
+        snap.spritePdat = spritePdat;
+        snap.bikerBuf = bikerBuf;
+        for (int i = 0; i < 4; ++i) {
+            snap.familySlots[i] = familySlots ? familySlots[i] : 0u;
+        }
+        snap.lastRaceTick = raceTick;
+        return false;
+    }
+
+    bool changed = (globalRsc != snap.globalRsc) ||
+                   (trackRsc != snap.trackRsc) ||
+                   (spritePdat != snap.spritePdat) ||
+                   (bikerBuf != snap.bikerBuf) ||
+                   (raceTick < snap.lastRaceTick);
+    if (familySlots) {
+        for (int i = 0; i < 4; ++i) {
+            if (familySlots[i] != snap.familySlots[i]) {
+                changed = true;
+            }
+        }
+    }
+
+    if (changed) {
+        snap.globalRsc = globalRsc;
+        snap.trackRsc = trackRsc;
+        snap.spritePdat = spritePdat;
+        snap.bikerBuf = bikerBuf;
+        if (familySlots) {
+            for (int i = 0; i < 4; ++i) {
+                snap.familySlots[i] = familySlots[i];
+            }
+        }
+    }
+    snap.lastRaceTick = raceTick;
+    return changed;
+}
+
+bool ShouldCullTexturedQuad(const CapturedVertex verts[4],
+                            const int32_t clipRect[4],
+                            uint32_t pdatPtr) {
+    if (!verts || !clipRect || pdatPtr == 0) {
+        return true;
+    }
+    int32_t minX = verts[0].x;
+    int32_t maxX = verts[0].x;
+    int32_t minY = verts[0].y;
+    int32_t maxY = verts[0].y;
+    for (int i = 1; i < 4; ++i) {
+        if (verts[i].x < minX) minX = verts[i].x;
+        if (verts[i].x > maxX) maxX = verts[i].x;
+        if (verts[i].y < minY) minY = verts[i].y;
+        if (verts[i].y > maxY) maxY = verts[i].y;
+    }
+    // Engine semantics (FUN_0042e850):
+    // - local_c == local_18 (minY == maxY) early-outs before mip selection and draws 0 scanlines.
+    // - Y scanlines are inclusive [clipT, clipB] (clipT > clipB culls).
+    // - X spans are half-open [clipL, clipR) where uVar13 = right - left (clipL >= clipR draws 0 pixels).
+    if (minY == maxY) {
+        return true;
+    }
+    const int32_t clipL = (minX > clipRect[0]) ? minX : clipRect[0];
+    const int32_t clipT = (minY > clipRect[1]) ? minY : clipRect[1];
+    const int32_t clipR = (maxX < clipRect[2]) ? maxX : clipRect[2];
+    const int32_t clipB = (maxY < clipRect[3]) ? maxY : clipRect[3];
+    return (clipL >= clipR) || (clipT > clipB);
+}
+
+bool ShouldCullFlatQuad(const CapturedVertex verts[4],
+                        const int32_t clipRect[4]) {
+    if (!verts || !clipRect) {
+        return true;
+    }
+    int32_t minX = verts[0].x;
+    int32_t maxX = verts[0].x;
+    int32_t minY = verts[0].y;
+    int32_t maxY = verts[0].y;
+    for (int i = 1; i < 4; ++i) {
+        if (verts[i].x < minX) minX = verts[i].x;
+        if (verts[i].x > maxX) maxX = verts[i].x;
+        if (verts[i].y < minY) minY = verts[i].y;
+        if (verts[i].y > maxY) maxY = verts[i].y;
+    }
+    // Engine semantics (FUN_00467cb0 & FUN_00468ce0):
+    // - Y scanlines are inclusive [clipT, clipB]; minY == maxY takes the single-scanline FUN_00468ce0
+    //   fast path and is NOT culled when clipT <= clipB.
+    // - X spans are half-open [clipL, clipR) where ECX = xR - xL is passed to FUN_00468ce0
+    //   (clipL >= clipR draws 0 pixels).
+    const int32_t clipL = (minX > clipRect[0]) ? minX : clipRect[0];
+    const int32_t clipT = (minY > clipRect[1]) ? minY : clipRect[1];
+    const int32_t clipR = (maxX < clipRect[2]) ? maxX : clipRect[2];
+    const int32_t clipB = (maxY < clipRect[3]) ? maxY : clipRect[3];
+    return (clipL >= clipR) || (clipT > clipB);
+}
 
 bool WriteIndexedPng(const std::wstring& path, const uint8_t* surface, int pitch, const uint8_t* palette, int width, int height) {
     if (!surface || !palette || width <= 0 || height <= 0) {
@@ -449,6 +645,11 @@ void CaptureInit(HMODULE hostModule, const std::wstring& dumpDir) {
     g_batchIndex = 0;
     g_raceFrameNumber = 0;
     g_f11WasDown = false;
+    g_dumpThisFrame = false;
+    g_dumpTriggeredCheckedThisFrame = false;
+    g_horizonCapturedThisFrame = false;
+    g_horizonHeight = 360;
+    std::memset(g_horizonBuffer, 0, sizeof(g_horizonBuffer));
     g_levelSnapshot = LevelStateSnapshot{};
     CaptureInvalidateCache();
     EnsureCrcTable();
@@ -456,17 +657,77 @@ void CaptureInit(HMODULE hostModule, const std::wstring& dumpDir) {
 
 void CaptureInvalidateCache() {
     std::memset(g_crcCache, 0, sizeof(g_crcCache));
+    g_texPixelCache.clear();
+    ++g_cacheGeneration;
+}
+
+bool CaptureShouldSkipSoftwareRasterizer() {
+    const Config& cfg = GetConfig();
+    return cfg.gpuWorld && cfg.presenterEnabled && !PresenterIsLatchedOff() && !g_dumpThisFrame;
+}
+
+bool CaptureHasWorldFrame() {
+    return g_horizonCapturedThisFrame && g_batchIndex > 0;
+}
+
+const CapturedQuad* CaptureGetWorldQuads(uint32_t& outCount) {
+    outCount = g_capturedCount;
+    return g_capturedQuads;
+}
+
+const uint8_t* CaptureGetHorizonLayer(int32_t& outHorizonHeight) {
+    outHorizonHeight = g_horizonHeight;
+    return g_horizonCapturedThisFrame ? g_horizonBuffer : nullptr;
+}
+
+const uint8_t* CaptureLookupTexturePixels(uint32_t pdatPtr,
+                                          uint32_t level0Crc32,
+                                          int32_t& outWidth,
+                                          int32_t& outHeight) {
+    const uint64_t key = (static_cast<uint64_t>(pdatPtr) << 32) | level0Crc32;
+    auto it = g_texPixelCache.find(key);
+    if (it == g_texPixelCache.end() || it->second.pixels.empty()) {
+        outWidth = 0;
+        outHeight = 0;
+        return nullptr;
+    }
+    outWidth = it->second.width;
+    outHeight = it->second.height;
+    return it->second.pixels.data();
+}
+
+uint32_t CaptureGetCacheGeneration() {
+    return g_cacheGeneration;
 }
 
 void CaptureOnBatchStart() {
     CheckAndInvalidateCacheOnLevelChange();
+    if (g_batchIndex == 0 && !g_dumpTriggeredCheckedThisFrame) {
+        g_dumpTriggeredCheckedThisFrame = true;
+        if (GetConfig().captureEnabled) {
+            const bool f11Down = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+            const bool f11Pressed = f11Down && !g_f11WasDown;
+            g_f11WasDown = f11Down;
+            const uint32_t nextFrameNum = g_raceFrameNumber + 1u;
+            const int autoDumpFrame = GetConfig().captureAutoDumpFrame;
+            const bool autoTriggered = (autoDumpFrame > 0 && static_cast<int>(nextFrameNum) == autoDumpFrame);
+            g_dumpThisFrame = f11Pressed || autoTriggered;
+        } else {
+            g_dumpThisFrame = false;
+        }
+    }
     ++g_batchIndex;
+}
+
+void CaptureOnBatchEnd() {
+    SnapshotHorizonAndClearSurfaceIfNeeded();
 }
 
 int CaptureTexturedQuadBefore() {
     if (!g_hostModule) {
         return -1;
     }
+    SnapshotHorizonAndClearSurfaceIfNeeded();
     if (g_capturedCount >= kMaxCapturedQuads) {
         ++g_overflowCount;
         return -1;
@@ -531,10 +792,9 @@ int CaptureTexturedQuadBefore() {
 
         if ((q.pdatFlags & 0x2000u) != 0) {
             // Dynamic sprite unpacked by FUN_00458f30 into top-left spriteW x spriteH of DAT_005aaa04 (stride pdatPitch=256).
-            int32_t spriteW = q.uvBox[2] - q.uvBox[0];
-            int32_t spriteH = q.uvBox[3] - q.uvBox[1];
-            if (spriteW <= 0 || spriteW > pdatPitch) spriteW = pdatPitch;
-            if (spriteH <= 0 || spriteH > pdatHeight) spriteH = pdatHeight;
+            int32_t spriteW = 0;
+            int32_t spriteH = 0;
+            ClampSpriteDimensions(q.uvBox, pdatPitch, pdatHeight, spriteW, spriteH);
             q.texWidth = spriteW;
             q.texHeight = spriteH;
 
@@ -551,12 +811,18 @@ int CaptureTexturedQuadBefore() {
                                   (static_cast<uint32_t>(q.spriteIndex) & 0x00FFFFFFu);
             q.level0Crc32 = LookupOrComputeLevel0Crc32(
                 q.pdatPtr, keyB, level0Ptr, spriteW, spriteH, pdatPitch, clutDescriptor, clutLen);
+            if (GetConfig().gpuWorld) {
+                CacheTexturePixels(q.pdatPtr, q.level0Crc32, level0Ptr, spriteW, spriteH, pdatPitch);
+            }
         } else {
             q.texWidth = pdatPitch;
             q.texHeight = pdatHeight;
             const uint32_t keyB = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(level0Ptr));
             q.level0Crc32 = LookupOrComputeLevel0Crc32(
                 q.pdatPtr, keyB, level0Ptr, pdatPitch, pdatHeight, pdatPitch, nullptr, 0);
+            if (GetConfig().gpuWorld) {
+                CacheTexturePixels(q.pdatPtr, q.level0Crc32, level0Ptr, pdatPitch, pdatHeight, pdatPitch);
+            }
         }
     }
 
@@ -570,13 +836,9 @@ void CaptureTexturedQuadAfter(int slotIndex) {
     }
     CapturedQuad& q = g_capturedQuads[slotIndex];
 
-    int16_t minX = q.verts[0].x;
-    int16_t maxX = q.verts[0].x;
     int16_t minY = q.verts[0].y;
     int16_t maxY = q.verts[0].y;
     for (int i = 1; i < 4; ++i) {
-        if (q.verts[i].x < minX) minX = q.verts[i].x;
-        if (q.verts[i].x > maxX) maxX = q.verts[i].x;
         if (q.verts[i].y < minY) minY = q.verts[i].y;
         if (q.verts[i].y > maxY) maxY = q.verts[i].y;
     }
@@ -585,6 +847,12 @@ void CaptureTexturedQuadAfter(int slotIndex) {
     if (minY == maxY || q.pdatPtr == 0) {
         q.chosenMip = -1;
         q.culled = true;
+        return;
+    }
+
+    if (CaptureShouldSkipSoftwareRasterizer()) {
+        q.chosenMip = 0;
+        q.culled = ShouldCullTexturedQuad(q.verts, q.clipRect, q.pdatPtr);
         return;
     }
 
@@ -606,15 +874,14 @@ void CaptureTexturedQuadAfter(int slotIndex) {
         }
     }
 
-    if (maxY < q.clipRect[1] || minY > q.clipRect[3] || maxX < q.clipRect[0] || minX > q.clipRect[2]) {
-        q.culled = true;
-    }
+    q.culled = ShouldCullTexturedQuad(q.verts, q.clipRect, q.pdatPtr);
 }
 
 int CaptureFlatQuadBefore(const int32_t* polyVerts, int edxArg) {
     if (!g_hostModule || !polyVerts) {
         return -1;
     }
+    SnapshotHorizonAndClearSurfaceIfNeeded();
     if (g_capturedCount >= kMaxCapturedQuads) {
         ++g_overflowCount;
         return -1;
@@ -670,12 +937,29 @@ int CaptureFlatQuadBefore(const int32_t* polyVerts, int edxArg) {
     return static_cast<int>(slot);
 }
 
-void CaptureFlatQuadAfter(int slotIndex, const int32_t* polyVerts) {
+void CaptureFlatQuadAfter(int slotIndex, int32_t* polyVerts) {
     if (slotIndex < 0 || static_cast<uint32_t>(slotIndex) >= g_capturedCount || !polyVerts) {
         return;
     }
 
     CapturedQuad& q = g_capturedQuads[slotIndex];
+    if (CaptureShouldSkipSoftwareRasterizer() && g_hostModule) {
+        int32_t* pYMin = GlobalPtr<int32_t>(0x00618544);
+        int32_t* pYMax = GlobalPtr<int32_t>(0x0061854c);
+        const int32_t clipYMax = *GlobalPtr<const int32_t>(0x006036cc);
+        if (*pYMax > clipYMax) {
+            *pYMax = clipYMax;
+        }
+        if (*pYMin != *pYMax) {
+            using FUN_00468d60_Fn = uint8_t(__fastcall*)(int32_t*, uint32_t);
+            auto fnOrderVerts = reinterpret_cast<FUN_00468d60_Fn>(Rebase(0x00468d60));
+            if (fnOrderVerts(polyVerts, 0) == 0) {
+                q.culled = true;
+                return;
+            }
+        }
+    }
+
     for (int i = 0; i < 4; ++i) {
         q.verts[i].x = static_cast<int16_t>(polyVerts[i * 2 + 0]);
         q.verts[i].y = static_cast<int16_t>(polyVerts[i * 2 + 1]);
@@ -683,37 +967,22 @@ void CaptureFlatQuadAfter(int slotIndex, const int32_t* polyVerts) {
         q.verts[i].v = 0;
     }
 
-    int32_t minX = q.verts[0].x;
-    int32_t maxX = q.verts[0].x;
-    int32_t minY = q.verts[0].y;
-    int32_t maxY = q.verts[0].y;
-    for (int i = 1; i < 4; ++i) {
-        if (q.verts[i].x < minX) minX = q.verts[i].x;
-        if (q.verts[i].x > maxX) maxX = q.verts[i].x;
-        if (q.verts[i].y < minY) minY = q.verts[i].y;
-        if (q.verts[i].y > maxY) maxY = q.verts[i].y;
-    }
-
-    // Note: in FUN_00467cb0, minY == maxY takes the single-scanline FUN_00468ce0 fast path (not culled!)
-    // as long as the horizontal span [max(minX, clip_xmin) .. min(maxX, clip_xmax)] is non-empty.
-    const int32_t clipL = (minX > q.clipRect[0]) ? minX : q.clipRect[0];
-    const int32_t clipR = (maxX < q.clipRect[2]) ? maxX : q.clipRect[2];
-    if (maxY < q.clipRect[1] || minY > q.clipRect[3] || clipL >= clipR) {
-        q.culled = true;
-    }
+    q.culled = ShouldCullFlatQuad(q.verts, q.clipRect);
 }
 
 void CaptureOnRacePresent(const uint8_t* surface, int pitch, const uint8_t* palette, int width, int height) {
     ++g_raceFrameNumber;
 
-    const bool f11Down = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
-    const bool f11Pressed = f11Down && !g_f11WasDown;
-    g_f11WasDown = f11Down;
+    if (!g_dumpTriggeredCheckedThisFrame && GetConfig().captureEnabled) {
+        const bool f11Down = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+        const bool f11Pressed = f11Down && !g_f11WasDown;
+        g_f11WasDown = f11Down;
+        const int autoDumpFrame = GetConfig().captureAutoDumpFrame;
+        const bool autoTriggered = (autoDumpFrame > 0 && static_cast<int>(g_raceFrameNumber) == autoDumpFrame);
+        g_dumpThisFrame = f11Pressed || autoTriggered;
+    }
 
-    const int autoDumpFrame = GetConfig().captureAutoDumpFrame;
-    const bool autoTriggered = (autoDumpFrame > 0 && static_cast<int>(g_raceFrameNumber) == autoDumpFrame);
-
-    if (f11Pressed || autoTriggered) {
+    if (g_dumpThisFrame) {
         wchar_t jsonName[64] = {0};
         wchar_t pngName[64] = {0};
         std::swprintf(jsonName, 64, L"frame_%u.json", g_raceFrameNumber);
@@ -738,4 +1007,7 @@ void CaptureEndFrame() {
     g_capturedCount = 0;
     g_overflowCount = 0;
     g_batchIndex = 0;
+    g_dumpThisFrame = false;
+    g_dumpTriggeredCheckedThisFrame = false;
+    g_horizonCapturedThisFrame = false;
 }

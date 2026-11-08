@@ -193,6 +193,23 @@ void RecordFrameAndLogFps(bool presentedByD3D) {
     }
 }
 
+void FinishRaceFrameAndPollHotkeys() {
+    if (GetConfig().captureEnabled || GetConfig().gpuWorld) {
+        CaptureEndFrame();
+    }
+    static bool s_prevF10Down = false;
+    const bool f10Down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+    if (f10Down && !s_prevF10Down) {
+        const bool newState = ToggleGpuWorld();
+        CaptureInvalidateCache();
+        LOG_INFO("GpuWorld toggled via F10 to %d (internal resolution %dx%d)",
+                 newState ? 1 : 0,
+                 GetConfig().internalWidth,
+                 GetConfig().internalHeight);
+    }
+    s_prevF10Down = f10Down;
+}
+
 void __fastcall Detour_FUN_0046e630(uint8_t* buffer, int pitch, int palette) {
     const int width = *GlobalPtr<int>(kVaBufferWidth);
     const int height = *GlobalPtr<int>(kVaBufferHeight);
@@ -201,7 +218,6 @@ void __fastcall Detour_FUN_0046e630(uint8_t* buffer, int pitch, int palette) {
         if (buffer != nullptr && palette != 0 && width > 0 && height > 0) {
             CaptureOnRacePresent(buffer, pitch, reinterpret_cast<const uint8_t*>(palette), width, height);
         }
-        CaptureEndFrame();
     }
 
     if (!GetConfig().presenterEnabled) {
@@ -209,6 +225,7 @@ void __fastcall Detour_FUN_0046e630(uint8_t* buffer, int pitch, int palette) {
             g_orig_FUN_0046e630(buffer, pitch, palette);
         }
         RecordFrameAndLogFps(false);
+        FinishRaceFrameAndPollHotkeys();
         return;
     }
 
@@ -221,6 +238,7 @@ void __fastcall Detour_FUN_0046e630(uint8_t* buffer, int pitch, int palette) {
             g_orig_FUN_0046e630(buffer, pitch, palette);
         }
         RecordFrameAndLogFps(false);
+        FinishRaceFrameAndPollHotkeys();
         return;
     }
 
@@ -228,7 +246,7 @@ void __fastcall Detour_FUN_0046e630(uint8_t* buffer, int pitch, int palette) {
 
     bool ok = false;
     const uint8_t* palBytes = reinterpret_cast<const uint8_t*>(palette);
-    if (overlayCount > 0) {
+    if (overlayCount > 0 && !(GetConfig().gpuWorld && CaptureHasWorldFrame())) {
         uint32_t lut[256];
         for (int i = 0; i < 256; ++i) {
             const uint32_t r = palBytes[i * 4 + 0];
@@ -260,10 +278,12 @@ void __fastcall Detour_FUN_0046e630(uint8_t* buffer, int pitch, int palette) {
             g_orig_FUN_0046e630(buffer, pitch, palette);
         }
         RecordFrameAndLogFps(false);
+        FinishRaceFrameAndPollHotkeys();
         return;
     }
 
     RecordFrameAndLogFps(true);
+    FinishRaceFrameAndPollHotkeys();
 }
 
 void __cdecl Detour_FUN_0046ded0() {
@@ -312,24 +332,44 @@ void __fastcall Detour_FUN_00460b00(char windowed) {
 }
 
 uint32_t __cdecl Detour_FUN_004688e0() {
-    CaptureOnBatchStart();
-    if (g_orig_FUN_004688e0) {
-        return g_orig_FUN_004688e0();
+    if (!GetConfig().captureEnabled && !GetConfig().gpuWorld) {
+        if (g_orig_FUN_004688e0) {
+            return g_orig_FUN_004688e0();
+        }
+        return 1;
     }
-    return 1;
+    CaptureOnBatchStart();
+    uint32_t res = 1;
+    if (g_orig_FUN_004688e0) {
+        res = g_orig_FUN_004688e0();
+    }
+    CaptureOnBatchEnd();
+    return res;
 }
 
 void __cdecl Detour_FUN_0042e850() {
+    if (!GetConfig().captureEnabled && !GetConfig().gpuWorld) {
+        if (g_orig_FUN_0042e850) {
+            g_orig_FUN_0042e850();
+        }
+        return;
+    }
     const int slot = CaptureTexturedQuadBefore();
-    if (g_orig_FUN_0042e850) {
+    if (!CaptureShouldSkipSoftwareRasterizer() && g_orig_FUN_0042e850) {
         g_orig_FUN_0042e850();
     }
     CaptureTexturedQuadAfter(slot);
 }
 
 void __fastcall Detour_FUN_00467cb0(int* polyVerts, int edxArg) {
+    if (!GetConfig().captureEnabled && !GetConfig().gpuWorld) {
+        if (g_orig_FUN_00467cb0) {
+            g_orig_FUN_00467cb0(polyVerts, edxArg);
+        }
+        return;
+    }
     const int slot = CaptureFlatQuadBefore(polyVerts, edxArg);
-    if (g_orig_FUN_00467cb0) {
+    if (!CaptureShouldSkipSoftwareRasterizer() && g_orig_FUN_00467cb0) {
         g_orig_FUN_00467cb0(polyVerts, edxArg);
     }
     CaptureFlatQuadAfter(slot, polyVerts);
@@ -455,18 +495,18 @@ bool InstallHooks(ExeBuild build) {
         LOG_WARN("IAT hook on GDI32.dll!StretchDIBits not installed; gdi_blits will report n/a");
     }
 
-    if (GetConfig().captureEnabled) {
+    if (GetConfig().captureEnabled || GetConfig().presenterEnabled || GetConfig().gpuWorld) {
         if (!rr95::InstallHook(g_site_FUN_004688e0, g_hostModule)) {
-            LOG_ERROR("Failed to install capture hook on FUN_004688e0");
+            LOG_ERROR("Failed to install capture/world hook on FUN_004688e0");
         } else if (!rr95::InstallHook(g_site_FUN_0042e850, g_hostModule)) {
-            LOG_ERROR("Failed to install capture hook on FUN_0042e850");
+            LOG_ERROR("Failed to install capture/world hook on FUN_0042e850");
             rr95::RemoveHook(g_site_FUN_004688e0, g_hostModule);
         } else if (!rr95::InstallHook(g_site_FUN_00467cb0, g_hostModule)) {
-            LOG_ERROR("Failed to install capture hook on FUN_00467cb0");
+            LOG_ERROR("Failed to install capture/world hook on FUN_00467cb0");
             rr95::RemoveHook(g_site_FUN_0042e850, g_hostModule);
             rr95::RemoveHook(g_site_FUN_004688e0, g_hostModule);
         } else {
-            LOG_INFO("Capture hooks on FUN_004688e0, FUN_0042e850, and FUN_00467cb0 installed");
+            LOG_INFO("Capture/world hooks on FUN_004688e0, FUN_0042e850, and FUN_00467cb0 installed");
         }
     }
 

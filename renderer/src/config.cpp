@@ -88,6 +88,28 @@ void ConfigInit(const std::wstring& iniFilePath) {
 
     UINT autoDumpVal = GetPrivateProfileIntW(L"Capture", L"AutoDumpFrame", 0, iniFilePath.c_str());
     g_config.captureAutoDumpFrame = static_cast<int>(autoDumpVal);
+
+    UINT generalGpuWorld = GetPrivateProfileIntW(L"General", L"GpuWorld", 0, iniFilePath.c_str());
+    UINT presenterGpuWorld = GetPrivateProfileIntW(L"Presenter", L"GpuWorld", generalGpuWorld, iniFilePath.c_str());
+    UINT worldGpuWorld = GetPrivateProfileIntW(L"World", L"GpuWorld", presenterGpuWorld, iniFilePath.c_str());
+    g_config.gpuWorld = (worldGpuWorld != 0);
+
+    INT generalHeight = static_cast<INT>(GetPrivateProfileIntW(L"General", L"InternalHeight", 1080, iniFilePath.c_str()));
+    INT presenterHeight = static_cast<INT>(GetPrivateProfileIntW(L"Presenter", L"InternalHeight", generalHeight, iniFilePath.c_str()));
+    INT worldHeight = static_cast<INT>(GetPrivateProfileIntW(L"World", L"InternalHeight", presenterHeight, iniFilePath.c_str()));
+    g_config.internalHeight = ClampInternalHeight(worldHeight);
+    g_config.internalWidth = (g_config.internalHeight * 4) / 3;
+}
+
+int ClampInternalHeight(int h) {
+    if (h < 240) return 240;
+    if (h > 4320) return 4320;
+    return h;
+}
+
+bool ToggleGpuWorld() {
+    g_config.gpuWorld = !g_config.gpuWorld;
+    return g_config.gpuWorld;
 }
 
 const Config& GetConfig() {
