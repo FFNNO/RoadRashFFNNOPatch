@@ -194,23 +194,22 @@ void RecordFrameAndLogFps(bool presentedByD3D) {
 }
 
 void FinishRaceFrameAndPollHotkeys() {
-    if (GetConfig().captureEnabled || GetConfig().gpuWorld) {
+    static RaceFrameHotkeyState s_hotkeyState;
+    const Config& cfg = GetConfig();
+    const uint32_t vk = cfg.toggleKey;
+    const bool keyDown = (vk != 0) && (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
+    const RaceFrameActions actions = AdvanceRaceFrame(s_hotkeyState, cfg.captureEnabled, cfg.gpuWorld, vk, keyDown);
+    if (actions.endCaptureFrame) {
         CaptureEndFrame();
     }
-    const uint32_t vk = GetConfig().toggleKey;
-    if (vk != 0) {
-        static bool s_prevKeyDown = false;
-        const bool keyDown = (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
-        if (keyDown && !s_prevKeyDown) {
-            const bool newState = ToggleGpuWorld();
-            CaptureInvalidateCache();
-            LOG_INFO("GpuWorld toggled via key 0x%02X to %d (internal resolution %dx%d)",
-                     vk,
-                     newState ? 1 : 0,
-                     GetConfig().internalWidth,
-                     GetConfig().internalHeight);
-        }
-        s_prevKeyDown = keyDown;
+    if (actions.toggleGpuWorld) {
+        const bool newState = ToggleGpuWorld();
+        CaptureInvalidateCache();
+        LOG_INFO("GpuWorld toggled via key 0x%02X to %d (internal resolution %dx%d)",
+                 vk,
+                 newState ? 1 : 0,
+                 GetConfig().internalWidth,
+                 GetConfig().internalHeight);
     }
 }
 
@@ -359,10 +358,11 @@ void __cdecl Detour_FUN_0042e850() {
         return;
     }
     const int slot = CaptureTexturedQuadBefore();
-    if (!CaptureShouldSkipSoftwareRasterizer() && g_orig_FUN_0042e850) {
+    const bool skip = CaptureShouldSkipSoftwareRasterizer();
+    if (!skip && g_orig_FUN_0042e850) {
         g_orig_FUN_0042e850();
     }
-    CaptureTexturedQuadAfter(slot);
+    CaptureTexturedQuadAfter(slot, skip);
 }
 
 void __fastcall Detour_FUN_00467cb0(int* polyVerts, int edxArg) {
@@ -373,10 +373,11 @@ void __fastcall Detour_FUN_00467cb0(int* polyVerts, int edxArg) {
         return;
     }
     const int slot = CaptureFlatQuadBefore(polyVerts, edxArg);
-    if (!CaptureShouldSkipSoftwareRasterizer() && g_orig_FUN_00467cb0) {
+    const bool skip = CaptureShouldSkipSoftwareRasterizer();
+    if (!skip && g_orig_FUN_00467cb0) {
         g_orig_FUN_00467cb0(polyVerts, edxArg);
     }
-    CaptureFlatQuadAfter(slot, polyVerts);
+    CaptureFlatQuadAfter(slot, polyVerts, skip);
 }
 
 }  // namespace

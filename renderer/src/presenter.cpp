@@ -2,6 +2,7 @@
 #include "config.h"
 #include "capture.h"
 #include "log.h"
+#include "quad_mapping.h"
 
 #include <d3d11.h>
 #include <dxgi.h>
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -67,6 +69,10 @@ bool PresenterRecordFailure(PresenterFailureState& state, uint64_t nowMs) {
         return true;
     }
     return false;
+}
+
+bool PresenterStateAllowsGpuWorld(const PresenterFailureState& state) {
+    return !state.latchedOff && state.failureCount == 0;
 }
 
 void PresenterRecordSuccess(PresenterFailureState& state) {
@@ -244,56 +250,9 @@ float4 main(PSIn p) : SV_Target {
     float2 pts[4] = { p.p01.xy, p.p01.zw, p.p23.xy, p.p23.zw };
     float2 uvs[4] = { p.uv01.xy, p.uv01.zw, p.uv23.xy, p.uv23.zw };
 
-    float ymin = min(min(pts[0].y, pts[1].y), min(pts[2].y, pts[3].y));
-    float ymax = max(max(pts[0].y, pts[1].y), max(pts[2].y, pts[3].y));
-    float yClamped = clamp(curY, ymin, ymax);
-
-    float xL = 0.0;
-    float xR = 0.0;
-    float2 uvL = float2(0.0, 0.0);
-    float2 uvR = float2(0.0, 0.0);
-    bool foundL = false;
-    bool foundR = false;
-
-    [unroll]
-    for (int i = 0; i < 4; ++i) {
-        int next = (i + 1) & 3;
-        float2 p0 = pts[i];
-        float2 p1 = pts[next];
-        float2 uv0 = uvs[i];
-        float2 uv1 = uvs[next];
-
-        if (p1.y > p0.y) {
-            if (yClamped >= p0.y && yClamped <= p1.y && !foundR) {
-                float s = (yClamped - p0.y) / (p1.y - p0.y);
-                xR = lerp(p0.x, p1.x, s);
-                uvR = lerp(uv0, uv1, s);
-                foundR = true;
-            }
-        } else if (p1.y < p0.y) {
-            if (yClamped >= p1.y && yClamped <= p0.y && !foundL) {
-                float s = (yClamped - p1.y) / (p0.y - p1.y);
-                xL = lerp(p1.x, p0.x, s);
-                uvL = lerp(uv1, uv0, s);
-                foundL = true;
-            }
-        }
-    }
-
-    if (!foundL) {
-        xL = min(min(pts[0].x, pts[1].x), min(pts[2].x, pts[3].x));
-        uvL = uvs[0];
-    }
-    if (!foundR) {
-        xR = max(max(pts[0].x, pts[1].x), max(pts[2].x, pts[3].x));
-        uvR = uvs[1];
-    }
-
-    float span = max(xR - xL, 1e-4);
-    float t = saturate((curX - xL) / span);
-    float2 finalUv = lerp(uvL, uvR, t);
-
-    finalUv = clamp(finalUv, p.uvClamp.xy, p.uvClamp.zw);
+    // Engine scanline mapping (quad_mapping.h, shared with hook_test).
+    QuadUvSample m = QuadMapUv(pts, uvs, curX, curY);
+    float2 finalUv = clamp(m.uv, p.uvClamp.xy, p.uvClamp.zw);
 
     float4 texel = texQuad.Sample(samp, finalUv);
     if (texel.a < 0.5) {
@@ -302,6 +261,14 @@ float4 main(PSIn p) : SV_Target {
     return texel * p.color;
 }
 )";
+
+// The world pixel shader is the shared quad mapping (quad_mapping.h) followed by its main().
+std::string BuildWorldPixelShaderSource() {
+    std::string src = RR_QUAD_MAPPING_HLSL;
+    src += "\n";
+    src += kWorldPixelShaderSrc;
+    return src;
+}
 
 struct WorldVertex {
     float x, y;
@@ -328,6 +295,10 @@ class D3D11Presenter {
 public:
     bool IsLatchedOff() const {
         return m_failureState.latchedOff || m_inBackoffCooldown;
+    }
+
+    bool GpuWorldAllowed() const {
+        return PresenterStateAllowsGpuWorld(m_failureState) && !m_inBackoffCooldown;
     }
 
     bool Present8bpp(HWND hwnd, const uint8_t* surface, int pitch, const uint8_t* palette, int width, int height) {
@@ -796,7 +767,8 @@ private:
 
         ComPtr<ID3DBlob> worldPsBlob;
         errBlob.Reset();
-        hr = D3DCompile(kWorldPixelShaderSrc, std::strlen(kWorldPixelShaderSrc), "world_ps",
+        const std::string worldPsSource = BuildWorldPixelShaderSource();
+        hr = D3DCompile(worldPsSource.c_str(), worldPsSource.size(), "world_ps",
                         nullptr, nullptr, "main", "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
                         &worldPsBlob, &errBlob);
         if (FAILED(hr)) {
@@ -1057,8 +1029,12 @@ private:
         return rawSrv;
     }
 
+    // When useHudSentinelKey is set, pixels equal to the frame's HUD sentinel become transparent and
+    // a histogram of the layer is handed to the capture module (HUD sentinel collision detection).
     bool UploadLayerToRgbaTexture(const uint8_t* srcSurf, int srcPitch, const uint8_t* palette,
                                   int width, int height, bool useHudSentinelKey) {
+        const uint8_t sentinel = CaptureGetHudSentinel();
+        uint32_t hist[256] = {};
         D3D11_MAPPED_SUBRESOURCE mapped = {};
         HRESULT hr = m_context->Map(m_texLayerRgba.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
         if (FAILED(hr)) {
@@ -1071,7 +1047,10 @@ private:
             const uint8_t* srcRow = srcSurf + static_cast<ptrdiff_t>(y) * srcPitch;
             for (int x = 0; x < width; ++x) {
                 const uint8_t idx = srcRow[x];
-                if (useHudSentinelKey && idx == kHudTransparentSentinel) {
+                if (useHudSentinelKey) {
+                    ++hist[idx];
+                }
+                if (useHudSentinelKey && idx == sentinel) {
                     dstRow[x] = 0x00000000u;
                 } else {
                     const uint32_t r = palette[idx * 4 + 0];
@@ -1082,6 +1061,9 @@ private:
             }
         }
         m_context->Unmap(m_texLayerRgba.Get(), 0);
+        if (useHudSentinelKey) {
+            CaptureObserveHudLayer(hist);
+        }
         return true;
     }
 
@@ -1269,27 +1251,23 @@ private:
                 uv23[2] = static_cast<float>(q.verts[3].u) / texW;
                 uv23[3] = static_cast<float>(q.verts[3].v) / texH;
 
-                float minTexX = 0.0f;
-                float minTexY = 0.0f;
-                float maxTexX = texW - 1.0f;
-                float maxTexY = texH - 1.0f;
-
-                if ((q.pdatFlags & 0x2000u) != 0) {
-                    minTexX = 0.0f;
-                    minTexY = 0.0f;
-                    maxTexX = texW - 1.0f;
-                    maxTexY = texH - 1.0f;
-                } else if (q.uvBox[2] > q.uvBox[0] && q.uvBox[3] > q.uvBox[1]) {
-                    minTexX = static_cast<float>(q.uvBox[0]);
-                    minTexY = static_cast<float>(q.uvBox[1]);
-                    maxTexX = static_cast<float>(q.uvBox[2]);
-                    maxTexY = static_cast<float>(q.uvBox[3]);
+                const int32_t us[4] = {q.verts[0].u, q.verts[1].u, q.verts[2].u, q.verts[3].u};
+                const int32_t vs[4] = {q.verts[0].v, q.verts[1].v, q.verts[2].v, q.verts[3].v};
+                const QuadAddressing addr = ChooseQuadAddressing(
+                    q.uvBox, (q.pdatFlags & 0x2000u) != 0, q.texWidth, q.texHeight, us, vs);
+                if (addr.wrap) {
+                    // UVs past the texture: wrap like the engine span routines (no clamp).
+                    sampler = m_samplerWrap.Get();
+                    uvClamp[0] = -1.0e6f;
+                    uvClamp[1] = -1.0e6f;
+                    uvClamp[2] = 1.0e6f;
+                    uvClamp[3] = 1.0e6f;
+                } else {
+                    uvClamp[0] = (static_cast<float>(addr.clampTexel[0]) + 0.5f) / texW;
+                    uvClamp[1] = (static_cast<float>(addr.clampTexel[1]) + 0.5f) / texH;
+                    uvClamp[2] = (static_cast<float>(addr.clampTexel[2]) + 0.5f) / texW;
+                    uvClamp[3] = (static_cast<float>(addr.clampTexel[3]) + 0.5f) / texH;
                 }
-
-                uvClamp[0] = (minTexX + 0.5f) / texW;
-                uvClamp[1] = (minTexY + 0.5f) / texH;
-                uvClamp[2] = (maxTexX + 0.5f) / texW;
-                uvClamp[3] = (maxTexY + 0.5f) / texH;
 
                 for (int i = 0; i < 4; ++i) {
                     vx[i] = static_cast<float>(q.verts[i].x) * invSrcW * 2.0f - 1.0f;
@@ -1522,6 +1500,10 @@ D3D11Presenter g_presenter;
 
 }  // namespace
 
+std::string PresenterWorldPixelShaderSource() {
+    return BuildWorldPixelShaderSource();
+}
+
 bool PresenterPresent8bpp(HWND hwnd, const uint8_t* surface, int pitch, const uint8_t* palette, int width, int height) {
     return g_presenter.Present8bpp(hwnd, surface, pitch, palette, width, height);
 }
@@ -1532,6 +1514,10 @@ bool PresenterPresentBgra(HWND hwnd, const uint32_t* dib, int width, int height)
 
 bool PresenterIsLatchedOff() {
     return g_presenter.IsLatchedOff();
+}
+
+bool PresenterGpuWorldAllowed() {
+    return g_presenter.GpuWorldAllowed();
 }
 
 void PresenterNotifyWindowChange() {

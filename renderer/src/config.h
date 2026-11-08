@@ -21,13 +21,15 @@ struct Config {
     bool gpuWorld = false;
     int internalWidth = 1440;
     int internalHeight = 1080;
-    uint32_t toggleKey = 0x7B;  // VK_F12
+    uint32_t toggleKey = 0x91;  // VK_SCROLL (Scroll Lock)
 };
 
 void ConfigInit(const std::wstring& iniFilePath);
 const Config& GetConfig();
 bool ToggleGpuWorld();
 int ClampInternalHeight(int h);
-uint32_t ParseVirtualKey(const wchar_t* str, uint32_t defaultKey = 0x7B);
+// Accepts F1..F12, ScrollLock, Pause, or a full decimal/hex code in 1..255.
+// Anything else (including trailing garbage such as "0x7Bzz") returns defaultKey.
+uint32_t ParseVirtualKey(const wchar_t* str, uint32_t defaultKey = 0x91);
 bool ParseFilterMode(const wchar_t* str, FilterMode& outMode);
 const char* FilterModeToString(FilterMode mode);

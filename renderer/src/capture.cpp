@@ -13,7 +13,6 @@ namespace {
 
 constexpr uint32_t kMaxCapturedQuads = 4096;
 constexpr uint32_t kCrcCacheSize     = 512;  // Power of two for open-addressed table
-constexpr size_t   kMaxTexPixelCache = 2048;
 constexpr int32_t  kSurfaceWidth     = 640;
 constexpr int32_t  kSurfaceHeight    = 480;
 
@@ -92,6 +91,11 @@ struct CachedTexturePixels {
 
 std::unordered_map<uint64_t, CachedTexturePixels> g_texPixelCache;
 uint32_t g_cacheGeneration = 1;
+size_t g_texPixelCacheBytes = 0;
+size_t g_texPixelCacheCapBytes = kDefaultTexturePixelCacheCapBytes;
+uint32_t g_texPixelCacheEvictions = 0;
+
+HudSentinelState g_hudSentinel;
 
 void EnsureCrcTable() {
     if (g_crcTableReady) {
@@ -151,40 +155,6 @@ uint32_t LookupOrComputeLevel0Crc32(uint32_t keyA,
         idx = (idx + 1u) & (kCrcCacheSize - 1u);
     }
     return ComputeTextureRectCrc32(level0Ptr, width, height, rowPitch, extraData, extraLen);
-}
-
-void CacheTexturePixels(uint32_t pdatPtr,
-                        uint32_t level0Crc32,
-                        const uint8_t* level0Ptr,
-                        int32_t width,
-                        int32_t height,
-                        int32_t rowPitch) {
-    if (!level0Ptr || width <= 0 || height <= 0 || width > 1024 || height > 1024 || rowPitch < width) {
-        return;
-    }
-    const uint64_t key = (static_cast<uint64_t>(pdatPtr) << 32) | level0Crc32;
-    auto it = g_texPixelCache.find(key);
-    if (it != g_texPixelCache.end() && it->second.width == width && it->second.height == height) {
-        return;
-    }
-    if (g_texPixelCache.size() >= kMaxTexPixelCache) {
-        g_texPixelCache.clear();
-        ++g_cacheGeneration;
-    }
-    CachedTexturePixels entry;
-    entry.width = width;
-    entry.height = height;
-    entry.pixels.resize(static_cast<size_t>(width) * static_cast<size_t>(height));
-    if (rowPitch == width) {
-        std::memcpy(entry.pixels.data(), level0Ptr, entry.pixels.size());
-    } else {
-        for (int32_t y = 0; y < height; ++y) {
-            std::memcpy(entry.pixels.data() + static_cast<size_t>(y) * static_cast<size_t>(width),
-                        level0Ptr + static_cast<size_t>(y) * static_cast<size_t>(rowPitch),
-                        static_cast<size_t>(width));
-        }
-    }
-    g_texPixelCache[key] = std::move(entry);
 }
 
 uintptr_t Rebase(uint32_t preferredVa) {
@@ -250,12 +220,13 @@ void SnapshotHorizonAndClearSurfaceIfNeeded() {
         }
     }
 
-    // Clear the locked 8bpp surface to kHudTransparentSentinel (0x7E) so that after FUN_004688e0
+    // Clear the locked 8bpp surface to this frame's HUD sentinel so that after FUN_004688e0
     // finishes and FUN_0045d6d0 draws the dashboard/HUD/gauges/text onto DAT_005cd4bc, only pixels
     // actually written by Layer 3 (including black index 0 gauge interiors and text drop-shadows)
-    // differ from kHudTransparentSentinel.
+    // differ from the sentinel. See HudSentinelState in capture.h for how collisions are handled.
+    const uint8_t sentinel = HudSentinelActive(g_hudSentinel);
     for (int32_t y = 0; y < kSurfaceHeight; ++y) {
-        std::memset(surfBase + static_cast<ptrdiff_t>(y) * surfPitch, kHudTransparentSentinel, kSurfaceWidth);
+        std::memset(surfBase + static_cast<ptrdiff_t>(y) * surfPitch, sentinel, kSurfaceWidth);
     }
 
     g_horizonCapturedThisFrame = true;
@@ -441,6 +412,73 @@ bool ShouldCullFlatQuad(const CapturedVertex verts[4],
     const int32_t clipR = (maxX < clipRect[2]) ? maxX : clipRect[2];
     const int32_t clipB = (maxY < clipRect[3]) ? maxY : clipRect[3];
     return (clipL >= clipR) || (clipT > clipB);
+}
+
+uint8_t HudSentinelActive(const HudSentinelState& state) {
+    return state.candidates[state.active & 1u];
+}
+
+bool HudSentinelObserve(HudSentinelState& state, const uint32_t hist[256], uint8_t* outRetired,
+                        uint8_t* outReplacement) {
+    if (!hist) {
+        return false;
+    }
+    const uint8_t active = HudSentinelActive(state);
+    const uint8_t inactive = state.candidates[(state.active + 1u) & 1u];
+    const uint32_t stamp = state.frame + 1u;
+    for (int i = 0; i < 256; ++i) {
+        // Pixels equal to the active sentinel are mostly the clear value, so they prove nothing.
+        if (i != active && hist[i] > 0) {
+            state.lastSeen[i] = stamp;
+        }
+    }
+    if (hist[inactive] == 0) {
+        return false;
+    }
+    // The inactive candidate was not the clear value this frame, so every pixel with that index was
+    // written by a HUD writer: retire it and pick the least recently seen index instead. Index 0 is
+    // the black colour key used by HUD art and is never a candidate.
+    int best = -1;
+    for (int i = 1; i < 256; ++i) {
+        if (i == active || i == inactive) {
+            continue;
+        }
+        if (best < 0 || state.lastSeen[i] < state.lastSeen[best]) {
+            best = i;
+        }
+    }
+    if (best < 0) {
+        return false;
+    }
+    state.candidates[(state.active + 1u) & 1u] = static_cast<uint8_t>(best);
+    if (outRetired) {
+        *outRetired = inactive;
+    }
+    if (outReplacement) {
+        *outReplacement = static_cast<uint8_t>(best);
+    }
+    return true;
+}
+
+void HudSentinelAdvance(HudSentinelState& state) {
+    state.active = (state.active + 1u) & 1u;
+    ++state.frame;
+}
+
+RaceFrameActions AdvanceRaceFrame(RaceFrameHotkeyState& state,
+                                  bool captureEnabled,
+                                  bool gpuWorld,
+                                  uint32_t toggleKey,
+                                  bool keyDown) {
+    RaceFrameActions actions;
+    actions.endCaptureFrame = captureEnabled || gpuWorld;
+    if (toggleKey == 0) {
+        state.prevKeyDown = false;
+        return actions;
+    }
+    actions.toggleGpuWorld = keyDown && !state.prevKeyDown;
+    state.prevKeyDown = keyDown;
+    return actions;
 }
 
 bool WriteIndexedPng(const std::wstring& path, const uint8_t* surface, int pitch, const uint8_t* palette, int width, int height) {
@@ -651,6 +689,7 @@ void CaptureInit(HMODULE hostModule, const std::wstring& dumpDir) {
     g_horizonHeight = 360;
     std::memset(g_horizonBuffer, 0, sizeof(g_horizonBuffer));
     g_levelSnapshot = LevelStateSnapshot{};
+    g_hudSentinel = HudSentinelState{};
     CaptureInvalidateCache();
     EnsureCrcTable();
 }
@@ -658,12 +697,88 @@ void CaptureInit(HMODULE hostModule, const std::wstring& dumpDir) {
 void CaptureInvalidateCache() {
     std::memset(g_crcCache, 0, sizeof(g_crcCache));
     g_texPixelCache.clear();
+    g_texPixelCacheBytes = 0;
     ++g_cacheGeneration;
+}
+
+void CaptureSetTexturePixelCacheCap(size_t capBytes) {
+    g_texPixelCacheCapBytes = (capBytes > 0) ? capBytes : kDefaultTexturePixelCacheCapBytes;
+}
+
+size_t CaptureGetTexturePixelCacheBytes() {
+    return g_texPixelCacheBytes;
+}
+
+uint32_t CaptureGetTexturePixelCacheEvictions() {
+    return g_texPixelCacheEvictions;
+}
+
+void CaptureCacheTexturePixels(uint32_t pdatPtr,
+                               uint32_t level0Crc32,
+                               const uint8_t* level0Ptr,
+                               int32_t width,
+                               int32_t height,
+                               int32_t rowPitch) {
+    if (!level0Ptr || width <= 0 || height <= 0 || width > 1024 || height > 1024 || rowPitch < width) {
+        return;
+    }
+    const uint64_t key = (static_cast<uint64_t>(pdatPtr) << 32) | level0Crc32;
+    auto it = g_texPixelCache.find(key);
+    if (it != g_texPixelCache.end()) {
+        if (it->second.width == width && it->second.height == height) {
+            return;
+        }
+        g_texPixelCacheBytes -= it->second.pixels.size();
+        g_texPixelCache.erase(it);
+    }
+    const size_t entryBytes = static_cast<size_t>(width) * static_cast<size_t>(height);
+    if (g_texPixelCacheBytes + entryBytes > g_texPixelCacheCapBytes) {
+        ++g_texPixelCacheEvictions;
+        LOG_INFO("Texture pixel cache reached %zu of %zu bytes (%zu textures); clearing it (eviction %u)",
+                 g_texPixelCacheBytes, g_texPixelCacheCapBytes, g_texPixelCache.size(), g_texPixelCacheEvictions);
+        g_texPixelCache.clear();
+        g_texPixelCacheBytes = 0;
+        ++g_cacheGeneration;
+        if (entryBytes > g_texPixelCacheCapBytes) {
+            return;
+        }
+    }
+    CachedTexturePixels entry;
+    entry.width = width;
+    entry.height = height;
+    entry.pixels.resize(entryBytes);
+    if (rowPitch == width) {
+        std::memcpy(entry.pixels.data(), level0Ptr, entry.pixels.size());
+    } else {
+        for (int32_t y = 0; y < height; ++y) {
+            std::memcpy(entry.pixels.data() + static_cast<size_t>(y) * static_cast<size_t>(width),
+                        level0Ptr + static_cast<size_t>(y) * static_cast<size_t>(rowPitch),
+                        static_cast<size_t>(width));
+        }
+    }
+    g_texPixelCacheBytes += entry.pixels.size();
+    g_texPixelCache[key] = std::move(entry);
+}
+
+uint8_t CaptureGetHudSentinel() {
+    return HudSentinelActive(g_hudSentinel);
+}
+
+void CaptureObserveHudLayer(const uint32_t hist[256]) {
+    uint8_t retired = 0;
+    uint8_t replacement = 0;
+    if (HudSentinelObserve(g_hudSentinel, hist, &retired, &replacement)) {
+        LOG_INFO("HUD sentinel index 0x%02X was drawn by a HUD writer; replaced by 0x%02X",
+                 static_cast<unsigned int>(retired), static_cast<unsigned int>(replacement));
+    }
 }
 
 bool CaptureShouldSkipSoftwareRasterizer() {
     const Config& cfg = GetConfig();
-    return cfg.gpuWorld && cfg.presenterEnabled && !PresenterIsLatchedOff() && !g_dumpThisFrame;
+    // PresenterGpuWorldAllowed() is false while latched off, after any failed present that has not
+    // been followed by a successful one, and during the retry backoff: a GDI fallback frame must
+    // always contain the software world.
+    return cfg.gpuWorld && cfg.presenterEnabled && PresenterGpuWorldAllowed() && !g_dumpThisFrame;
 }
 
 bool CaptureHasWorldFrame() {
@@ -812,7 +927,7 @@ int CaptureTexturedQuadBefore() {
             q.level0Crc32 = LookupOrComputeLevel0Crc32(
                 q.pdatPtr, keyB, level0Ptr, spriteW, spriteH, pdatPitch, clutDescriptor, clutLen);
             if (GetConfig().gpuWorld) {
-                CacheTexturePixels(q.pdatPtr, q.level0Crc32, level0Ptr, spriteW, spriteH, pdatPitch);
+                CaptureCacheTexturePixels(q.pdatPtr, q.level0Crc32, level0Ptr, spriteW, spriteH, pdatPitch);
             }
         } else {
             q.texWidth = pdatPitch;
@@ -821,7 +936,7 @@ int CaptureTexturedQuadBefore() {
             q.level0Crc32 = LookupOrComputeLevel0Crc32(
                 q.pdatPtr, keyB, level0Ptr, pdatPitch, pdatHeight, pdatPitch, nullptr, 0);
             if (GetConfig().gpuWorld) {
-                CacheTexturePixels(q.pdatPtr, q.level0Crc32, level0Ptr, pdatPitch, pdatHeight, pdatPitch);
+                CaptureCacheTexturePixels(q.pdatPtr, q.level0Crc32, level0Ptr, pdatPitch, pdatHeight, pdatPitch);
             }
         }
     }
@@ -830,7 +945,7 @@ int CaptureTexturedQuadBefore() {
     return static_cast<int>(slot);
 }
 
-void CaptureTexturedQuadAfter(int slotIndex) {
+void CaptureTexturedQuadAfter(int slotIndex, bool rasterizerSkipped) {
     if (slotIndex < 0 || static_cast<uint32_t>(slotIndex) >= g_capturedCount) {
         return;
     }
@@ -850,7 +965,7 @@ void CaptureTexturedQuadAfter(int slotIndex) {
         return;
     }
 
-    if (CaptureShouldSkipSoftwareRasterizer()) {
+    if (rasterizerSkipped) {
         q.chosenMip = 0;
         q.culled = ShouldCullTexturedQuad(q.verts, q.clipRect, q.pdatPtr);
         return;
@@ -937,13 +1052,22 @@ int CaptureFlatQuadBefore(const int32_t* polyVerts, int edxArg) {
     return static_cast<int>(slot);
 }
 
-void CaptureFlatQuadAfter(int slotIndex, int32_t* polyVerts) {
+void CaptureFlatQuadAfter(int slotIndex, int32_t* polyVerts, bool rasterizerSkipped) {
     if (slotIndex < 0 || static_cast<uint32_t>(slotIndex) >= g_capturedCount || !polyVerts) {
         return;
     }
 
     CapturedQuad& q = g_capturedQuads[slotIndex];
-    if (CaptureShouldSkipSoftwareRasterizer() && g_hostModule) {
+    if (rasterizerSkipped && g_hostModule) {
+        // The original FUN_00467cb0 did not run, so emulate exactly the state changes its prologue
+        // makes before the span loop, and nothing else (verified in the exe bytes):
+        // - 0x467cb9..0x467cd5: clamp DAT_0061854c (max y) to the clip bottom DAT_006036cc;
+        // - 0x467ce9..0x467cf3: single-scanline polygons (DAT_00618544 == DAT_0061854c) branch to
+        //   FUN_00468ce0 and return without touching the vertices;
+        // - 0x467d2f..0x467d34: push edi / xor edx,edx / mov ecx,esi / call FUN_00468d60, which
+        //   reorders (and for concave inputs repairs) the four vertices at poly+0x18 in place.
+        //   With EDX=0 it never takes the branch that toggles the u-flip byte at poly+0x3d.
+        // The return value of FUN_00468d60 is ignored by FUN_00467cb0; here 0 marks the quad culled.
         int32_t* pYMin = GlobalPtr<int32_t>(0x00618544);
         int32_t* pYMax = GlobalPtr<int32_t>(0x0061854c);
         const int32_t clipYMax = *GlobalPtr<const int32_t>(0x006036cc);
@@ -1004,10 +1128,23 @@ void CaptureOnRacePresent(const uint8_t* surface, int pitch, const uint8_t* pale
 }
 
 void CaptureEndFrame() {
+    if (g_horizonCapturedThisFrame) {
+        HudSentinelAdvance(g_hudSentinel);
+    }
     g_capturedCount = 0;
     g_overflowCount = 0;
     g_batchIndex = 0;
     g_dumpThisFrame = false;
     g_dumpTriggeredCheckedThisFrame = false;
     g_horizonCapturedThisFrame = false;
+}
+
+CaptureFrameCounters CaptureGetFrameCounters() {
+    CaptureFrameCounters c;
+    c.capturedCount = g_capturedCount;
+    c.overflowCount = g_overflowCount;
+    c.batchIndex = g_batchIndex;
+    c.dumpThisFrame = g_dumpThisFrame;
+    c.horizonCapturedThisFrame = g_horizonCapturedThisFrame;
+    return c;
 }

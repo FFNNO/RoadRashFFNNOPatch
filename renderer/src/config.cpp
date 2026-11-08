@@ -59,21 +59,25 @@ const char* FilterModeToString(FilterMode mode) {
 uint32_t ParseVirtualKey(const wchar_t* str, uint32_t defaultKey) {
     std::wstring s = ToLowerTrimmed(str);
     if (s.empty()) return defaultKey;
-    if (s == L"f1")  return VK_F1;
-    if (s == L"f2")  return VK_F2;
-    if (s == L"f3")  return VK_F3;
-    if (s == L"f4")  return VK_F4;
-    if (s == L"f5")  return VK_F5;
-    if (s == L"f6")  return VK_F6;
-    if (s == L"f7")  return VK_F7;
-    if (s == L"f8")  return VK_F8;
-    if (s == L"f9")  return VK_F9;
-    if (s == L"f10") return VK_F10;
-    if (s == L"f11") return VK_F11;
-    if (s == L"f12") return VK_F12;
+    static const struct {
+        const wchar_t* name;
+        uint32_t vk;
+    } kNamedKeys[] = {
+        {L"f1", VK_F1},   {L"f2", VK_F2},   {L"f3", VK_F3},   {L"f4", VK_F4},
+        {L"f5", VK_F5},   {L"f6", VK_F6},   {L"f7", VK_F7},   {L"f8", VK_F8},
+        {L"f9", VK_F9},   {L"f10", VK_F10}, {L"f11", VK_F11}, {L"f12", VK_F12},
+        {L"scrolllock", VK_SCROLL}, {L"scroll_lock", VK_SCROLL}, {L"scroll", VK_SCROLL},
+        {L"pause", VK_PAUSE},
+    };
+    for (const auto& k : kNamedKeys) {
+        if (s == k.name) return k.vk;
+    }
+    // Numeric codes must consume the whole string: "0x7Bzz" or "12abc" fall back to the default.
+    if (!std::iswdigit(s[0])) return defaultKey;
     wchar_t* end = nullptr;
-    unsigned long val = std::wcstoul(s.c_str(), &end, 0);
-    if (end != s.c_str() && val > 0 && val < 256) {
+    const unsigned long val = std::wcstoul(s.c_str(), &end, 0);
+    if (end == nullptr || end == s.c_str() || *end != L'\0') return defaultKey;
+    if (val > 0 && val < 256) {
         return static_cast<uint32_t>(val);
     }
     return defaultKey;
@@ -124,8 +128,8 @@ void ConfigInit(const std::wstring& iniFilePath) {
     g_config.internalWidth = (g_config.internalHeight * 4) / 3;
 
     wchar_t toggleKeyBuf[64] = {0};
-    GetPrivateProfileStringW(L"World", L"ToggleKey", L"F12", toggleKeyBuf, 64, iniFilePath.c_str());
-    g_config.toggleKey = ParseVirtualKey(toggleKeyBuf, VK_F12);
+    GetPrivateProfileStringW(L"World", L"ToggleKey", L"ScrollLock", toggleKeyBuf, 64, iniFilePath.c_str());
+    g_config.toggleKey = ParseVirtualKey(toggleKeyBuf, VK_SCROLL);
 }
 
 int ClampInternalHeight(int h) {

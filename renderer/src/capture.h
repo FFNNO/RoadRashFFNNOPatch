@@ -4,7 +4,31 @@
 #include <cstdint>
 #include <string>
 
-inline constexpr uint8_t kHudTransparentSentinel = 0x7Eu;
+// HUD layer transparency (T5b item 5).
+// With GpuWorld=1 the 8bpp surface is cleared to a sentinel palette index before the HUD writers
+// run, and Layer 3 composites every pixel that differs from that sentinel. A world-coverage mask
+// cannot replace the sentinel, because HUD writers draw on top of covered pixels, and it cannot be
+// proven that no HUD writer ever produces a given index (GDI text and needles pick the nearest
+// palette entry). Indices 0x7E and 0x60 are the only two never present in the 7 dumped software
+// frames, so they start as the two candidates. The candidates alternate every frame; a candidate
+// seen in the HUD output of a frame where it was not the clear value was drawn by a HUD writer,
+// and is replaced by the least recently seen index. A collision therefore lasts at most one frame.
+inline constexpr uint8_t kHudSentinelInitialA = 0x7Eu;
+inline constexpr uint8_t kHudSentinelInitialB = 0x60u;
+
+struct HudSentinelState {
+    uint8_t candidates[2] = {kHudSentinelInitialA, kHudSentinelInitialB};
+    uint32_t active = 0;              // index into candidates used as the clear value this frame
+    uint32_t frame = 0;               // frames observed so far
+    uint32_t lastSeen[256] = {};      // 0 = never seen in HUD output, otherwise frame + 1
+};
+
+uint8_t HudSentinelActive(const HudSentinelState& state);
+// hist[i] = number of HUD-layer pixels with index i after the HUD writers ran on a surface cleared
+// to HudSentinelActive(). Returns true when the inactive candidate was retired and replaced.
+bool HudSentinelObserve(HudSentinelState& state, const uint32_t hist[256], uint8_t* outRetired = nullptr,
+                        uint8_t* outReplacement = nullptr);
+void HudSentinelAdvance(HudSentinelState& state);
 
 enum class QuadKind : uint8_t {
     Textured = 0,
@@ -42,6 +66,30 @@ struct CapturedQuad {
     int32_t corners16_16[8];
     int32_t snappedPreFix[8];
     CapturedVertex verts[4];
+};
+
+// Per-frame bookkeeping done after every race present (hook_sites.cpp FinishRaceFrameAndPollHotkeys).
+struct RaceFrameHotkeyState {
+    bool prevKeyDown = false;
+};
+
+struct RaceFrameActions {
+    bool endCaptureFrame = false;  // reset the per-frame capture state (CaptureEndFrame)
+    bool toggleGpuWorld = false;   // rising edge of the configured toggle key
+};
+
+RaceFrameActions AdvanceRaceFrame(RaceFrameHotkeyState& state,
+                                  bool captureEnabled,
+                                  bool gpuWorld,
+                                  uint32_t toggleKey,
+                                  bool keyDown);
+
+struct CaptureFrameCounters {
+    uint32_t capturedCount = 0;
+    uint32_t overflowCount = 0;
+    uint32_t batchIndex = 0;
+    bool dumpThisFrame = false;
+    bool horizonCapturedThisFrame = false;
 };
 
 struct LevelStateSnapshot {
@@ -84,11 +132,32 @@ void CaptureInvalidateCache();
 void CaptureOnBatchStart();
 void CaptureOnBatchEnd();
 int CaptureTexturedQuadBefore();
-void CaptureTexturedQuadAfter(int slotIndex);
+void CaptureTexturedQuadAfter(int slotIndex, bool rasterizerSkipped);
 int CaptureFlatQuadBefore(const int32_t* polyVerts, int edxArg);
-void CaptureFlatQuadAfter(int slotIndex, int32_t* polyVerts);
+// rasterizerSkipped must be the decision the detour used for this call (the original
+// FUN_00467cb0 did not run), so the emulated prologue never runs on top of the original one.
+void CaptureFlatQuadAfter(int slotIndex, int32_t* polyVerts, bool rasterizerSkipped);
 void CaptureOnRacePresent(const uint8_t* surface, int pitch, const uint8_t* palette, int width, int height);
 void CaptureEndFrame();
+CaptureFrameCounters CaptureGetFrameCounters();
+
+// Texture pixel cache (8bpp indices of every captured texture, read by the presenter).
+// Capped by bytes; when an insert would exceed the cap the whole cache is cleared (the presenter
+// re-uploads on the next generation) and the eviction is logged.
+inline constexpr size_t kDefaultTexturePixelCacheCapBytes = 256u * 1024u * 1024u;
+void CaptureSetTexturePixelCacheCap(size_t capBytes);
+size_t CaptureGetTexturePixelCacheBytes();
+uint32_t CaptureGetTexturePixelCacheEvictions();
+void CaptureCacheTexturePixels(uint32_t pdatPtr,
+                               uint32_t level0Crc32,
+                               const uint8_t* level0Ptr,
+                               int32_t width,
+                               int32_t height,
+                               int32_t rowPitch);
+
+// HUD sentinel for the current frame and the observation hook called by the presenter.
+uint8_t CaptureGetHudSentinel();
+void CaptureObserveHudLayer(const uint32_t hist[256]);
 
 // GPU World (Task T5) query API:
 bool CaptureShouldSkipSoftwareRasterizer();
