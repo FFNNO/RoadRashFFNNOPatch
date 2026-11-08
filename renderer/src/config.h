@@ -21,11 +21,13 @@ struct Config {
     bool gpuWorld = false;
     int internalWidth = 1440;
     int internalHeight = 1080;
+    uint32_t toggleKey = 0x7B;  // VK_F12
 };
 
 void ConfigInit(const std::wstring& iniFilePath);
 const Config& GetConfig();
 bool ToggleGpuWorld();
 int ClampInternalHeight(int h);
+uint32_t ParseVirtualKey(const wchar_t* str, uint32_t defaultKey = 0x7B);
 bool ParseFilterMode(const wchar_t* str, FilterMode& outMode);
 const char* FilterModeToString(FilterMode mode);

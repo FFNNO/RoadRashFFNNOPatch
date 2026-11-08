@@ -56,6 +56,29 @@ const char* FilterModeToString(FilterMode mode) {
     return "bilinear";
 }
 
+uint32_t ParseVirtualKey(const wchar_t* str, uint32_t defaultKey) {
+    std::wstring s = ToLowerTrimmed(str);
+    if (s.empty()) return defaultKey;
+    if (s == L"f1")  return VK_F1;
+    if (s == L"f2")  return VK_F2;
+    if (s == L"f3")  return VK_F3;
+    if (s == L"f4")  return VK_F4;
+    if (s == L"f5")  return VK_F5;
+    if (s == L"f6")  return VK_F6;
+    if (s == L"f7")  return VK_F7;
+    if (s == L"f8")  return VK_F8;
+    if (s == L"f9")  return VK_F9;
+    if (s == L"f10") return VK_F10;
+    if (s == L"f11") return VK_F11;
+    if (s == L"f12") return VK_F12;
+    wchar_t* end = nullptr;
+    unsigned long val = std::wcstoul(s.c_str(), &end, 0);
+    if (end != s.c_str() && val > 0 && val < 256) {
+        return static_cast<uint32_t>(val);
+    }
+    return defaultKey;
+}
+
 void ConfigInit(const std::wstring& iniFilePath) {
     UINT enabledVal = GetPrivateProfileIntW(L"General", L"Enabled", 1, iniFilePath.c_str());
     g_config.enabled = (enabledVal != 0);
@@ -99,6 +122,10 @@ void ConfigInit(const std::wstring& iniFilePath) {
     INT worldHeight = static_cast<INT>(GetPrivateProfileIntW(L"World", L"InternalHeight", presenterHeight, iniFilePath.c_str()));
     g_config.internalHeight = ClampInternalHeight(worldHeight);
     g_config.internalWidth = (g_config.internalHeight * 4) / 3;
+
+    wchar_t toggleKeyBuf[64] = {0};
+    GetPrivateProfileStringW(L"World", L"ToggleKey", L"F12", toggleKeyBuf, 64, iniFilePath.c_str());
+    g_config.toggleKey = ParseVirtualKey(toggleKeyBuf, VK_F12);
 }
 
 int ClampInternalHeight(int h) {

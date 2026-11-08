@@ -146,24 +146,66 @@ struct alignas(16) PresentConstants {
     float pad[2];
 };
 
+const char* kLayerVertexShaderSrc = R"(
+struct VSOut {
+    float4 pos : SV_Position;
+    float2 uv  : TEXCOORD0;
+};
+
+VSOut main(uint id : SV_VertexID) {
+    VSOut o;
+    o.uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(o.uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    return o;
+}
+)";
+
+const char* kLayerPixelShaderSrc = R"(
+Texture2D<float4> texLayer : register(t0);
+SamplerState      samp     : register(s0);
+
+float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    float4 c = texLayer.Sample(samp, uv);
+    if (c.a < 0.5) {
+        discard;
+    }
+    return c;
+}
+)";
+
 const char* kWorldVertexShaderSrc = R"(
 struct VSIn {
-    float2 pos   : POSITION;
-    float3 uvq   : TEXCOORD0;
-    float4 color : COLOR0;
+    float2 pos     : POSITION;
+    float4 p01     : TEXCOORD0;
+    float4 p23     : TEXCOORD1;
+    float4 uv01    : TEXCOORD2;
+    float4 uv23    : TEXCOORD3;
+    float4 uvClamp : TEXCOORD4;
+    float4 color   : COLOR0;
+    float4 flags   : COLOR1;
 };
 
 struct VSOut {
-    float4 pos   : SV_Position;
-    float3 uvq   : TEXCOORD0;
-    float4 color : COLOR0;
+    float4 pos                     : SV_Position;
+    nointerpolation float4 p01     : TEXCOORD0;
+    nointerpolation float4 p23     : TEXCOORD1;
+    nointerpolation float4 uv01    : TEXCOORD2;
+    nointerpolation float4 uv23    : TEXCOORD3;
+    nointerpolation float4 uvClamp : TEXCOORD4;
+    nointerpolation float4 color   : COLOR0;
+    nointerpolation float4 flags   : COLOR1;
 };
 
 VSOut main(VSIn v) {
     VSOut o;
-    o.pos   = float4(v.pos, 0.0, 1.0);
-    o.uvq   = v.uvq;
-    o.color = v.color;
+    o.pos     = float4(v.pos, 0.0, 1.0);
+    o.p01     = v.p01;
+    o.p23     = v.p23;
+    o.uv01    = v.uv01;
+    o.uv23    = v.uv23;
+    o.uvClamp = v.uvClamp;
+    o.color   = v.color;
+    o.flags   = v.flags;
     return o;
 }
 )";
@@ -172,28 +214,104 @@ const char* kWorldPixelShaderSrc = R"(
 Texture2D<float4> texQuad : register(t0);
 SamplerState      samp    : register(s0);
 
+cbuffer WorldCB : register(b0) {
+    float2 srcSize;
+    float2 dstSize;
+    uint filterMode;
+    uint useBgra;
+    float2 pad;
+};
+
 struct PSIn {
-    float4 pos   : SV_Position;
-    float3 uvq   : TEXCOORD0;
-    float4 color : COLOR0;
+    float4 pos                     : SV_Position;
+    nointerpolation float4 p01     : TEXCOORD0;
+    nointerpolation float4 p23     : TEXCOORD1;
+    nointerpolation float4 uv01    : TEXCOORD2;
+    nointerpolation float4 uv23    : TEXCOORD3;
+    nointerpolation float4 uvClamp : TEXCOORD4;
+    nointerpolation float4 color   : COLOR0;
+    nointerpolation float4 flags   : COLOR1;
 };
 
 float4 main(PSIn p) : SV_Target {
-    float q = max(p.uvq.z, 1e-6);
-    float2 uv = p.uvq.xy / q;
-    float4 texel = texQuad.Sample(samp, uv);
-    float4 outColor = texel * p.color;
-    if (outColor.a < 0.5) {
+    if (p.flags.x > 0.5) {
+        return p.color;
+    }
+
+    float curX = p.pos.x * (srcSize.x / dstSize.x);
+    float curY = p.pos.y * (srcSize.y / dstSize.y);
+
+    float2 pts[4] = { p.p01.xy, p.p01.zw, p.p23.xy, p.p23.zw };
+    float2 uvs[4] = { p.uv01.xy, p.uv01.zw, p.uv23.xy, p.uv23.zw };
+
+    float ymin = min(min(pts[0].y, pts[1].y), min(pts[2].y, pts[3].y));
+    float ymax = max(max(pts[0].y, pts[1].y), max(pts[2].y, pts[3].y));
+    float yClamped = clamp(curY, ymin, ymax);
+
+    float xL = 0.0;
+    float xR = 0.0;
+    float2 uvL = float2(0.0, 0.0);
+    float2 uvR = float2(0.0, 0.0);
+    bool foundL = false;
+    bool foundR = false;
+
+    [unroll]
+    for (int i = 0; i < 4; ++i) {
+        int next = (i + 1) & 3;
+        float2 p0 = pts[i];
+        float2 p1 = pts[next];
+        float2 uv0 = uvs[i];
+        float2 uv1 = uvs[next];
+
+        if (p1.y > p0.y) {
+            if (yClamped >= p0.y && yClamped <= p1.y && !foundR) {
+                float s = (yClamped - p0.y) / (p1.y - p0.y);
+                xR = lerp(p0.x, p1.x, s);
+                uvR = lerp(uv0, uv1, s);
+                foundR = true;
+            }
+        } else if (p1.y < p0.y) {
+            if (yClamped >= p1.y && yClamped <= p0.y && !foundL) {
+                float s = (yClamped - p1.y) / (p0.y - p1.y);
+                xL = lerp(p1.x, p0.x, s);
+                uvL = lerp(uv1, uv0, s);
+                foundL = true;
+            }
+        }
+    }
+
+    if (!foundL) {
+        xL = min(min(pts[0].x, pts[1].x), min(pts[2].x, pts[3].x));
+        uvL = uvs[0];
+    }
+    if (!foundR) {
+        xR = max(max(pts[0].x, pts[1].x), max(pts[2].x, pts[3].x));
+        uvR = uvs[1];
+    }
+
+    float span = max(xR - xL, 1e-4);
+    float t = saturate((curX - xL) / span);
+    float2 finalUv = lerp(uvL, uvR, t);
+
+    finalUv = clamp(finalUv, p.uvClamp.xy, p.uvClamp.zw);
+
+    float4 texel = texQuad.Sample(samp, finalUv);
+    if (texel.a < 0.5) {
         discard;
     }
-    return outColor;
+    return texel * p.color;
 }
 )";
 
 struct WorldVertex {
     float x, y;
-    float u, v, q;
-    float r, g, b, a;
+    float p01[4];
+    float p23[4];
+    float uv01[4];
+    float uv23[4];
+    float uvClamp[4];
+    float color[4];
+    float flags[4];
 };
 
 struct WorldDrawBatch {
@@ -205,51 +323,6 @@ struct WorldDrawBatch {
 };
 
 constexpr size_t kMaxWorldVertices = 65536;
-
-void ComputeProjectiveQ(const CapturedVertex verts[4], float outQ[4]) {
-    outQ[0] = 1.0f;
-    outQ[1] = 1.0f;
-    outQ[2] = 1.0f;
-    outQ[3] = 1.0f;
-
-    const float x0 = static_cast<float>(verts[0].x);
-    const float y0 = static_cast<float>(verts[0].y);
-    const float x1 = static_cast<float>(verts[1].x);
-    const float y1 = static_cast<float>(verts[1].y);
-    const float x2 = static_cast<float>(verts[2].x);
-    const float y2 = static_cast<float>(verts[2].y);
-    const float x3 = static_cast<float>(verts[3].x);
-    const float y3 = static_cast<float>(verts[3].y);
-
-    const float dx02 = x2 - x0;
-    const float dy02 = y2 - y0;
-    const float dx13 = x3 - x1;
-    const float dy13 = y3 - y1;
-
-    const float c0 = dx13 * (y0 - y1) - dy13 * (x0 - x1);
-    const float c2 = (-dx13) * (y2 - y3) - (-dy13) * (x2 - x3);
-    const float c1 = dx02 * (y1 - y2) - dy02 * (x1 - x2);
-    const float c3 = (-dx02) * (y3 - y0) - (-dy02) * (x3 - x0);
-
-    const bool allPos = (c0 > 1.0f && c1 > 1.0f && c2 > 1.0f && c3 > 1.0f);
-    const bool allNeg = (c0 < -1.0f && c1 < -1.0f && c2 < -1.0f && c3 < -1.0f);
-    if (!allPos && !allNeg) {
-        return;
-    }
-
-    const float q0 = (c0 + c2) / c2;
-    const float q1 = (c1 + c3) / c3;
-    const float q2 = (c0 + c2) / c0;
-    const float q3 = (c1 + c3) / c1;
-    if (q0 < 0.05f || q0 > 20.0f || q1 < 0.05f || q1 > 20.0f ||
-        q2 < 0.05f || q2 > 20.0f || q3 < 0.05f || q3 > 20.0f) {
-        return;
-    }
-    outQ[0] = q0;
-    outQ[1] = q1;
-    outQ[2] = q2;
-    outQ[3] = q3;
-}
 
 class D3D11Presenter {
 public:
@@ -374,6 +447,8 @@ public:
         m_blendAlpha.Reset();
         m_worldVB.Reset();
         m_worldInputLayout.Reset();
+        m_layerPS.Reset();
+        m_layerVS.Reset();
         m_worldPS.Reset();
         m_worldVS.Reset();
         m_srvBgra.Reset();
@@ -668,15 +743,54 @@ private:
         }
 
         D3D11_INPUT_ELEMENT_DESC ied[] = {
-            {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 0,  D3D11_INPUT_PER_VERTEX_DATA, 0},
-            {"TEXCOORD", 0, DXGI_FORMAT_R32G32B32_FLOAT,    0, 8,  D3D11_INPUT_PER_VERTEX_DATA, 0},
-            {"COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 20, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 0,   D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"TEXCOORD", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 8,   D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"TEXCOORD", 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 24,  D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"TEXCOORD", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 40,  D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"TEXCOORD", 3, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 56,  D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"TEXCOORD", 4, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 72,  D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 88,  D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"COLOR",    1, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 104, D3D11_INPUT_PER_VERTEX_DATA, 0},
         };
         hr = m_device->CreateInputLayout(ied, static_cast<UINT>(sizeof(ied) / sizeof(ied[0])),
                                          worldVsBlob->GetBufferPointer(), worldVsBlob->GetBufferSize(),
                                          &m_worldInputLayout);
         if (FAILED(hr)) {
             LOG_ERROR("CreateInputLayout(world) failed: 0x%08lX", static_cast<unsigned long>(hr));
+            return false;
+        }
+
+        ComPtr<ID3DBlob> layerVsBlob;
+        errBlob.Reset();
+        hr = D3DCompile(kLayerVertexShaderSrc, std::strlen(kLayerVertexShaderSrc), "layer_vs",
+                        nullptr, nullptr, "main", "vs_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                        &layerVsBlob, &errBlob);
+        if (FAILED(hr)) {
+            LOG_ERROR("Layer VS compile failed (0x%08lX): %s", static_cast<unsigned long>(hr),
+                      errBlob ? static_cast<const char*>(errBlob->GetBufferPointer()) : "");
+            return false;
+        }
+        hr = m_device->CreateVertexShader(layerVsBlob->GetBufferPointer(), layerVsBlob->GetBufferSize(),
+                                          nullptr, &m_layerVS);
+        if (FAILED(hr)) {
+            LOG_ERROR("CreateVertexShader(layerVS) failed: 0x%08lX", static_cast<unsigned long>(hr));
+            return false;
+        }
+
+        ComPtr<ID3DBlob> layerPsBlob;
+        errBlob.Reset();
+        hr = D3DCompile(kLayerPixelShaderSrc, std::strlen(kLayerPixelShaderSrc), "layer_ps",
+                        nullptr, nullptr, "main", "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                        &layerPsBlob, &errBlob);
+        if (FAILED(hr)) {
+            LOG_ERROR("Layer PS compile failed (0x%08lX): %s", static_cast<unsigned long>(hr),
+                      errBlob ? static_cast<const char*>(errBlob->GetBufferPointer()) : "");
+            return false;
+        }
+        hr = m_device->CreatePixelShader(layerPsBlob->GetBufferPointer(), layerPsBlob->GetBufferSize(),
+                                         nullptr, &m_layerPS);
+        if (FAILED(hr)) {
+            LOG_ERROR("CreatePixelShader(layerPS) failed: 0x%08lX", static_cast<unsigned long>(hr));
             return false;
         }
 
@@ -972,27 +1086,10 @@ private:
     }
 
     bool DrawFullscreenLayerOnWorld(ID3D11ShaderResourceView* srv, int worldW, int worldH, bool alphaBlend) {
-        D3D11_MAPPED_SUBRESOURCE mappedVB = {};
-        HRESULT hr = m_context->Map(m_worldVB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedVB);
-        if (FAILED(hr)) {
-            return false;
-        }
-        auto* v = static_cast<WorldVertex*>(mappedVB.pData);
-        v[0] = {-1.0f,  1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
-        v[1] = { 1.0f,  1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
-        v[2] = { 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
-        v[3] = {-1.0f,  1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
-        v[4] = { 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
-        v[5] = {-1.0f, -1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
-        m_context->Unmap(m_worldVB.Get(), 0);
-
-        const UINT stride = sizeof(WorldVertex);
-        const UINT offset = 0;
-        m_context->IASetInputLayout(m_worldInputLayout.Get());
-        m_context->IASetVertexBuffers(0, 1, m_worldVB.GetAddressOf(), &stride, &offset);
+        m_context->IASetInputLayout(nullptr);
         m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        m_context->VSSetShader(m_worldVS.Get(), nullptr, 0);
-        m_context->PSSetShader(m_worldPS.Get(), nullptr, 0);
+        m_context->VSSetShader(m_layerVS.Get(), nullptr, 0);
+        m_context->PSSetShader(m_layerPS.Get(), nullptr, 0);
         m_context->PSSetShaderResources(0, 1, &srv);
         m_context->PSSetSamplers(0, 1, m_samplerClamp.GetAddressOf());
         m_context->RSSetState(m_rasterScissor.Get());
@@ -1003,7 +1100,7 @@ private:
         const float blendFactor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         m_context->OMSetBlendState(alphaBlend ? m_blendAlpha.Get() : nullptr, blendFactor, 0xFFFFFFFFu);
 
-        m_context->Draw(6, 0);
+        m_context->Draw(3, 0);
         return true;
     }
 
@@ -1061,6 +1158,26 @@ private:
         const float invSrcW = 1.0f / static_cast<float>(srcW);
         const float invSrcH = 1.0f / static_cast<float>(srcH);
 
+        // Upload constant buffer with srcSize and dstSize for PS coordinate mapping
+        {
+            D3D11_MAPPED_SUBRESOURCE mappedCB = {};
+            HRESULT hr = m_context->Map(m_constantBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedCB);
+            if (FAILED(hr)) {
+                LOG_ERROR("D3D11 Map(constantBuffer) failed: 0x%08lX", static_cast<unsigned long>(hr));
+                return RecordFailure(nowMs);
+            }
+            auto* cb = static_cast<PresentConstants*>(mappedCB.pData);
+            cb->srcSize[0] = static_cast<float>(srcW);
+            cb->srcSize[1] = static_cast<float>(srcH);
+            cb->dstSize[0] = static_cast<float>(worldW);
+            cb->dstSize[1] = static_cast<float>(worldH);
+            cb->filterMode = 0;
+            cb->useBgra = 0;
+            cb->pad[0] = 0.0f;
+            cb->pad[1] = 0.0f;
+            m_context->Unmap(m_constantBuffer.Get(), 0);
+        }
+
         for (uint32_t qi = 0; qi < quadCount; ++qi) {
             const CapturedQuad& q = quads[qi];
             if (q.culled) {
@@ -1087,14 +1204,31 @@ private:
 
             ID3D11ShaderResourceView* srv = m_srvWhite.Get();
             ID3D11SamplerState* sampler = m_samplerClamp.Get();
-            float r = 1.0f, g = 1.0f, b = 1.0f;
 
-            WorldVertex qv[4] = {};
+            float p01[4] = {
+                static_cast<float>(q.verts[0].x), static_cast<float>(q.verts[0].y),
+                static_cast<float>(q.verts[1].x), static_cast<float>(q.verts[1].y)
+            };
+            float p23[4] = {
+                static_cast<float>(q.verts[2].x), static_cast<float>(q.verts[2].y),
+                static_cast<float>(q.verts[3].x), static_cast<float>(q.verts[3].y)
+            };
+            float uv01[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float uv23[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float uvClamp[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+            float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+            float flags[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+            float vx[4] = {};
+            float vy[4] = {};
+
             if (q.kind == QuadKind::Flat) {
                 const uint8_t idx = q.flatColor;
-                r = palette[idx * 4 + 0] / 255.0f;
-                g = palette[idx * 4 + 1] / 255.0f;
-                b = palette[idx * 4 + 2] / 255.0f;
+                color[0] = palette[idx * 4 + 0] / 255.0f;
+                color[1] = palette[idx * 4 + 1] / 255.0f;
+                color[2] = palette[idx * 4 + 2] / 255.0f;
+                color[3] = 1.0f;
+                flags[0] = 1.0f; // isFlat = 1.0
 
                 int minX = q.verts[0].x, maxX = q.verts[0].x;
                 int minY = q.verts[0].y, maxY = q.verts[0].y;
@@ -1110,37 +1244,70 @@ private:
                     const float xR = static_cast<float>(maxX) * invSrcW * 2.0f - 1.0f;
                     const float yT = 1.0f - static_cast<float>(minY) * invSrcH * 2.0f;
                     const float yB = 1.0f - static_cast<float>(minY + 1) * invSrcH * 2.0f;
-                    qv[0] = {xL, yT, 0.0f, 0.0f, 1.0f, r, g, b, 1.0f};
-                    qv[1] = {xR, yT, 0.0f, 0.0f, 1.0f, r, g, b, 1.0f};
-                    qv[2] = {xR, yB, 0.0f, 0.0f, 1.0f, r, g, b, 1.0f};
-                    qv[3] = {xL, yB, 0.0f, 0.0f, 1.0f, r, g, b, 1.0f};
+                    vx[0] = xL; vy[0] = yT;
+                    vx[1] = xR; vy[1] = yT;
+                    vx[2] = xR; vy[2] = yB;
+                    vx[3] = xL; vy[3] = yB;
                 } else {
                     for (int i = 0; i < 4; ++i) {
-                        const float vx = static_cast<float>(q.verts[i].x) * invSrcW * 2.0f - 1.0f;
-                        const float vy = 1.0f - static_cast<float>(q.verts[i].y) * invSrcH * 2.0f;
-                        qv[i] = {vx, vy, 0.0f, 0.0f, 1.0f, r, g, b, 1.0f};
+                        vx[i] = static_cast<float>(q.verts[i].x) * invSrcW * 2.0f - 1.0f;
+                        vy[i] = 1.0f - static_cast<float>(q.verts[i].y) * invSrcH * 2.0f;
                     }
                 }
             } else {
                 srv = GetOrCreateWorldTextureSRV(q, palette);
-                const bool isDynamicSprite = (q.pdatFlags & 0x2000u) != 0;
-                sampler = isDynamicSprite ? m_samplerClamp.Get() : m_samplerWrap.Get();
-
-                float projQ[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-                if (!isDynamicSprite) {
-                    ComputeProjectiveQ(q.verts, projQ);
-                }
-
                 const float texW = static_cast<float>(std::max(1, q.texWidth));
                 const float texH = static_cast<float>(std::max(1, q.texHeight));
-                for (int i = 0; i < 4; ++i) {
-                    const float vx = static_cast<float>(q.verts[i].x) * invSrcW * 2.0f - 1.0f;
-                    const float vy = 1.0f - static_cast<float>(q.verts[i].y) * invSrcH * 2.0f;
-                    const float u = static_cast<float>(q.verts[i].u) / texW;
-                    const float v = static_cast<float>(q.verts[i].v) / texH;
-                    const float wq = projQ[i];
-                    qv[i] = {vx, vy, u * wq, v * wq, wq, 1.0f, 1.0f, 1.0f, 1.0f};
+
+                uv01[0] = static_cast<float>(q.verts[0].u) / texW;
+                uv01[1] = static_cast<float>(q.verts[0].v) / texH;
+                uv01[2] = static_cast<float>(q.verts[1].u) / texW;
+                uv01[3] = static_cast<float>(q.verts[1].v) / texH;
+
+                uv23[0] = static_cast<float>(q.verts[2].u) / texW;
+                uv23[1] = static_cast<float>(q.verts[2].v) / texH;
+                uv23[2] = static_cast<float>(q.verts[3].u) / texW;
+                uv23[3] = static_cast<float>(q.verts[3].v) / texH;
+
+                float minTexX = 0.0f;
+                float minTexY = 0.0f;
+                float maxTexX = texW - 1.0f;
+                float maxTexY = texH - 1.0f;
+
+                if ((q.pdatFlags & 0x2000u) != 0) {
+                    minTexX = 0.0f;
+                    minTexY = 0.0f;
+                    maxTexX = texW - 1.0f;
+                    maxTexY = texH - 1.0f;
+                } else if (q.uvBox[2] > q.uvBox[0] && q.uvBox[3] > q.uvBox[1]) {
+                    minTexX = static_cast<float>(q.uvBox[0]);
+                    minTexY = static_cast<float>(q.uvBox[1]);
+                    maxTexX = static_cast<float>(q.uvBox[2]);
+                    maxTexY = static_cast<float>(q.uvBox[3]);
                 }
+
+                uvClamp[0] = (minTexX + 0.5f) / texW;
+                uvClamp[1] = (minTexY + 0.5f) / texH;
+                uvClamp[2] = (maxTexX + 0.5f) / texW;
+                uvClamp[3] = (maxTexY + 0.5f) / texH;
+
+                for (int i = 0; i < 4; ++i) {
+                    vx[i] = static_cast<float>(q.verts[i].x) * invSrcW * 2.0f - 1.0f;
+                    vy[i] = 1.0f - static_cast<float>(q.verts[i].y) * invSrcH * 2.0f;
+                }
+            }
+
+            WorldVertex qv[4];
+            for (int i = 0; i < 4; ++i) {
+                qv[i].x = vx[i];
+                qv[i].y = vy[i];
+                std::memcpy(qv[i].p01, p01, sizeof(p01));
+                std::memcpy(qv[i].p23, p23, sizeof(p23));
+                std::memcpy(qv[i].uv01, uv01, sizeof(uv01));
+                std::memcpy(qv[i].uv23, uv23, sizeof(uv23));
+                std::memcpy(qv[i].uvClamp, uvClamp, sizeof(uvClamp));
+                std::memcpy(qv[i].color, color, sizeof(color));
+                std::memcpy(qv[i].flags, flags, sizeof(flags));
             }
 
             // Choose diagonal (0-2 vs 1-3) so slightly concave quads do not fold over themselves
@@ -1201,6 +1368,7 @@ private:
             m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             m_context->VSSetShader(m_worldVS.Get(), nullptr, 0);
             m_context->PSSetShader(m_worldPS.Get(), nullptr, 0);
+            m_context->PSSetConstantBuffers(0, 1, m_constantBuffer.GetAddressOf());
             m_context->RSSetState(m_rasterScissor.Get());
             const float blendFactor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             m_context->OMSetBlendState(nullptr, blendFactor, 0xFFFFFFFFu);
@@ -1326,6 +1494,8 @@ private:
     // Task T5 world rendering resources
     ComPtr<ID3D11VertexShader> m_worldVS;
     ComPtr<ID3D11PixelShader> m_worldPS;
+    ComPtr<ID3D11VertexShader> m_layerVS;
+    ComPtr<ID3D11PixelShader> m_layerPS;
     ComPtr<ID3D11InputLayout> m_worldInputLayout;
     ComPtr<ID3D11Buffer> m_worldVB;
     ComPtr<ID3D11RasterizerState> m_rasterScissor;

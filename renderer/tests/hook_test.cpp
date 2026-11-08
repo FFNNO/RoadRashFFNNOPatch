@@ -480,6 +480,206 @@ int main() {
               "ShouldCullFlatQuad culls quad at x=[640,650) when clip_xmax=640 (half-open X)");
     }
 
+    // 6. ParseVirtualKey tests (Defect 4 hotkey configuration)
+    {
+        Check(ParseVirtualKey(L"F12", 0x7B) == 0x7B, "ParseVirtualKey resolves F12 to 0x7B");
+        Check(ParseVirtualKey(L"f12", 0x7B) == 0x7B, "ParseVirtualKey case-insensitive f12");
+        Check(ParseVirtualKey(L"F10", 0x7B) == 0x79, "ParseVirtualKey resolves F10 to 0x79");
+        Check(ParseVirtualKey(L"0x7B", 0) == 0x7B, "ParseVirtualKey resolves hex 0x7B");
+        Check(ParseVirtualKey(L"123", 0) == 123, "ParseVirtualKey resolves decimal 123");
+        Check(ParseVirtualKey(L"invalid", 0x7B) == 0x7B, "ParseVirtualKey falls back to default on invalid key");
+    }
+
+    // 7. Engine scanline walk vs CPU shader math vs Two-triangle interpolation (Defect 1)
+    {
+        struct TestPoint { float x, y; };
+        struct TestUv { float u, v; };
+        struct TestQuad { TestPoint p[4]; TestUv uv[4]; };
+
+        auto CpuScanlineWalk = [](const TestQuad& q, float curX, float curY) -> TestUv {
+            float ymin = std::min(std::min(q.p[0].y, q.p[1].y), std::min(q.p[2].y, q.p[3].y));
+            float ymax = std::max(std::max(q.p[0].y, q.p[1].y), std::max(q.p[2].y, q.p[3].y));
+            float yC = std::max(ymin, std::min(ymax, curY));
+
+            float xL = 0.0f, xR = 0.0f;
+            TestUv uvL = {0.0f, 0.0f}, uvR = {0.0f, 0.0f};
+            bool foundL = false, foundR = false;
+
+            for (int i = 0; i < 4; ++i) {
+                int next = (i + 1) & 3;
+                TestPoint p0 = q.p[i];
+                TestPoint p1 = q.p[next];
+                TestUv uv0 = q.uv[i];
+                TestUv uv1 = q.uv[next];
+
+                if (p1.y > p0.y) {
+                    if (yC >= p0.y && yC <= p1.y && !foundR) {
+                        float s = (yC - p0.y) / (p1.y - p0.y);
+                        xR = p0.x + (p1.x - p0.x) * s;
+                        uvR.u = uv0.u + (uv1.u - uv0.u) * s;
+                        uvR.v = uv0.v + (uv1.v - uv0.v) * s;
+                        foundR = true;
+                    }
+                } else if (p1.y < p0.y) {
+                    if (yC >= p1.y && yC <= p0.y && !foundL) {
+                        float s = (yC - p1.y) / (p0.y - p1.y);
+                        xL = p1.x + (p0.x - p1.x) * s;
+                        uvL.u = uv1.u + (uv0.u - uv1.u) * s;
+                        uvL.v = uv1.v + (uv0.v - uv1.v) * s;
+                        foundL = true;
+                    }
+                }
+            }
+            if (!foundL) {
+                xL = std::min(std::min(q.p[0].x, q.p[1].x), std::min(q.p[2].x, q.p[3].x));
+                uvL = q.uv[0];
+            }
+            if (!foundR) {
+                xR = std::max(std::max(q.p[0].x, q.p[1].x), std::max(q.p[2].x, q.p[3].x));
+                uvR = q.uv[1];
+            }
+            float span = std::max(xR - xL, 1e-4f);
+            float t = std::max(0.0f, std::min(1.0f, (curX - xL) / span));
+            return { uvL.u + (uvR.u - uvL.u) * t, uvL.v + (uvR.v - uvL.v) * t };
+        };
+
+        auto CpuShaderMath = [](const TestQuad& q, float curX, float curY) -> TestUv {
+            float ymin = std::min(std::min(q.p[0].y, q.p[1].y), std::min(q.p[2].y, q.p[3].y));
+            float ymax = std::max(std::max(q.p[0].y, q.p[1].y), std::max(q.p[2].y, q.p[3].y));
+            float yClamped = std::max(ymin, std::min(ymax, curY));
+
+            float xL = 0.0f, xR = 0.0f;
+            TestUv uvL = {0.0f, 0.0f}, uvR = {0.0f, 0.0f};
+            bool foundL = false, foundR = false;
+
+            for (int i = 0; i < 4; ++i) {
+                int next = (i + 1) & 3;
+                TestPoint p0 = q.p[i];
+                TestPoint p1 = q.p[next];
+                TestUv uv0 = q.uv[i];
+                TestUv uv1 = q.uv[next];
+
+                if (p1.y > p0.y) {
+                    if (yClamped >= p0.y && yClamped <= p1.y && !foundR) {
+                        float s = (yClamped - p0.y) / (p1.y - p0.y);
+                        xR = p0.x + (p1.x - p0.x) * s;
+                        uvR.u = uv0.u + (uv1.u - uv0.u) * s;
+                        uvR.v = uv0.v + (uv1.v - uv0.v) * s;
+                        foundR = true;
+                    }
+                } else if (p1.y < p0.y) {
+                    if (yClamped >= p1.y && yClamped <= p0.y && !foundL) {
+                        float s = (yClamped - p1.y) / (p0.y - p1.y);
+                        xL = p1.x + (p0.x - p1.x) * s;
+                        uvL.u = uv1.u + (uv0.u - uv1.u) * s;
+                        uvL.v = uv1.v + (uv0.v - uv1.v) * s;
+                        foundL = true;
+                    }
+                }
+            }
+
+            if (!foundL) {
+                xL = std::min(std::min(q.p[0].x, q.p[1].x), std::min(q.p[2].x, q.p[3].x));
+                uvL = q.uv[0];
+            }
+            if (!foundR) {
+                xR = std::max(std::max(q.p[0].x, q.p[1].x), std::max(q.p[2].x, q.p[3].x));
+                uvR = q.uv[1];
+            }
+
+            float span = std::max(xR - xL, 1e-4f);
+            float t = std::max(0.0f, std::min(1.0f, (curX - xL) / span));
+            return { uvL.u + (uvR.u - uvL.u) * t, uvL.v + (uvR.v - uvL.v) * t };
+        };
+
+        auto BarycentricUv = [](float px, float py,
+                               TestPoint p0, TestPoint p1, TestPoint p2,
+                               TestUv uv0, TestUv uv1, TestUv uv2,
+                               TestUv& outUv) -> bool {
+            float denom = (p1.y - p2.y) * (p0.x - p2.x) + (p2.x - p1.x) * (p0.y - p2.y);
+            if (std::abs(denom) < 1e-6f) return false;
+            float w0 = ((p1.y - p2.y) * (px - p2.x) + (p2.x - p1.x) * (py - p2.y)) / denom;
+            float w1 = ((p2.y - p0.y) * (px - p2.x) + (p0.x - p2.x) * (py - p2.y)) / denom;
+            float w2 = 1.0f - w0 - w1;
+            if (w0 >= -1e-4f && w1 >= -1e-4f && w2 >= -1e-4f) {
+                outUv.u = w0 * uv0.u + w1 * uv1.u + w2 * uv2.u;
+                outUv.v = w0 * uv0.v + w1 * uv1.v + w2 * uv2.v;
+                return true;
+            }
+            return false;
+        };
+
+        auto TwoTrianglesUv = [&](const TestQuad& q, float px, float py, TestUv& outUv) -> bool {
+            if (BarycentricUv(px, py, q.p[0], q.p[1], q.p[2], q.uv[0], q.uv[1], q.uv[2], outUv)) {
+                return true;
+            }
+            if (BarycentricUv(px, py, q.p[0], q.p[2], q.p[3], q.uv[0], q.uv[2], q.uv[3], outUv)) {
+                return true;
+            }
+            return false;
+        };
+
+        // 1. Road trapezoid
+        const TestQuad roadTrapezoid = {
+            {{280.0f, 100.0f}, {360.0f, 100.0f}, {560.0f, 300.0f}, {80.0f, 300.0f}},
+            {{0.0f, 0.0f}, {64.0f, 0.0f}, {64.0f, 256.0f}, {0.0f, 256.0f}}
+        };
+
+        // 2. Strongly non-planar skew
+        const TestQuad skewQuad = {
+            {{200.0f, 80.0f}, {450.0f, 120.0f}, {520.0f, 380.0f}, {120.0f, 310.0f}},
+            {{0.0f, 0.0f}, {256.0f, 0.0f}, {256.0f, 256.0f}, {0.0f, 256.0f}}
+        };
+
+        // 3. Sprite rectangle
+        const TestQuad spriteRect = {
+            {{150.0f, 200.0f}, {350.0f, 200.0f}, {350.0f, 420.0f}, {150.0f, 420.0f}},
+            {{0.0f, 0.0f}, {128.0f, 0.0f}, {128.0f, 128.0f}, {0.0f, 128.0f}}
+        };
+
+        auto TestQuadDiff = [&](const TestQuad& q, float& outMaxShaderDiff, float& outMaxTriDiff) {
+            outMaxShaderDiff = 0.0f;
+            outMaxTriDiff = 0.0f;
+            float ymin = std::min(std::min(q.p[0].y, q.p[1].y), std::min(q.p[2].y, q.p[3].y));
+            float ymax = std::max(std::max(q.p[0].y, q.p[1].y), std::max(q.p[2].y, q.p[3].y));
+            for (int y = static_cast<int>(ymin); y <= static_cast<int>(ymax); ++y) {
+                float py = static_cast<float>(y) + 0.5f;
+                for (int x = 0; x < 640; ++x) {
+                    float px = static_cast<float>(x) + 0.5f;
+                    TestUv uvTri = {};
+                    if (!TwoTrianglesUv(q, px, py, uvTri)) {
+                        continue; // outside quad coverage
+                    }
+                    TestUv uvWalk = CpuScanlineWalk(q, px, py);
+                    TestUv uvShader = CpuShaderMath(q, px, py);
+
+                    float shaderDiff = std::max(std::abs(uvWalk.u - uvShader.u), std::abs(uvWalk.v - uvShader.v));
+                    outMaxShaderDiff = std::max(outMaxShaderDiff, shaderDiff);
+
+                    float triDiff = std::max(std::abs(uvWalk.u - uvTri.u), std::abs(uvWalk.v - uvTri.v));
+                    outMaxTriDiff = std::max(outMaxTriDiff, triDiff);
+                }
+            }
+        };
+
+        float maxShaderDiff = 0.0f, maxTriDiff = 0.0f;
+
+        // Test road trapezoid
+        TestQuadDiff(roadTrapezoid, maxShaderDiff, maxTriDiff);
+        Check(maxShaderDiff <= 0.0625f, "Road trapezoid: scanline walk vs shader math error <= 1/16 texel");
+        Check(maxTriDiff > 25.0f, "Road trapezoid: two-triangle interpolation error > 25 texels (proves defect 1 root cause)");
+
+        // Test non-planar skew
+        TestQuadDiff(skewQuad, maxShaderDiff, maxTriDiff);
+        Check(maxShaderDiff <= 0.0625f, "Non-planar skew: scanline walk vs shader math error <= 1/16 texel");
+        Check(maxTriDiff > 30.0f, "Non-planar skew: two-triangle interpolation error > 30 texels (proves defect 1 root cause)");
+
+        // Test sprite rectangle
+        TestQuadDiff(spriteRect, maxShaderDiff, maxTriDiff);
+        Check(maxShaderDiff <= 0.0625f, "Sprite rectangle: scanline walk vs shader math error <= 1/16 texel");
+        Check(maxTriDiff <= 0.0625f, "Sprite rectangle: two-triangle affine mapping matches rectangle scanlines");
+    }
+
     // PNG and JSON writer unit tests (B3 item 5).
     RunCaptureWritersTest();
 

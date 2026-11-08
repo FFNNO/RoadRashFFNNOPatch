@@ -197,17 +197,21 @@ void FinishRaceFrameAndPollHotkeys() {
     if (GetConfig().captureEnabled || GetConfig().gpuWorld) {
         CaptureEndFrame();
     }
-    static bool s_prevF10Down = false;
-    const bool f10Down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-    if (f10Down && !s_prevF10Down) {
-        const bool newState = ToggleGpuWorld();
-        CaptureInvalidateCache();
-        LOG_INFO("GpuWorld toggled via F10 to %d (internal resolution %dx%d)",
-                 newState ? 1 : 0,
-                 GetConfig().internalWidth,
-                 GetConfig().internalHeight);
+    const uint32_t vk = GetConfig().toggleKey;
+    if (vk != 0) {
+        static bool s_prevKeyDown = false;
+        const bool keyDown = (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
+        if (keyDown && !s_prevKeyDown) {
+            const bool newState = ToggleGpuWorld();
+            CaptureInvalidateCache();
+            LOG_INFO("GpuWorld toggled via key 0x%02X to %d (internal resolution %dx%d)",
+                     vk,
+                     newState ? 1 : 0,
+                     GetConfig().internalWidth,
+                     GetConfig().internalHeight);
+        }
+        s_prevKeyDown = keyDown;
     }
-    s_prevF10Down = f10Down;
 }
 
 void __fastcall Detour_FUN_0046e630(uint8_t* buffer, int pitch, int palette) {
