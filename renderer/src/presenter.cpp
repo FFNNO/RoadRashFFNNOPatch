@@ -189,6 +189,8 @@ struct VSIn {
     float4 uvClamp : TEXCOORD4;
     float4 color   : COLOR0;
     float4 flags   : COLOR1;
+    float4 texInfo : TEXCOORD5;
+    float4 box     : TEXCOORD6;
 };
 
 struct VSOut {
@@ -200,6 +202,8 @@ struct VSOut {
     nointerpolation float4 uvClamp : TEXCOORD4;
     nointerpolation float4 color   : COLOR0;
     nointerpolation float4 flags   : COLOR1;
+    nointerpolation float4 texInfo : TEXCOORD5;
+    nointerpolation float4 box     : TEXCOORD6;
 };
 
 VSOut main(VSIn v) {
@@ -212,13 +216,16 @@ VSOut main(VSIn v) {
     o.uvClamp = v.uvClamp;
     o.color   = v.color;
     o.flags   = v.flags;
+    o.texInfo = v.texInfo;
+    o.box     = v.box;
     return o;
 }
 )";
 
 const char* kWorldPixelShaderSrc = R"(
-Texture2D<float4> texQuad : register(t0);
-SamplerState      samp    : register(s0);
+Texture2D<float4> texQuad   : register(t0);
+SamplerState      samp      : register(s0);
+SamplerState      sampAtlas : register(s1);
 
 cbuffer WorldCB : register(b0) {
     float2 srcSize;
@@ -237,8 +244,38 @@ struct PSIn {
     nointerpolation float4 uvClamp : TEXCOORD4;
     nointerpolation float4 color   : COLOR0;
     nointerpolation float4 flags   : COLOR1;
+    nointerpolation float4 texInfo : TEXCOORD5;
+    nointerpolation float4 box     : TEXCOORD6;
 };
 
+// One mip level of an atlas cell: clamp to the texel centres that lie fully inside the uv_box at
+// that level, so bilinear taps never reach a neighbouring cell. texInfo = (width, height, maxLevel),
+// box = inclusive level-0 texel box (minX, minY, maxX, maxY).
+float4 SampleAtlasLevel(float2 uv, float level, float4 texInfo, float4 box) {
+    float scale = exp2(level);
+    float2 size = max(floor(texInfo.xy / scale), float2(1.0, 1.0));
+    float2 lo = ceil(box.xy / scale);
+    float2 hi = max(floor((box.zw + 1.0) / scale) - 1.0, lo);
+    float2 t = clamp(uv * size, lo + 0.5, hi + 0.5);
+    return texQuad.SampleLevel(sampAtlas, t / size, level);
+}
+
+// Trilinear filtering done by hand for atlas cells (per-level clamp), using the analytic gradients.
+float4 SampleAtlas(float2 uv, float2 gx, float2 gy, float4 texInfo, float4 box) {
+    float2 sx = gx * texInfo.xy;
+    float2 sy = gy * texInfo.xy;
+    float rho2 = max(dot(sx, sx), dot(sy, sy));
+    float lod = clamp(0.5 * log2(max(rho2, 1e-12)), 0.0, texInfo.z);
+    float l0 = floor(lod);
+    float l1 = min(l0 + 1.0, texInfo.z);
+    float4 c0 = SampleAtlasLevel(uv, l0, texInfo, box);
+    float4 c1 = SampleAtlasLevel(uv, l1, texInfo, box);
+    return lerp(c0, c1, lod - l0);
+}
+
+// flags.x: 1 = flat colour quad.
+// flags.y: 0 = B4 path (level 0, point sampler); 1 = SampleGrad on the engine mip chain with the
+//          trilinear/anisotropic sampler; 2 = atlas cell, per-level clamped trilinear.
 float4 main(PSIn p) : SV_Target {
     if (p.flags.x > 0.5) {
         return p.color;
@@ -254,7 +291,26 @@ float4 main(PSIn p) : SV_Target {
     QuadUvSample m = QuadMapUv(pts, uvs, curX, curY);
     float2 finalUv = clamp(m.uv, p.uvClamp.xy, p.uvClamp.zw);
 
-    float4 texel = texQuad.Sample(samp, finalUv);
+    // Gradients per render-target pixel come from the analytic scanline derivatives of the
+    // unclamped mapping, never from the clamped value, so quad edges do not spike the mip level.
+    // All sampling happens before the discard and uses explicit LOD or gradients.
+    float4 texel;
+    if (p.flags.y < 0.5) {
+        texel = texQuad.SampleLevel(samp, finalUv, 0.0);
+    } else {
+        float2 gx = m.dUvDx * (srcSize.x / dstSize.x);
+        float2 gy = m.dUvDy * (srcSize.y / dstSize.y);
+        if (p.flags.y < 1.5) {
+            texel = texQuad.SampleGrad(samp, finalUv, gx, gy);
+        } else {
+            texel = SampleAtlas(m.uv, gx, gy, p.texInfo, p.box);
+        }
+        // Textures are stored premultiplied (index 0 = transparent black), so filtering never pulls
+        // dark or coloured fringes in from transparent texels; convert back to straight colour.
+        if (texel.a >= 0.5) {
+            texel.rgb = texel.rgb / texel.a;
+        }
+    }
     if (texel.a < 0.5) {
         discard;
     }
@@ -279,6 +335,8 @@ struct WorldVertex {
     float uvClamp[4];
     float color[4];
     float flags[4];
+    float texInfo[4];
+    float box[4];
 };
 
 struct WorldDrawBatch {
@@ -420,6 +478,9 @@ public:
         m_texWhite.Reset();
         m_samplerWrap.Reset();
         m_samplerClamp.Reset();
+        m_samplerFilteredWrap.Reset();
+        m_samplerFilteredClamp.Reset();
+        m_samplerAtlas.Reset();
         m_rasterScissor.Reset();
         m_blendAlpha.Reset();
         m_worldVB.Reset();
@@ -728,6 +789,8 @@ private:
             {"TEXCOORD", 4, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 72,  D3D11_INPUT_PER_VERTEX_DATA, 0},
             {"COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 88,  D3D11_INPUT_PER_VERTEX_DATA, 0},
             {"COLOR",    1, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 104, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"TEXCOORD", 5, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 120, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"TEXCOORD", 6, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 136, D3D11_INPUT_PER_VERTEX_DATA, 0},
         };
         hr = m_device->CreateInputLayout(ied, static_cast<UINT>(sizeof(ied) / sizeof(ied[0])),
                                          worldVsBlob->GetBufferPointer(), worldVsBlob->GetBufferSize(),
@@ -843,6 +906,36 @@ private:
         hr = m_device->CreateSamplerState(&sd, &m_samplerClamp);
         if (FAILED(hr)) {
             LOG_ERROR("CreateSamplerState(Clamp) failed: 0x%08lX", static_cast<unsigned long>(hr));
+            return false;
+        }
+
+        // T6 filtered samplers: trilinear, or anisotropic when [World] Anisotropy is 2..16.
+        const int aniso = GetConfig().anisotropy;
+        D3D11_SAMPLER_DESC fd = {};
+        fd.Filter = (aniso >= 2) ? D3D11_FILTER_ANISOTROPIC : D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        fd.MaxAnisotropy = (aniso >= 2) ? static_cast<UINT>(aniso) : 1u;
+        fd.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
+        fd.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
+        fd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+        fd.MaxLOD = D3D11_FLOAT32_MAX;
+        hr = m_device->CreateSamplerState(&fd, &m_samplerFilteredWrap);
+        if (FAILED(hr)) {
+            LOG_ERROR("CreateSamplerState(FilteredWrap) failed: 0x%08lX", static_cast<unsigned long>(hr));
+            return false;
+        }
+        fd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+        fd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+        fd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        hr = m_device->CreateSamplerState(&fd, &m_samplerFilteredClamp);
+        if (FAILED(hr)) {
+            LOG_ERROR("CreateSamplerState(FilteredClamp) failed: 0x%08lX", static_cast<unsigned long>(hr));
+            return false;
+        }
+        fd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        fd.MaxAnisotropy = 1;
+        hr = m_device->CreateSamplerState(&fd, &m_samplerAtlas);
+        if (FAILED(hr)) {
+            LOG_ERROR("CreateSamplerState(Atlas) failed: 0x%08lX", static_cast<unsigned long>(hr));
             return false;
         }
 
@@ -971,7 +1064,12 @@ private:
         return true;
     }
 
-    ID3D11ShaderResourceView* GetOrCreateWorldTextureSRV(const CapturedQuad& q, const uint8_t* palette) {
+    // Returns the SRV of the quad's texture; *outLevels receives its uploaded mip level count.
+    ID3D11ShaderResourceView* GetOrCreateWorldTextureSRV(const CapturedQuad& q, const uint8_t* palette,
+                                                         int32_t* outLevels) {
+        if (outLevels) {
+            *outLevels = 1;
+        }
         if (q.pdatPtr == 0 || q.texWidth <= 0 || q.texHeight <= 0) {
             return m_srvWhite.Get();
         }
@@ -983,37 +1081,55 @@ private:
 
         auto it = m_worldTexSrvCache.find(srvKey);
         if (it != m_worldTexSrvCache.end()) {
-            return it->second.Get();
+            if (outLevels) {
+                *outLevels = it->second.levels;
+            }
+            return it->second.srv.Get();
         }
 
-        int32_t tw = 0;
-        int32_t th = 0;
-        const uint8_t* texPixels = CaptureLookupTexturePixels(q.pdatPtr, q.level0Crc32, tw, th);
-        if (!texPixels || tw <= 0 || th <= 0) {
+        TextureMipChainView chain;
+        if (!CaptureLookupTextureMipChain(q.pdatPtr, q.level0Crc32, chain) || chain.levels <= 0 ||
+            chain.width[0] <= 0 || chain.height[0] <= 0) {
             return m_srvWhite.Get();
         }
+        // MipFilter=chosen keeps the B4 single level; trilinear uploads every engine level.
+        const int32_t levels = (GetConfig().mipFilter == MipFilter::Trilinear) ? chain.levels : 1;
+        const int32_t tw = chain.width[0];
+        const int32_t th = chain.height[0];
 
-        m_tempRgbaUpload.resize(static_cast<size_t>(tw) * static_cast<size_t>(th));
-        for (int32_t i = 0; i < tw * th; ++i) {
-            const uint8_t idx = texPixels[static_cast<size_t>(i)];
-            if (colorKey && idx == 0) {
-                m_tempRgbaUpload[static_cast<size_t>(i)] = 0x00000000u;
-            } else {
-                const uint32_t r = palette[idx * 4 + 0];
-                const uint32_t g = palette[idx * 4 + 1];
-                const uint32_t b = palette[idx * 4 + 2];
-                m_tempRgbaUpload[static_cast<size_t>(i)] = r | (g << 8) | (b << 16) | 0xFF000000u;
-            }
+        // Palette conversion with index 0 as alpha 0 for colour-keyed textures. A transparent texel
+        // is stored as (0, 0, 0, 0), so every level is premultiplied.
+        size_t totalTexels = 0;
+        for (int32_t l = 0; l < levels; ++l) {
+            totalTexels += static_cast<size_t>(chain.width[l]) * static_cast<size_t>(chain.height[l]);
         }
-
-        D3D11_SUBRESOURCE_DATA initData = {};
-        initData.pSysMem = m_tempRgbaUpload.data();
-        initData.SysMemPitch = static_cast<UINT>(tw * sizeof(uint32_t));
+        m_tempRgbaUpload.resize(totalTexels);
+        D3D11_SUBRESOURCE_DATA initData[kMaxTextureMipLevels] = {};
+        size_t offset = 0;
+        for (int32_t l = 0; l < levels; ++l) {
+            const size_t count = static_cast<size_t>(chain.width[l]) * static_cast<size_t>(chain.height[l]);
+            uint32_t* dst = m_tempRgbaUpload.data() + offset;
+            const uint8_t* src = chain.pixels[l];
+            for (size_t i = 0; i < count; ++i) {
+                const uint8_t idx = src[i];
+                if (colorKey && idx == 0) {
+                    dst[i] = 0x00000000u;
+                } else {
+                    const uint32_t r = palette[idx * 4 + 0];
+                    const uint32_t g = palette[idx * 4 + 1];
+                    const uint32_t b = palette[idx * 4 + 2];
+                    dst[i] = r | (g << 8) | (b << 16) | 0xFF000000u;
+                }
+            }
+            initData[l].pSysMem = dst;
+            initData[l].SysMemPitch = static_cast<UINT>(chain.width[l] * sizeof(uint32_t));
+            offset += count;
+        }
 
         D3D11_TEXTURE2D_DESC td = {};
         td.Width = static_cast<UINT>(tw);
         td.Height = static_cast<UINT>(th);
-        td.MipLevels = 1;
+        td.MipLevels = static_cast<UINT>(levels);
         td.ArraySize = 1;
         td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         td.SampleDesc.Count = 1;
@@ -1021,7 +1137,7 @@ private:
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
         ComPtr<ID3D11Texture2D> tex;
-        HRESULT hr = m_device->CreateTexture2D(&td, &initData, &tex);
+        HRESULT hr = m_device->CreateTexture2D(&td, initData, &tex);
         if (FAILED(hr)) {
             return m_srvWhite.Get();
         }
@@ -1030,8 +1146,11 @@ private:
         if (FAILED(hr)) {
             return m_srvWhite.Get();
         }
+        if (outLevels) {
+            *outLevels = levels;
+        }
         ID3D11ShaderResourceView* rawSrv = srv.Get();
-        m_worldTexSrvCache.emplace(srvKey, std::move(srv));
+        m_worldTexSrvCache.emplace(srvKey, CachedWorldTexture{std::move(srv), levels});
         return rawSrv;
     }
 
@@ -1167,6 +1286,7 @@ private:
         }
 
         const bool subPixel = GetConfig().subPixel;
+        const bool trilinear = GetConfig().mipFilter == MipFilter::Trilinear;
         uint32_t frameFloatQuads = 0;
         uint32_t frameFallbackQuads = 0;
         for (uint32_t qi = 0; qi < quadCount; ++qi) {
@@ -1224,6 +1344,8 @@ private:
             float uvClamp[4] = {0.0f, 0.0f, 1.0f, 1.0f};
             float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
             float flags[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float texInfo[4] = {1.0f, 1.0f, 0.0f, 0.0f};
+            float box[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
             float vx[4] = {};
             float vy[4] = {};
@@ -1261,7 +1383,8 @@ private:
                     }
                 }
             } else {
-                srv = GetOrCreateWorldTextureSRV(q, palette);
+                int32_t texLevels = 1;
+                srv = GetOrCreateWorldTextureSRV(q, palette, &texLevels);
                 const float texW = static_cast<float>(std::max(1, q.texWidth));
                 const float texH = static_cast<float>(std::max(1, q.texHeight));
 
@@ -1279,9 +1402,26 @@ private:
                 const int32_t vs[4] = {q.verts[0].v, q.verts[1].v, q.verts[2].v, q.verts[3].v};
                 const QuadAddressing addr = ChooseQuadAddressing(
                     q.uvBox, (q.pdatFlags & 0x2000u) != 0, q.texWidth, q.texHeight, us, vs);
+                texInfo[0] = texW;
+                texInfo[1] = texH;
+                box[0] = static_cast<float>(addr.clampTexel[0]);
+                box[1] = static_cast<float>(addr.clampTexel[1]);
+                box[2] = static_cast<float>(addr.clampTexel[2]);
+                box[3] = static_cast<float>(addr.clampTexel[3]);
+                if (trilinear) {
+                    // Atlas cells use the per-level clamped path, limited to the levels where the
+                    // box is still at least 2 texels wide; everything else uses SampleGrad.
+                    const int32_t maxLevel = addr.atlas ? AtlasMaxMipLevel(addr.clampTexel, texLevels)
+                                                        : (texLevels - 1);
+                    texInfo[2] = static_cast<float>(maxLevel < 0 ? 0 : maxLevel);
+                    flags[1] = addr.atlas ? 2.0f : 1.0f;
+                    sampler = addr.wrap ? m_samplerFilteredWrap.Get() : m_samplerFilteredClamp.Get();
+                }
                 if (addr.wrap) {
                     // UVs past the texture: wrap like the engine span routines (no clamp).
-                    sampler = m_samplerWrap.Get();
+                    if (!trilinear) {
+                        sampler = m_samplerWrap.Get();
+                    }
                     uvClamp[0] = -1.0e6f;
                     uvClamp[1] = -1.0e6f;
                     uvClamp[2] = 1.0e6f;
@@ -1310,6 +1450,8 @@ private:
                 std::memcpy(qv[i].uvClamp, uvClamp, sizeof(uvClamp));
                 std::memcpy(qv[i].color, color, sizeof(color));
                 std::memcpy(qv[i].flags, flags, sizeof(flags));
+                std::memcpy(qv[i].texInfo, texInfo, sizeof(texInfo));
+                std::memcpy(qv[i].box, box, sizeof(box));
             }
 
             // Choose diagonal (0-2 vs 1-3) so slightly concave quads do not fold over themselves
@@ -1378,6 +1520,7 @@ private:
             m_context->VSSetShader(m_worldVS.Get(), nullptr, 0);
             m_context->PSSetShader(m_worldPS.Get(), nullptr, 0);
             m_context->PSSetConstantBuffers(0, 1, m_constantBuffer.GetAddressOf());
+            m_context->PSSetSamplers(1, 1, m_samplerAtlas.GetAddressOf());
             m_context->RSSetState(m_rasterScissor.Get());
             const float blendFactor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             m_context->OMSetBlendState(nullptr, blendFactor, 0xFFFFFFFFu);
@@ -1512,6 +1655,9 @@ private:
     ComPtr<ID3D11BlendState> m_blendAlpha;
     ComPtr<ID3D11SamplerState> m_samplerWrap;
     ComPtr<ID3D11SamplerState> m_samplerClamp;
+    ComPtr<ID3D11SamplerState> m_samplerFilteredWrap;
+    ComPtr<ID3D11SamplerState> m_samplerFilteredClamp;
+    ComPtr<ID3D11SamplerState> m_samplerAtlas;
     ComPtr<ID3D11Texture2D> m_texWhite;
     ComPtr<ID3D11ShaderResourceView> m_srvWhite;
     ComPtr<ID3D11Texture2D> m_texLayerRgba;
@@ -1520,7 +1666,11 @@ private:
     ComPtr<ID3D11RenderTargetView> m_rtvWorld;
     ComPtr<ID3D11ShaderResourceView> m_srvWorld;
 
-    std::unordered_map<uint64_t, ComPtr<ID3D11ShaderResourceView>> m_worldTexSrvCache;
+    struct CachedWorldTexture {
+        ComPtr<ID3D11ShaderResourceView> srv;
+        int32_t levels = 1;
+    };
+    std::unordered_map<uint64_t, CachedWorldTexture> m_worldTexSrvCache;
     uint8_t m_cachedPalette[1024] = {};
     uint64_t m_cachedWorldGen = 0;
     std::vector<uint32_t> m_tempRgbaUpload;

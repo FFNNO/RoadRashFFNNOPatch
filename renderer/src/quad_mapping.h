@@ -197,3 +197,25 @@ inline QuadAddressing ChooseQuadAddressing(const int32_t uvBox[4],
     a.wrap = outside;
     return a;
 }
+
+// Highest mip level at which an inclusive level-0 texel box {minX, minY, maxX, maxY} still covers
+// at least 2 whole texels on both axes (level texels i with i * 2^L >= min and (i + 1) * 2^L <= max + 1).
+// Atlas quads are limited to these levels so lower mips cannot blend in neighbouring cells; the
+// world pixel shader clamps each sampled level to the same whole-texel range.
+inline int32_t AtlasMaxMipLevel(const int32_t box[4], int32_t levels) {
+    const int32_t minX = (box[0] > 0) ? box[0] : 0;
+    const int32_t minY = (box[1] > 0) ? box[1] : 0;
+    int32_t best = 0;
+    for (int32_t level = 1; level < levels && level < 16; ++level) {
+        const int32_t scale = 1 << level;
+        const int32_t loX = (minX + scale - 1) / scale;
+        const int32_t loY = (minY + scale - 1) / scale;
+        const int32_t hiX = (box[2] + 1) / scale - 1;
+        const int32_t hiY = (box[3] + 1) / scale - 1;
+        if (hiX - loX + 1 < 2 || hiY - loY + 1 < 2) {
+            break;
+        }
+        best = level;
+    }
+    return best;
+}

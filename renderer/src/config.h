@@ -8,6 +8,13 @@ enum class FilterMode {
     SharpBilinear = 2
 };
 
+// [World] MipFilter: trilinear = upload the engine's PDAT mip chain and sample it with trilinear (or
+// anisotropic) filtering; chosen = B4 behaviour (level 0 only, point sampling).
+enum class MipFilter {
+    Chosen = 0,
+    Trilinear = 1
+};
+
 struct Config {
     bool enabled = true;
     LogLevel logLevel = LogLevel::Info;
@@ -23,6 +30,8 @@ struct Config {
     int internalHeight = 1080;
     uint32_t toggleKey = 0x91;  // VK_SCROLL (Scroll Lock)
     bool subPixel = true;       // [World] SubPixel: draw world quads at their 16.16 corners
+    MipFilter mipFilter = MipFilter::Trilinear;
+    int anisotropy = 8;         // [World] Anisotropy: 2..16 = anisotropic filtering, 0 or 1 = off
 };
 
 void ConfigInit(const std::wstring& iniFilePath);
@@ -33,4 +42,6 @@ int ClampInternalHeight(int h);
 // Anything else (including trailing garbage such as "0x7Bzz") returns defaultKey.
 uint32_t ParseVirtualKey(const wchar_t* str, uint32_t defaultKey = 0x91);
 bool ParseFilterMode(const wchar_t* str, FilterMode& outMode);
+bool ParseMipFilter(const wchar_t* str, MipFilter& outMode);
+int ClampAnisotropy(int value);
 const char* FilterModeToString(FilterMode mode);

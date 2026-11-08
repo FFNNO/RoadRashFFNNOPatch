@@ -992,6 +992,108 @@ int main() {
         Check(!s.eligible && !s.useCorners, "single-scanline quads keep their snapped vertices");
     }
 
+    // 14. Blended mipmaps (T6): config, engine mip chain cache, atlas level limit, analytic gradients.
+    {
+        char what[256];
+        MipFilter mf = MipFilter::Chosen;
+        Check(ParseMipFilter(L"Trilinear", mf) && mf == MipFilter::Trilinear &&
+                  ParseMipFilter(L" chosen ", mf) && mf == MipFilter::Chosen,
+              "ParseMipFilter accepts trilinear and chosen");
+        Check(!ParseMipFilter(L"bogus", mf) && mf == MipFilter::Trilinear,
+              "ParseMipFilter falls back to trilinear on unknown values");
+        Check(ClampAnisotropy(0) == 0 && ClampAnisotropy(1) == 0 && ClampAnisotropy(2) == 2 &&
+                  ClampAnisotropy(8) == 8 && ClampAnisotropy(64) == 16,
+              "Anisotropy: 0 or 1 = off, 2..16 kept, larger values clamp to 16");
+        Check(Config{}.mipFilter == MipFilter::Trilinear && Config{}.anisotropy == 8 && Config{}.subPixel,
+              "defaults: MipFilter=trilinear, Anisotropy=8, SubPixel=1");
+
+        Check(ClampMipLevelCount(64, 256, 7) == 7 && ClampMipLevelCount(64, 256, 8) == 7 &&
+                  ClampMipLevelCount(64, 64, 0) == 1 && ClampMipLevelCount(256, 256, 20) == 9,
+              "ClampMipLevelCount stops before a level dimension reaches 0");
+
+        // A 8x4 texture with two engine levels below it (4x2, 2x1).
+        uint8_t l0[8 * 4];
+        uint8_t l1[4 * 2];
+        uint8_t l2[2 * 1];
+        for (int i = 0; i < 32; ++i) l0[i] = static_cast<uint8_t>(i);
+        for (int i = 0; i < 8; ++i) l1[i] = static_cast<uint8_t>(100 + i);
+        l2[0] = 200;
+        l2[1] = 201;
+        const uint8_t* extra[2] = {l1, l2};
+        CaptureInit(nullptr, L"");
+        CaptureCacheTexturePixels(0x4000, 9, l0, 8, 4, 8, extra, 2);
+        TextureMipChainView chain;
+        const bool found = CaptureLookupTextureMipChain(0x4000, 9, chain);
+        Check(found && chain.levels == 3 && chain.width[1] == 4 && chain.height[1] == 2 && chain.width[2] == 2 &&
+                  chain.height[2] == 1 && chain.pixels[0][31] == 31 && chain.pixels[1][7] == 107 &&
+                  chain.pixels[2][1] == 201 && CaptureGetTexturePixelCacheBytes() == 32 + 8 + 2,
+              "engine mip levels are cached back to back with their own sizes (no regeneration)");
+        CaptureCacheTexturePixels(0x5000, 9, l0, 8, 4, 8);
+        Check(CaptureLookupTextureMipChain(0x5000, 9, chain) && chain.levels == 1,
+              "MipFilter=chosen caches level 0 only");
+        CaptureInvalidateCache();
+
+        const int32_t fullBox[4] = {0, 0, 63, 255};
+        const int32_t halfBox[4] = {0, 128, 63, 255};
+        const int32_t oddBox[4] = {3, 0, 12, 63};
+        Check(AtlasMaxMipLevel(fullBox, 7) == 5, "64x256 box keeps levels up to 32 -> 2 texels wide (level 5)");
+        Check(AtlasMaxMipLevel(halfBox, 7) == 5, "aligned half-texture atlas cell keeps levels 0..5");
+        Check(AtlasMaxMipLevel(oddBox, 7) == 2,
+              "unaligned cell [3..12] stops at level 2 (level 3 covers no whole texel inside it)");
+
+        // Analytic gradients of the shared mapping vs central differences inside a strongly skewed quad.
+        rr::qm::float2 pts[4] = {rr::qm::float2(200.0f, 80.0f), rr::qm::float2(450.0f, 120.0f),
+                                 rr::qm::float2(520.0f, 380.0f), rr::qm::float2(120.0f, 310.0f)};
+        rr::qm::float2 uvs[4] = {rr::qm::float2(0.0f, 0.0f), rr::qm::float2(256.0f, 0.0f),
+                                 rr::qm::float2(256.0f, 256.0f), rr::qm::float2(0.0f, 256.0f)};
+        const float vertexY[4] = {80.0f, 120.0f, 380.0f, 310.0f};
+        double maxRelErr = 0.0;
+        int samples = 0;
+        for (int y = 90; y <= 370; y += 7) {
+            bool nearVertex = false;
+            for (float vy : vertexY) nearVertex = nearVertex || std::fabs(static_cast<float>(y) - vy) < 2.0f;
+            if (nearVertex) continue;
+            for (int x = 130; x <= 510; x += 11) {
+                const float fx = static_cast<float>(x);
+                const float fy = static_cast<float>(y);
+                const rr::qm::QuadUvSample m = rr::qm::QuadMapUv(pts, uvs, fx, fy);
+                if (fx < m.xL + 2.0f || fx > m.xR - 2.0f) continue;
+                const float h = 0.25f;
+                const rr::qm::QuadUvSample mx0 = rr::qm::QuadMapUv(pts, uvs, fx - h, fy);
+                const rr::qm::QuadUvSample mx1 = rr::qm::QuadMapUv(pts, uvs, fx + h, fy);
+                const rr::qm::QuadUvSample my0 = rr::qm::QuadMapUv(pts, uvs, fx, fy - h);
+                const rr::qm::QuadUvSample my1 = rr::qm::QuadMapUv(pts, uvs, fx, fy + h);
+                const double fdux = (mx1.uv.x - mx0.uv.x) / (2.0 * h);
+                const double fdvy = (my1.uv.y - my0.uv.y) / (2.0 * h);
+                const double fduy = (my1.uv.x - my0.uv.x) / (2.0 * h);
+                const double scale = 1.0 + std::fabs(fdux) + std::fabs(fdvy) + std::fabs(fduy);
+                maxRelErr = std::max(maxRelErr, std::fabs(fdux - m.dUvDx.x) / scale);
+                maxRelErr = std::max(maxRelErr, std::fabs(fdvy - m.dUvDy.y) / scale);
+                maxRelErr = std::max(maxRelErr, std::fabs(fduy - m.dUvDy.x) / scale);
+                ++samples;
+            }
+        }
+        std::snprintf(what, sizeof(what),
+                      "analytic scanline gradients match central differences at %d interior points (max rel err %.5f)",
+                      samples, maxRelErr);
+        Check(samples > 200 && maxRelErr < 0.01, what);
+
+        // Pixels just outside the quad (clamped y, saturated t) keep the edge-row gradient: no spike, no zero.
+        rr::qm::float2 tpts[4] = {rr::qm::float2(280.0f, 100.0f), rr::qm::float2(360.0f, 100.0f),
+                                  rr::qm::float2(560.0f, 300.0f), rr::qm::float2(80.0f, 300.0f)};
+        rr::qm::float2 tuvs[4] = {rr::qm::float2(0.0f, 0.0f), rr::qm::float2(64.0f, 0.0f),
+                                  rr::qm::float2(64.0f, 256.0f), rr::qm::float2(0.0f, 256.0f)};
+        const rr::qm::QuadUvSample edgeRow = rr::qm::QuadMapUv(tpts, tuvs, 320.0f, 100.0f);
+        const rr::qm::QuadUvSample above = rr::qm::QuadMapUv(tpts, tuvs, 320.0f, 99.6f);
+        const rr::qm::QuadUvSample rightOut = rr::qm::QuadMapUv(tpts, tuvs, 470.0f, 200.0f);
+        const rr::qm::QuadUvSample rightIn = rr::qm::QuadMapUv(tpts, tuvs, 455.0f, 200.0f);
+        Check(std::fabs(above.dUvDy.y - edgeRow.dUvDy.y) < 1e-4f && std::fabs(above.dUvDx.x - edgeRow.dUvDx.x) < 1e-4f &&
+                  edgeRow.dUvDy.y > 0.5f,
+              "pixel above the top edge (clamped y) keeps the top-row gradient");
+        Check(rightOut.uv.x == 64.0f && std::fabs(rightOut.dUvDx.x - rightIn.dUvDx.x) < 1e-4f && rightOut.dUvDx.x > 0.0f,
+              "pixel past the right edge (saturated t) keeps the span gradient instead of dropping to zero");
+    }
+
     // PNG and JSON writer unit tests (B3 item 5).
     RunCaptureWritersTest();
 

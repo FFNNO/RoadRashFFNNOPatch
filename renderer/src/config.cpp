@@ -47,6 +47,26 @@ bool ParseFilterMode(const wchar_t* str, FilterMode& outMode) {
     return false;
 }
 
+bool ParseMipFilter(const wchar_t* str, MipFilter& outMode) {
+    std::wstring s = ToLowerTrimmed(str);
+    if (s == L"trilinear") {
+        outMode = MipFilter::Trilinear;
+        return true;
+    }
+    if (s == L"chosen") {
+        outMode = MipFilter::Chosen;
+        return true;
+    }
+    outMode = MipFilter::Trilinear;
+    return false;
+}
+
+int ClampAnisotropy(int value) {
+    if (value < 2) return 0;
+    if (value > 16) return 16;
+    return value;
+}
+
 const char* FilterModeToString(FilterMode mode) {
     switch (mode) {
         case FilterMode::Nearest:       return "nearest";
@@ -133,6 +153,13 @@ void ConfigInit(const std::wstring& iniFilePath) {
 
     UINT subPixelVal = GetPrivateProfileIntW(L"World", L"SubPixel", 1, iniFilePath.c_str());
     g_config.subPixel = (subPixelVal != 0);
+
+    wchar_t mipBuf[64] = {0};
+    GetPrivateProfileStringW(L"World", L"MipFilter", L"trilinear", mipBuf, 64, iniFilePath.c_str());
+    ParseMipFilter(mipBuf, g_config.mipFilter);
+
+    const INT aniso = static_cast<INT>(GetPrivateProfileIntW(L"World", L"Anisotropy", 8, iniFilePath.c_str()));
+    g_config.anisotropy = ClampAnisotropy(aniso);
 }
 
 int ClampInternalHeight(int h) {

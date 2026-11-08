@@ -88,6 +88,8 @@ bool g_crcTableReady = false;
 struct CachedTexturePixels {
     int32_t width = 0;
     int32_t height = 0;
+    int32_t levels = 1;                          // engine mip levels stored back to back
+    size_t levelOffset[kMaxTextureMipLevels] = {};
     std::vector<uint8_t> pixels;
 };
 
@@ -802,14 +804,37 @@ uint32_t CaptureGetTexturePixelCacheEvictions() {
     return g_texPixelCacheEvictions;
 }
 
+int32_t ClampMipLevelCount(int32_t width, int32_t height, int32_t levelCount) {
+    int32_t levels = (levelCount < 1) ? 1 : levelCount;
+    levels = (levels > kMaxTextureMipLevels) ? kMaxTextureMipLevels : levels;
+    int32_t valid = 1;
+    while (valid < levels && (width >> valid) >= 1 && (height >> valid) >= 1) {
+        ++valid;
+    }
+    return valid;
+}
+
 void CaptureCacheTexturePixels(uint32_t pdatPtr,
                                uint32_t level0Crc32,
                                const uint8_t* level0Ptr,
                                int32_t width,
                                int32_t height,
-                               int32_t rowPitch) {
+                               int32_t rowPitch,
+                               const uint8_t* const* extraLevels,
+                               int32_t extraLevelCount) {
     if (!level0Ptr || width <= 0 || height <= 0 || width > 1024 || height > 1024 || rowPitch < width) {
         return;
+    }
+    // Level i (i >= 1) is the engine's own (width >> i) x (height >> i) block, rows packed.
+    int32_t levels = 1;
+    if (extraLevels && extraLevelCount > 0) {
+        levels = ClampMipLevelCount(width, height, extraLevelCount + 1);
+        for (int32_t i = 1; i < levels; ++i) {
+            if (!extraLevels[i - 1]) {
+                levels = i;
+                break;
+            }
+        }
     }
     const uint64_t key = (static_cast<uint64_t>(pdatPtr) << 32) | level0Crc32;
     auto it = g_texPixelCache.find(key);
@@ -820,7 +845,12 @@ void CaptureCacheTexturePixels(uint32_t pdatPtr,
         g_texPixelCacheBytes -= it->second.pixels.size();
         g_texPixelCache.erase(it);
     }
-    const size_t entryBytes = static_cast<size_t>(width) * static_cast<size_t>(height);
+    size_t entryBytes = 0;
+    size_t levelOffset[kMaxTextureMipLevels] = {};
+    for (int32_t i = 0; i < levels; ++i) {
+        levelOffset[i] = entryBytes;
+        entryBytes += static_cast<size_t>(width >> i) * static_cast<size_t>(height >> i);
+    }
     if (g_texPixelCacheBytes + entryBytes > g_texPixelCacheCapBytes) {
         ++g_texPixelCacheEvictions;
         LOG_INFO("Texture pixel cache reached %zu of %zu bytes (%zu textures); clearing it (eviction %u)",
@@ -835,15 +865,24 @@ void CaptureCacheTexturePixels(uint32_t pdatPtr,
     CachedTexturePixels entry;
     entry.width = width;
     entry.height = height;
+    entry.levels = levels;
+    for (int32_t i = 0; i < levels; ++i) {
+        entry.levelOffset[i] = levelOffset[i];
+    }
     entry.pixels.resize(entryBytes);
+    const size_t level0Bytes = static_cast<size_t>(width) * static_cast<size_t>(height);
     if (rowPitch == width) {
-        std::memcpy(entry.pixels.data(), level0Ptr, entry.pixels.size());
+        std::memcpy(entry.pixels.data(), level0Ptr, level0Bytes);
     } else {
         for (int32_t y = 0; y < height; ++y) {
             std::memcpy(entry.pixels.data() + static_cast<size_t>(y) * static_cast<size_t>(width),
                         level0Ptr + static_cast<size_t>(y) * static_cast<size_t>(rowPitch),
                         static_cast<size_t>(width));
         }
+    }
+    for (int32_t i = 1; i < levels; ++i) {
+        std::memcpy(entry.pixels.data() + levelOffset[i], extraLevels[i - 1],
+                    static_cast<size_t>(width >> i) * static_cast<size_t>(height >> i));
     }
     g_texPixelCacheBytes += entry.pixels.size();
     g_texPixelCache[key] = std::move(entry);
@@ -898,6 +937,23 @@ const uint8_t* CaptureLookupTexturePixels(uint32_t pdatPtr,
     outWidth = it->second.width;
     outHeight = it->second.height;
     return it->second.pixels.data();
+}
+
+bool CaptureLookupTextureMipChain(uint32_t pdatPtr, uint32_t level0Crc32, TextureMipChainView& out) {
+    out = TextureMipChainView{};
+    const uint64_t key = (static_cast<uint64_t>(pdatPtr) << 32) | level0Crc32;
+    auto it = g_texPixelCache.find(key);
+    if (it == g_texPixelCache.end() || it->second.pixels.empty()) {
+        return false;
+    }
+    const CachedTexturePixels& e = it->second;
+    out.levels = e.levels;
+    for (int32_t i = 0; i < e.levels; ++i) {
+        out.width[i] = e.width >> i;
+        out.height[i] = e.height >> i;
+        out.pixels[i] = e.pixels.data() + e.levelOffset[i];
+    }
+    return true;
 }
 
 uint32_t CaptureGetCacheGeneration() {
@@ -1027,7 +1083,20 @@ int CaptureTexturedQuadBefore() {
             q.level0Crc32 = LookupOrComputeLevel0Crc32(
                 q.pdatPtr, keyB, level0Ptr, pdatPitch, pdatHeight, pdatPitch, nullptr, 0);
             if (GetConfig().gpuWorld) {
-                CaptureCacheTexturePixels(q.pdatPtr, q.level0Crc32, level0Ptr, pdatPitch, pdatHeight, pdatPitch);
+                // Engine mip chain (T6): PDAT +0x28 holds the level count and +0x38 + 12 * i the
+                // level-i texel pointer FUN_0042e850 reads; level i is (w >> i) x (h >> i).
+                const uint8_t* extraLevels[kMaxTextureMipLevels - 1] = {};
+                int32_t extraCount = 0;
+                if (GetConfig().mipFilter == MipFilter::Trilinear) {
+                    const int32_t levels = ClampMipLevelCount(pdatPitch, pdatHeight, q.mipLevels);
+                    for (int32_t level = 1; level < levels; ++level) {
+                        extraLevels[level - 1] =
+                            *reinterpret_cast<const uint8_t* const*>(pdat + 0x38 + level * 0x0c);
+                        ++extraCount;
+                    }
+                }
+                CaptureCacheTexturePixels(q.pdatPtr, q.level0Crc32, level0Ptr, pdatPitch, pdatHeight, pdatPitch,
+                                          extraLevels, extraCount);
             }
         }
     }

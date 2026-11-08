@@ -170,15 +170,30 @@ CaptureFrameCounters CaptureGetFrameCounters();
 // Capped by bytes; when an insert would exceed the cap the whole cache is cleared (the presenter
 // re-uploads on the next generation) and the eviction is logged.
 inline constexpr size_t kDefaultTexturePixelCacheCapBytes = 256u * 1024u * 1024u;
+inline constexpr int32_t kMaxTextureMipLevels = 12;
 void CaptureSetTexturePixelCacheCap(size_t capBytes);
 size_t CaptureGetTexturePixelCacheBytes();
 uint32_t CaptureGetTexturePixelCacheEvictions();
+// extraLevels[i - 1] points to engine mip level i ((width >> i) x (height >> i), rows packed).
 void CaptureCacheTexturePixels(uint32_t pdatPtr,
                                uint32_t level0Crc32,
                                const uint8_t* level0Ptr,
                                int32_t width,
                                int32_t height,
-                               int32_t rowPitch);
+                               int32_t rowPitch,
+                               const uint8_t* const* extraLevels = nullptr,
+                               int32_t extraLevelCount = 0);
+// Number of usable levels for a width x height chain claiming levelCount levels (1..12, stops
+// before a dimension would reach 0).
+int32_t ClampMipLevelCount(int32_t width, int32_t height, int32_t levelCount);
+
+struct TextureMipChainView {
+    int32_t levels = 0;
+    int32_t width[kMaxTextureMipLevels] = {};
+    int32_t height[kMaxTextureMipLevels] = {};
+    const uint8_t* pixels[kMaxTextureMipLevels] = {};
+};
+bool CaptureLookupTextureMipChain(uint32_t pdatPtr, uint32_t level0Crc32, TextureMipChainView& out);
 
 // HUD sentinel for the current frame and the observation hook called by the presenter.
 uint8_t CaptureGetHudSentinel();
