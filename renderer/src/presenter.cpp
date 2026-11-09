@@ -357,6 +357,9 @@ struct WorldDrawBatch {
 };
 
 constexpr size_t kMaxWorldVertices = 65536;
+// Texture pack creation budget per menu frame. Menus redraw at about 1 fps, so a longer frame there
+// is not visible, while race frames keep [TexturePack] DecodeBudgetMs.
+constexpr int32_t kMenuTexturePackBudgetMs = 50;
 
 class D3D11Presenter {
 public:
@@ -449,8 +452,9 @@ public:
         }
 
         // Menus present through this path, so servicing the pack here lets the preload finish
-        // before the first race frame instead of starting with it.
-        ServiceTexturePack();
+        // before the first race frame instead of starting with it. Menus redraw at about 1 fps,
+        // so they get a larger texture creation budget than race frames.
+        ServiceTexturePack(kMenuTexturePackBudgetMs);
 
         D3D11_MAPPED_SUBRESOURCE mapped = {};
         HRESULT hr = m_context->Map(m_texBgra.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -1301,7 +1305,7 @@ private:
     // on their first draw. D3D textures are still created here, on the game thread, within
     // DecodeBudgetMs per frame. A device loss runs Shutdown, and the next frame indexes and
     // preloads again. GpuWorld=0 or Enabled=0 does no texture pack work.
-    void ServiceTexturePack() {
+    void ServiceTexturePack(int32_t budgetMsOverride = 0) {
         if (!GetConfig().gpuWorld || !GetConfig().texturePackEnabled) {
             return;
         }
@@ -1312,7 +1316,7 @@ private:
                             GetConfig().texturePackPreload);
             m_texturePackInitialized = true;
         }
-        TexturePackUpdate(m_device.Get());
+        TexturePackUpdate(m_device.Get(), budgetMsOverride);
     }
 
     // Texture pack replacements are fixed full-brightness RGBA, while originals are converted through

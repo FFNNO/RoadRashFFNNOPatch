@@ -1094,7 +1094,7 @@ public:
         return nullptr;
     }
 
-    void Update(ID3D11Device* device) {
+    void Update(ID3D11Device* device, int32_t budgetMsOverride) {
         if (!device) {
             return;
         }
@@ -1102,7 +1102,8 @@ public:
         QueryPerformanceFrequency(&freq);
         QueryPerformanceCounter(&start);
 
-        const double budgetSec = static_cast<double>(m_decodeBudgetMs) / 1000.0;
+        const int32_t budgetMs = budgetMsOverride > 0 ? budgetMsOverride : m_decodeBudgetMs;
+        const double budgetSec = static_cast<double>(budgetMs) / 1000.0;
         const uint64_t maxBytes = static_cast<uint64_t>(m_maxMiB) * 1024ULL * 1024ULL;
         // Bumped only for replacements that were drawn while pending: a preloaded replacement that
         // is ready before its first use has no cached original to invalidate.
@@ -1486,8 +1487,8 @@ void TexturePackClearD3DResources() {
     g_texturePackManager.ClearD3DResources();
 }
 
-void TexturePackUpdate(ID3D11Device* device) {
-    g_texturePackManager.Update(device);
+void TexturePackUpdate(ID3D11Device* device, int32_t budgetMsOverride) {
+    g_texturePackManager.Update(device, budgetMsOverride);
 }
 
 uint64_t TexturePackGetGeneration() {

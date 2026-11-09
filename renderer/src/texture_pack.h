@@ -164,7 +164,9 @@ struct TexturePackStats {
 void TexturePackInit(const std::wstring& packDir, int32_t maxMiB, int32_t decodeBudgetMs, bool preload);
 void TexturePackShutdown();
 void TexturePackClearD3DResources();
-void TexturePackUpdate(ID3D11Device* device);
+// budgetMsOverride > 0 replaces DecodeBudgetMs for this call (used by the menu present path, where
+// a longer frame is not visible, so the preload finishes before the race).
+void TexturePackUpdate(ID3D11Device* device, int32_t budgetMsOverride = 0);
 uint64_t TexturePackGetGeneration();
 // Number of PNG files indexed by the last TexturePackInit (0 when not initialized). Lock-free.
 uint32_t TexturePackGetIndexedCount();
