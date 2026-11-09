@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <cstdint>
 #include <string>
+#include "overlay_text.h"
 
 struct LetterboxViewport {
     int x;
@@ -49,3 +50,9 @@ bool PresenterIsLatchedOff();
 bool PresenterGpuWorldAllowed();
 void PresenterNotifyWindowChange();
 void PresenterShutdown();
+
+// Starts the save/load toast. Callable from any thread: the toast is drawn by the next present.
+// When the caller is the thread that presents (the game thread), the last frame is also
+// re-presented at once with the toast, and a window timer keeps re-presenting it while the game
+// does not present (static menus) until the toast has faded out and been removed.
+void PresenterShowToast(ToastKind kind);

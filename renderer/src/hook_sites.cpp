@@ -5,9 +5,14 @@
 #include "capture.h"
 #include "log.h"
 #include "texture_pack.h"
+#include "save_redirect.h"
+#include "overlay_text.h"
 #include <windows.h>
+#include <commdlg.h>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
+#include <string>
 
 namespace {
 
@@ -64,7 +69,6 @@ using StretchDIBits_Fn = int(WINAPI*)(HDC hdc, int xDest, int yDest, int DestWid
                                       int xSrc, int ySrc, int SrcWidth, int SrcHeight,
                                       const VOID* lpBits, const BITMAPINFO* lpbmi, UINT iUsage, DWORD rop);
 StretchDIBits_Fn g_origStretchDIBits = nullptr;
-void** g_iatStretchDIBitsSlot = nullptr;
 
 int WINAPI Detour_StretchDIBits(HDC hdc, int xDest, int yDest, int DestWidth, int DestHeight,
                                 int xSrc, int ySrc, int SrcWidth, int SrcHeight,
@@ -77,56 +81,150 @@ int WINAPI Detour_StretchDIBits(HDC hdc, int xDest, int yDest, int DestWidth, in
     return 0;
 }
 
-bool InstallIatStretchDIBitsHook(HMODULE moduleBase) {
-    if (!moduleBase) {
-        return false;
-    }
-    const auto* base = reinterpret_cast<const uint8_t*>(moduleBase);
-    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
-        return false;
-    }
-    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) {
-        return false;
-    }
-    const IMAGE_DATA_DIRECTORY& importDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (importDir.VirtualAddress == 0 || importDir.Size == 0) {
-        return false;
-    }
+rr95::IatHook g_iatStretchDIBits{"GDI32.dll", "StretchDIBits", reinterpret_cast<void*>(&Detour_StretchDIBits),
+                                reinterpret_cast<void**>(&g_origStretchDIBits), nullptr};
 
-    const auto* desc = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + importDir.VirtualAddress);
-    for (; desc->Name != 0; ++desc) {
-        const char* dllName = reinterpret_cast<const char*>(base + desc->Name);
-        if (_stricmp(dllName, "GDI32.dll") != 0) {
-            continue;
-        }
-        const DWORD origFirstThunkRva = desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk;
-        const auto* origThunk = reinterpret_cast<const IMAGE_THUNK_DATA32*>(base + origFirstThunkRva);
-        auto* iatThunk = reinterpret_cast<IMAGE_THUNK_DATA32*>(
-            const_cast<uint8_t*>(base) + desc->FirstThunk);
+// ---------------------------------------------------------------------------------------------
+// Fixed save file and save/load feedback ([Save] in rr95gpu.ini).
+//
+// Engine globals (preferred VAs verified in RoadRash95.exe, out/decomp.c:32437-32595):
+// 0x00604320: char[0x103] current save file name, lpstrFile of the save/open dialogs
+// 0x005c4d08: 160-byte save block scratch buffer, used only by the save and load routines
+// 0x005cd47e: byte "game changed since the last save" flag, cleared only on save/load success
+constexpr uint32_t kVaSaveFileName = 0x00604320;
+constexpr size_t kSaveFileNameMax = 0x103;
+constexpr uint32_t kVaSaveBlock = 0x005c4d08;
+constexpr uint32_t kVaSaveDirtyFlag = 0x005cd47e;
 
-        for (; origThunk->u1.AddressOfData != 0; ++origThunk, ++iatThunk) {
-            if (IMAGE_SNAP_BY_ORDINAL32(origThunk->u1.Ordinal)) {
-                continue;
-            }
-            const auto* byName = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + origThunk->u1.AddressOfData);
-            if (std::strcmp(reinterpret_cast<const char*>(byName->Name), "StretchDIBits") == 0) {
-                DWORD oldProtect = 0;
-                void** slot = reinterpret_cast<void**>(&iatThunk->u1.Function);
-                if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &oldProtect)) {
-                    return false;
-                }
-                g_origStretchDIBits = reinterpret_cast<StretchDIBits_Fn>(*slot);
-                *slot = reinterpret_cast<void*>(&Detour_StretchDIBits);
-                VirtualProtect(slot, sizeof(void*), oldProtect, &oldProtect);
-                g_iatStretchDIBitsSlot = slot;
-                LOG_INFO("IAT hook on GDI32.dll!StretchDIBits installed (slot %p)", slot);
-                return true;
-            }
+// 0x0043f7c0: void __cdecl FUN_0043f7c0(void)  save the game to the file named at 0x00604320
+// 0x0043f580: void __cdecl FUN_0043f580(void)  load the game from the file named at 0x00604320
+using FUN_0043f7c0_Fn = void(__cdecl*)();
+using FUN_0043f580_Fn = void(__cdecl*)();
+FUN_0043f7c0_Fn g_orig_FUN_0043f7c0 = nullptr;
+FUN_0043f580_Fn g_orig_FUN_0043f580 = nullptr;
+
+using GetFileNameA_Fn = BOOL(WINAPI*)(LPOPENFILENAMEA ofn);
+GetFileNameA_Fn g_origGetSaveFileNameA = nullptr;
+GetFileNameA_Fn g_origGetOpenFileNameA = nullptr;
+std::string g_saveFilePathA;  // resolved [Save] File in the ANSI code page; empty = do not redirect
+
+BOOL CallOriginalFileDialog(GetFileNameA_Fn original, LPOPENFILENAMEA ofn) {
+    return original ? original(ofn) : FALSE;
+}
+
+// Answers every save dialog (Salvar Juego, Salvar Juego Como, save before quitting) with the
+// default file instead of showing it.
+BOOL WINAPI Detour_GetSaveFileNameA(LPOPENFILENAMEA ofn) {
+    if (ofn != nullptr && !g_saveFilePathA.empty()) {
+        const SaveRedirectResult r = RedirectSaveFileName(*ofn, g_saveFilePathA);
+        if (r == SaveRedirectResult::Filled) {
+            LOG_INFO("Save dialog answered with %s", ofn->lpstrFile);
+            return TRUE;
+        }
+        LOG_WARN("Save dialog not redirected to %s (%s); showing the dialog",
+                 g_saveFilePathA.c_str(), SaveRedirectResultToString(r));
+    }
+    return CallOriginalFileDialog(g_origGetSaveFileNameA, ofn);
+}
+
+// Answers the load dialog with the default file when it exists; otherwise the dialog opens as before.
+BOOL WINAPI Detour_GetOpenFileNameA(LPOPENFILENAMEA ofn) {
+    if (ofn != nullptr && !g_saveFilePathA.empty()) {
+        const DWORD attr = GetFileAttributesA(g_saveFilePathA.c_str());
+        const bool exists = attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
+        const SaveRedirectResult r = RedirectOpenFileName(*ofn, g_saveFilePathA, exists);
+        if (r == SaveRedirectResult::Filled) {
+            LOG_INFO("Open dialog answered with %s", ofn->lpstrFile);
+            return TRUE;
+        }
+        if (r == SaveRedirectResult::FileMissing) {
+            LOG_INFO("Default save file %s not found; showing the open dialog", g_saveFilePathA.c_str());
+        } else {
+            LOG_WARN("Open dialog not redirected to %s (%s); showing the dialog",
+                     g_saveFilePathA.c_str(), SaveRedirectResultToString(r));
         }
     }
-    return false;
+    return CallOriginalFileDialog(g_origGetOpenFileNameA, ofn);
+}
+
+rr95::IatHook g_iatGetSaveFileNameA{"COMDLG32.dll", "GetSaveFileNameA",
+                                    reinterpret_cast<void*>(&Detour_GetSaveFileNameA),
+                                    reinterpret_cast<void**>(&g_origGetSaveFileNameA), nullptr};
+rr95::IatHook g_iatGetOpenFileNameA{"COMDLG32.dll", "GetOpenFileNameA",
+                                    reinterpret_cast<void*>(&Detour_GetOpenFileNameA),
+                                    reinterpret_cast<void**>(&g_origGetOpenFileNameA), nullptr};
+
+const char* GameSaveFileName() {
+    const char* name = GlobalPtr<const char>(kVaSaveFileName);
+    const size_t len = strnlen(name, kSaveFileNameMax);
+    return (len == 0 || len >= kSaveFileNameMax) ? nullptr : name;
+}
+
+SaveFileProbe ProbeGameSaveFile() {
+    SaveFileProbe probe;
+    const char* name = GameSaveFileName();
+    WIN32_FILE_ATTRIBUTE_DATA data = {};
+    if (name == nullptr || !GetFileAttributesExA(name, GetFileExInfoStandard, &data) ||
+        (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        return probe;
+    }
+    probe.exists = true;
+    probe.size = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+    probe.lastWrite = (static_cast<uint64_t>(data.ftLastWriteTime.dwHighDateTime) << 32) |
+                      data.ftLastWriteTime.dwLowDateTime;
+    return probe;
+}
+
+// Clearing the magic before a call lets a valid block afterwards prove that this call built (save)
+// or read (load) it; both routines overwrite the whole block before they use it, and nothing else
+// in the game reads it.
+void ClearSaveBlockMagic() {
+    std::memset(GlobalPtr<uint8_t>(kVaSaveBlock) + kSaveBlockMagicOffset, 0, sizeof(uint32_t));
+}
+
+bool SaveBlockValid() {
+    return IsValidSaveBlock(GlobalPtr<const uint8_t>(kVaSaveBlock), kSaveBlockSize);
+}
+
+uint8_t SaveDirtyFlag() {
+    return *GlobalPtr<const uint8_t>(kVaSaveDirtyFlag);
+}
+
+void __cdecl Detour_FUN_0043f7c0() {
+    const SaveFileProbe before = ProbeGameSaveFile();
+    ClearSaveBlockMagic();
+    if (g_orig_FUN_0043f7c0) {
+        g_orig_FUN_0043f7c0();
+    }
+    const SaveFileProbe after = ProbeGameSaveFile();
+    const bool blockValid = SaveBlockValid();
+    const uint8_t dirty = SaveDirtyFlag();
+    const char* name = GameSaveFileName();
+    if (SaveRoutineSucceeded(before, after, blockValid, dirty)) {
+        LOG_INFO("Game saved to %s", name ? name : "?");
+        PresenterShowToast(ToastKind::Saved);
+    } else {
+        LOG_WARN("Game save to %s not confirmed (block valid=%d, dirty=%u, exists=%d, size=%llu, timestamp changed=%d)",
+                 name ? name : "?", blockValid ? 1 : 0, static_cast<unsigned>(dirty), after.exists ? 1 : 0,
+                 static_cast<unsigned long long>(after.size), before.lastWrite != after.lastWrite ? 1 : 0);
+    }
+}
+
+void __cdecl Detour_FUN_0043f580() {
+    ClearSaveBlockMagic();
+    if (g_orig_FUN_0043f580) {
+        g_orig_FUN_0043f580();
+    }
+    const bool blockValid = SaveBlockValid();
+    const uint8_t dirty = SaveDirtyFlag();
+    const char* name = GameSaveFileName();
+    if (LoadRoutineSucceeded(blockValid, dirty)) {
+        LOG_INFO("Game loaded from %s", name ? name : "?");
+        PresenterShowToast(ToastKind::Loaded);
+    } else {
+        LOG_WARN("Game load from %s not confirmed (block valid=%d, dirty=%u)",
+                 name ? name : "?", blockValid ? 1 : 0, static_cast<unsigned>(dirty));
+    }
 }
 
 void UpdateCachedLetterboxIfNeeded(HWND hwnd) {
@@ -496,6 +594,64 @@ static rr95::HookSite g_site_FUN_00467cb0{
     false
 };
 
+// First 6 bytes at 0x0043f580 in both original and patched exes:
+// 55                push ebp          (1 byte)
+// 8b ec             mov  ebp, esp     (2 bytes)
+// 83 ec 10          sub  esp, 0x10    (3 bytes)
+static rr95::HookSite g_site_FUN_0043f580{
+    "FUN_0043f580",
+    0x0043f580,
+    {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x10},
+    6,
+    {1, 2, 3},
+    reinterpret_cast<void*>(&Detour_FUN_0043f580),
+    reinterpret_cast<void**>(&g_orig_FUN_0043f580),
+    false
+};
+
+// First 6 bytes at 0x0043f7c0 in both original and patched exes:
+// 55                push ebp          (1 byte)
+// 8b ec             mov  ebp, esp     (2 bytes)
+// 83 ec 0c          sub  esp, 0x0c    (3 bytes)
+static rr95::HookSite g_site_FUN_0043f7c0{
+    "FUN_0043f7c0",
+    0x0043f7c0,
+    {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x0C},
+    6,
+    {1, 2, 3},
+    reinterpret_cast<void*>(&Detour_FUN_0043f7c0),
+    reinterpret_cast<void**>(&g_orig_FUN_0043f7c0),
+    false
+};
+
+// [Save] Enabled=1: dialog redirect (when the default path is usable) and save/load success
+// detection for the toast. Every failure only logs; the game keeps its original behaviour there.
+static void InstallSaveHooks() {
+    const std::wstring resolved = ResolveGamePath(GetConfig().saveFile);
+    g_saveFilePathA.clear();
+    if (resolved.empty()) {
+        LOG_WARN("[Save] File is empty; save and open dialogs are not redirected");
+    } else if (!WidePathToAnsi(resolved, g_saveFilePathA)) {
+        LOG_WARN("[Save] File '%ls' cannot be expressed in the ANSI code page; dialogs are not redirected",
+                 resolved.c_str());
+    }
+    if (!g_saveFilePathA.empty()) {
+        const bool saveOk = rr95::InstallIatHook(g_iatGetSaveFileNameA, g_hostModule);
+        const bool openOk = rr95::InstallIatHook(g_iatGetOpenFileNameA, g_hostModule);
+        if (!saveOk || !openOk) {
+            LOG_WARN("IAT hooks on COMDLG32.dll not fully installed (GetSaveFileNameA=%d, GetOpenFileNameA=%d)",
+                     saveOk ? 1 : 0, openOk ? 1 : 0);
+        }
+        LOG_INFO("[Save] Default save file: %s", g_saveFilePathA.c_str());
+    }
+    if (!rr95::InstallHook(g_site_FUN_0043f7c0, g_hostModule)) {
+        LOG_WARN("Failed to install save hook on FUN_0043f7c0; no save message");
+    }
+    if (!rr95::InstallHook(g_site_FUN_0043f580, g_hostModule)) {
+        LOG_WARN("Failed to install load hook on FUN_0043f580; no load message");
+    }
+}
+
 bool InstallHooks(ExeBuild build) {
     if (build == ExeBuild::Unknown) {
         LOG_WARN("Cannot install hooks: unknown executable build");
@@ -519,7 +675,7 @@ bool InstallHooks(ExeBuild build) {
         return false;
     }
 
-    g_iatStretchDIBitsInstalled = InstallIatStretchDIBitsHook(g_hostModule);
+    g_iatStretchDIBitsInstalled = rr95::InstallIatHook(g_iatStretchDIBits, g_hostModule);
     if (!g_iatStretchDIBitsInstalled) {
         LOG_WARN("IAT hook on GDI32.dll!StretchDIBits not installed; gdi_blits will report n/a");
     }
@@ -539,28 +695,32 @@ bool InstallHooks(ExeBuild build) {
         }
     }
 
+    if (GetConfig().saveRedirectEnabled) {
+        InstallSaveHooks();
+    } else {
+        LOG_INFO("[Save] Enabled=0: original save/open dialogs, no save message");
+    }
+
     LOG_INFO("Hooks on FUN_0046e630, FUN_0046ded0, and FUN_00460b00 installed successfully");
     return true;
 }
 
 void RemoveHooks() {
     HMODULE hostModule = g_hostModule ? g_hostModule : GetModuleHandleW(nullptr);
-    if (g_iatStretchDIBitsSlot && g_origStretchDIBits) {
-        DWORD oldProtect = 0;
-        if (VirtualProtect(g_iatStretchDIBitsSlot, sizeof(void*), PAGE_READWRITE, &oldProtect)) {
-            *g_iatStretchDIBitsSlot = reinterpret_cast<void*>(g_origStretchDIBits);
-            VirtualProtect(g_iatStretchDIBitsSlot, sizeof(void*), oldProtect, &oldProtect);
-        }
-        g_iatStretchDIBitsSlot = nullptr;
-        g_origStretchDIBits = nullptr;
-    }
+    rr95::RemoveIatHook(g_iatStretchDIBits);
     g_iatStretchDIBitsInstalled = false;
+    rr95::RemoveIatHook(g_iatGetOpenFileNameA);
+    rr95::RemoveIatHook(g_iatGetSaveFileNameA);
+    rr95::RemoveHook(g_site_FUN_0043f580, hostModule);
+    rr95::RemoveHook(g_site_FUN_0043f7c0, hostModule);
     rr95::RemoveHook(g_site_FUN_00467cb0, hostModule);
     rr95::RemoveHook(g_site_FUN_0042e850, hostModule);
     rr95::RemoveHook(g_site_FUN_004688e0, hostModule);
     rr95::RemoveHook(g_site_FUN_00460b00, hostModule);
     rr95::RemoveHook(g_site_FUN_0046ded0, hostModule);
     rr95::RemoveHook(g_site_FUN_0046e630, hostModule);
+    g_orig_FUN_0043f580 = nullptr;
+    g_orig_FUN_0043f7c0 = nullptr;
     g_orig_FUN_00467cb0 = nullptr;
     g_orig_FUN_0042e850 = nullptr;
     g_orig_FUN_004688e0 = nullptr;

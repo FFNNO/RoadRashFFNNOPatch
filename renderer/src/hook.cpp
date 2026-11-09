@@ -193,4 +193,78 @@ void RemoveHook(HookSite& site, HMODULE moduleBase) {
     LOG_INFO("Hook '%s' removed from %p", site.name ? site.name : "<unnamed>", target);
 }
 
+void** FindIatSlot(HMODULE moduleBase, const char* dllName, const char* functionName) {
+    if (!moduleBase || !dllName || !functionName) {
+        return nullptr;
+    }
+    const auto* base = reinterpret_cast<const uint8_t*>(moduleBase);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        return nullptr;
+    }
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        return nullptr;
+    }
+    const IMAGE_DATA_DIRECTORY& importDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (importDir.VirtualAddress == 0 || importDir.Size == 0) {
+        return nullptr;
+    }
+
+    const auto* desc = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + importDir.VirtualAddress);
+    for (; desc->Name != 0; ++desc) {
+        const char* name = reinterpret_cast<const char*>(base + desc->Name);
+        if (_stricmp(name, dllName) != 0) {
+            continue;
+        }
+        const DWORD origFirstThunkRva = desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk;
+        const auto* origThunk = reinterpret_cast<const IMAGE_THUNK_DATA32*>(base + origFirstThunkRva);
+        auto* iatThunk = reinterpret_cast<IMAGE_THUNK_DATA32*>(const_cast<uint8_t*>(base) + desc->FirstThunk);
+        for (; origThunk->u1.AddressOfData != 0; ++origThunk, ++iatThunk) {
+            if (IMAGE_SNAP_BY_ORDINAL32(origThunk->u1.Ordinal)) {
+                continue;
+            }
+            const auto* byName = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + origThunk->u1.AddressOfData);
+            if (std::strcmp(reinterpret_cast<const char*>(byName->Name), functionName) == 0) {
+                return reinterpret_cast<void**>(&iatThunk->u1.Function);
+            }
+        }
+    }
+    return nullptr;
+}
+
+bool InstallIatHook(IatHook& hook, HMODULE moduleBase) {
+    if (hook.slot != nullptr || !hook.detour || !hook.original) {
+        return false;
+    }
+    void** slot = FindIatSlot(moduleBase, hook.dllName, hook.functionName);
+    if (!slot) {
+        return false;
+    }
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &oldProtect)) {
+        return false;
+    }
+    *hook.original = *slot;
+    *slot = hook.detour;
+    VirtualProtect(slot, sizeof(void*), oldProtect, &oldProtect);
+    hook.slot = slot;
+    LOG_INFO("IAT hook on %s!%s installed (slot %p)", hook.dllName, hook.functionName, slot);
+    return true;
+}
+
+void RemoveIatHook(IatHook& hook) {
+    if (hook.slot && hook.original && *hook.original) {
+        DWORD oldProtect = 0;
+        if (VirtualProtect(hook.slot, sizeof(void*), PAGE_READWRITE, &oldProtect)) {
+            *hook.slot = *hook.original;
+            VirtualProtect(hook.slot, sizeof(void*), oldProtect, &oldProtect);
+        }
+    }
+    hook.slot = nullptr;
+    if (hook.original) {
+        *hook.original = nullptr;
+    }
+}
+
 }  // namespace rr95

@@ -39,9 +39,14 @@ struct Config {
     bool texturePackPreload = true;  // [TexturePack] Preload: decode the whole pack in the background at Init
     bool texturePackDump = false;
     std::wstring texturePackDumpPath = L"texture-dump";
+    bool saveRedirectEnabled = true;            // [Save] Enabled: fixed save file, no dialogs, toast
+    std::wstring saveFile = L"Partida 1.RRS";   // [Save] File: relative to the game folder or absolute
 };
 
 void ConfigInit(const std::wstring& iniFilePath);
+// Reads every key of iniFilePath into cfg (missing keys keep their defaults). ConfigInit applies it
+// to the global config; tests call it on a local Config.
+void ParseConfigFile(const std::wstring& iniFilePath, Config& cfg);
 const Config& GetConfig();
 bool ToggleGpuWorld();
 int ClampInternalHeight(int h);

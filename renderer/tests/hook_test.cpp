@@ -22,6 +22,8 @@
 #include "../src/capture.h"
 #include "../src/quad_mapping.h"
 #include "../src/texture_pack.h"
+#include "../src/save_redirect.h"
+#include "../src/overlay_text.h"
 
 namespace {
 
@@ -119,6 +121,23 @@ int g_detourCalls = 0;
 int __fastcall Detour(int a, int b, int c) {
     ++g_detourCalls;
     return g_original(a, b, c) * 10;
+}
+
+int g_iatDetourCalls = 0;
+DWORD(WINAPI* g_iatOriginalGetCurrentProcessId)() = nullptr;
+
+DWORD WINAPI IatDetourGetCurrentProcessId() {
+    ++g_iatDetourCalls;
+    return 0x5A5A5A5Au;
+}
+
+OPENFILENAMEA MakeOfn(char* buffer, DWORD size, const char* defExt) {
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFile = buffer;
+    ofn.nMaxFile = size;
+    ofn.lpstrDefExt = defExt;
+    return ofn;
 }
 
 uint32_t PreferredVa(const void* address) {
@@ -1955,6 +1974,204 @@ int main() {
             RemoveDirectoryW(dir.c_str());
             RemoveDirectoryW(bigDir.c_str());
         }
+    }
+
+    // Save feedback: [Save] config, path resolution, dialog redirect, success rules, toast.
+    {
+        Check(Config{}.saveRedirectEnabled && Config{}.saveFile == L"Partida 1.RRS",
+              "[Save] defaults: Enabled=1, File=Partida 1.RRS");
+        const std::wstring ini = MakeTestTempPath(L"rr95_save_cfg_") + L".ini";
+        WritePrivateProfileStringW(L"Save", L"Enabled", L"0", ini.c_str());
+        WritePrivateProfileStringW(L"Save", L"File", L"D:\\Saves\\mine.RRS", ini.c_str());
+        Config parsed;
+        ParseConfigFile(ini, parsed);
+        Check(!parsed.saveRedirectEnabled && parsed.saveFile == L"D:\\Saves\\mine.RRS",
+              "[Save] Enabled=0 and File= are parsed from the ini");
+        DeleteFileW(ini.c_str());
+        Config missing;
+        ParseConfigFile(MakeTestTempPath(L"rr95_no_such_ini_") + L".ini", missing);
+        Check(missing.saveRedirectEnabled && missing.saveFile == L"Partida 1.RRS",
+              "[Save] keys missing from the ini keep their defaults");
+
+        wchar_t exePath[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        std::wstring exeDir = exePath;
+        exeDir = exeDir.substr(0, exeDir.find_last_of(L'\\'));
+        Check(ResolveGamePath(L"Partida 1.RRS") == exeDir + L"\\Partida 1.RRS",
+              "relative save file resolves against the game (exe) folder");
+        Check(ResolveGamePath(L"D:\\Saves\\mine.RRS") == L"D:\\Saves\\mine.RRS",
+              "absolute save file path is kept as is");
+
+        std::string ansi;
+        Check(WidePathToAnsi(L"C:\\Games\\RoadRash\\Partida 1.RRS", ansi) && ansi == "C:\\Games\\RoadRash\\Partida 1.RRS",
+              "WidePathToAnsi converts an ASCII path");
+        if (GetACP() != CP_UTF8) {
+            Check(!WidePathToAnsi(L"C:\\\U0001F600.RRS", ansi),
+                  "WidePathToAnsi refuses a path the ANSI code page cannot hold");
+        }
+
+        const std::string path = "C:\\Games\\RoadRash\\Partida 1.RRS";
+        char buf[260];
+        std::memset(buf, 'x', sizeof(buf));
+        OPENFILENAMEA ofn = MakeOfn(buf, 0x103, "RRS");
+        Check(RedirectSaveFileName(ofn, path) == SaveRedirectResult::Filled && path == buf,
+              "save redirect copies the default path into lpstrFile");
+        Check(ofn.nFileOffset == 18 && ofn.nFileExtension == 28,
+              "save redirect sets nFileOffset to the name and nFileExtension past the dot");
+
+        char smallBuf[16];
+        std::memset(smallBuf, 'x', sizeof(smallBuf));
+        smallBuf[0] = '\0';
+        OPENFILENAMEA tiny = MakeOfn(smallBuf, sizeof(smallBuf), "RRS");
+        Check(RedirectSaveFileName(tiny, path) == SaveRedirectResult::BufferTooSmall && smallBuf[0] == '\0' &&
+              smallBuf[1] == 'x' && tiny.nFileOffset == 0,
+              "save redirect refuses a buffer that is too small and leaves it untouched");
+        char exact[64];
+        OPENFILENAMEA fits = MakeOfn(exact, static_cast<DWORD>(path.size() + 1), "RRS");
+        Check(RedirectSaveFileName(fits, path) == SaveRedirectResult::Filled && path == exact,
+              "save redirect accepts a buffer of exactly path length plus terminator");
+        OPENFILENAMEA shortBy1 = MakeOfn(exact, static_cast<DWORD>(path.size()), "RRS");
+        Check(RedirectSaveFileName(shortBy1, path) == SaveRedirectResult::BufferTooSmall,
+              "save redirect refuses a buffer one byte short of the terminator");
+
+        char noExt[260] = {};
+        OPENFILENAMEA ext = MakeOfn(noExt, sizeof(noExt), "RRS");
+        Check(RedirectSaveFileName(ext, "D:\\Saves\\partida") == SaveRedirectResult::Filled &&
+              std::string(noExt) == "D:\\Saves\\partida.RRS" && ext.nFileOffset == 9 && ext.nFileExtension == 17,
+              "save redirect appends the default extension when the name has none");
+        char title[64] = {};
+        OPENFILENAMEA withTitle = MakeOfn(noExt, sizeof(noExt), "RRS");
+        withTitle.lpstrFileTitle = title;
+        withTitle.nMaxFileTitle = sizeof(title);
+        Check(FillOpenFileNameFromPath(withTitle, path) == SaveRedirectResult::Filled &&
+              std::string(title) == "Partida 1.RRS",
+              "redirect fills lpstrFileTitle with the file name");
+        OPENFILENAMEA multi = MakeOfn(noExt, sizeof(noExt), "RRS");
+        multi.Flags = OFN_ALLOWMULTISELECT;
+        Check(FillOpenFileNameFromPath(multi, path) == SaveRedirectResult::Unsupported,
+              "redirect refuses multi-select requests");
+        OPENFILENAMEA nullBuf = MakeOfn(nullptr, 260, "RRS");
+        Check(FillOpenFileNameFromPath(nullBuf, path) == SaveRedirectResult::InvalidArgs,
+              "redirect refuses a null lpstrFile");
+
+        char openBuf[260];
+        openBuf[0] = '\0';
+        OPENFILENAMEA openMissing = MakeOfn(openBuf, sizeof(openBuf), "RRS");
+        Check(RedirectOpenFileName(openMissing, path, false) == SaveRedirectResult::FileMissing && openBuf[0] == '\0',
+              "open redirect falls back to the dialog when the default file is missing");
+        OPENFILENAMEA openPresent = MakeOfn(openBuf, sizeof(openBuf), "RRS");
+        Check(RedirectOpenFileName(openPresent, path, true) == SaveRedirectResult::Filled && path == openBuf,
+              "open redirect answers with the default file when it exists");
+
+        // Save block checksum: test vector computed independently (Python port of FUN_0043f7c0,
+        // checked against a real save file).
+        uint8_t block[kSaveBlockSize] = {};
+        block[4] = 0xAD;
+        block[5] = 0xDE;
+        block[6] = 0xFE;
+        block[7] = 0xCA;
+        for (size_t i = 8; i < kSaveBlockSize; ++i) {
+            block[i] = static_cast<uint8_t>(i * 7 + 3);
+        }
+        const uint32_t ck = ComputeSaveChecksum(block + kSaveBlockMagicOffset, kSaveBlockChecksumSpan);
+        Check(ck == 0x000994C3u, "ComputeSaveChecksum matches the game's checksum on a known vector");
+        std::memcpy(block, &ck, 4);
+        Check(IsValidSaveBlock(block, sizeof(block)), "IsValidSaveBlock accepts magic plus matching checksum");
+        block[100] ^= 1;
+        Check(!IsValidSaveBlock(block, sizeof(block)), "IsValidSaveBlock rejects a checksum mismatch");
+        block[100] ^= 1;
+        block[4] = 0;
+        Check(!IsValidSaveBlock(block, sizeof(block)), "IsValidSaveBlock rejects a cleared magic");
+        block[4] = 0xAD;
+        Check(!IsValidSaveBlock(block, 100), "IsValidSaveBlock rejects a short block");
+
+        SaveFileProbe probeBefore;
+        probeBefore.exists = true;
+        probeBefore.size = 160;
+        probeBefore.lastWrite = 1000;
+        SaveFileProbe probeAfter = probeBefore;
+        probeAfter.lastWrite = 2000;
+        Check(SaveRoutineSucceeded(probeBefore, probeAfter, true, 0),
+              "save success: valid block, dirty clear, new timestamp, 160 bytes");
+        Check(!SaveRoutineSucceeded(probeBefore, probeBefore, true, 0), "save failure: file timestamp unchanged");
+        Check(!SaveRoutineSucceeded(probeBefore, probeAfter, false, 0), "save failure: block not built (CreateFileA failed)");
+        Check(!SaveRoutineSucceeded(probeBefore, probeAfter, true, 1), "save failure: dirty flag still set");
+        SaveFileProbe wrongSize = probeAfter;
+        wrongSize.size = 0;
+        Check(!SaveRoutineSucceeded(probeBefore, wrongSize, true, 0), "save failure: file is not 160 bytes");
+        SaveFileProbe none;
+        Check(SaveRoutineSucceeded(none, probeAfter, true, 0), "save success: file created by this save");
+        Check(LoadRoutineSucceeded(true, 0) && !LoadRoutineSucceeded(false, 0) && !LoadRoutineSucceeded(true, 1),
+              "load success needs a valid block and a clear dirty flag");
+
+        // IAT helper on this test executable's own import of KERNEL32!GetCurrentProcessId.
+        const DWORD realPid = GetCurrentProcessId();
+        Check(rr95::FindIatSlot(self, "kernel32.dll", "GetCurrentProcessId") != nullptr,
+              "FindIatSlot finds a by-name import (dll name case-insensitive)");
+        Check(rr95::FindIatSlot(self, "KERNEL32.dll", "NoSuchFunction") == nullptr &&
+              rr95::FindIatSlot(self, "NOSUCH.dll", "GetCurrentProcessId") == nullptr,
+              "FindIatSlot returns null for a missing import");
+        rr95::IatHook iat{"KERNEL32.dll", "GetCurrentProcessId", reinterpret_cast<void*>(&IatDetourGetCurrentProcessId),
+                          reinterpret_cast<void**>(&g_iatOriginalGetCurrentProcessId), nullptr};
+        Check(rr95::InstallIatHook(iat, self) && iat.slot != nullptr, "InstallIatHook patches the slot");
+        const DWORD hookedPid = GetCurrentProcessId();
+        Check(hookedPid == 0x5A5A5A5Au && g_iatDetourCalls == 1, "calls through the IAT reach the detour");
+        Check(g_iatOriginalGetCurrentProcessId != nullptr && g_iatOriginalGetCurrentProcessId() == realPid,
+              "the saved original still works");
+        rr95::RemoveIatHook(iat);
+        Check(GetCurrentProcessId() == realPid && iat.slot == nullptr, "RemoveIatHook restores the original import");
+
+        // Toast timing.
+        Check(std::wcscmp(ToastText(ToastKind::Saved), L"Partida guardada") == 0 &&
+                  std::wcscmp(ToastText(ToastKind::Loaded), L"Partida cargada") == 0,
+              "toast texts are Partida guardada / Partida cargada");
+        Check(ToastAlpha(10000, 10000) == 1.0f && ToastAlpha(10000, 12000) == 1.0f && ToastAlpha(10000, 9000) == 1.0f,
+              "toast alpha is 1 at the start, before the fade, and for a start time in the future");
+        Check(std::fabs(ToastAlpha(10000, 12750) - 0.5f) < 1e-4f, "toast alpha is 0.5 halfway through the fade");
+        Check(ToastAlpha(10000, 13000) == 0.0f && ToastExpired(10000, 13000) && !ToastExpired(10000, 12999),
+              "toast expires after 3 s");
+        Check(ToastNeedsRepresent(1100, 1000, false, true) && !ToastNeedsRepresent(1020, 1000, false, true),
+              "toast timer re-presents only when the game has been idle for a timer period");
+        Check(ToastNeedsRepresent(1010, 1000, true, true) && !ToastNeedsRepresent(1010, 1000, true, false),
+              "toast timer re-presents once more when the toast expired on screen");
+
+        // Toast placement.
+        const ToastRect image16x9{240, 0, 1440, 1080};  // 1920x1080 client, 4:3 image
+        Check(ToastRightMargin(1920, image16x9) == 240, "right margin of a 16:9 pillarbox is 240 px");
+        const int pad = ToastPadding(1080);
+        const ToastPlacement wide = ComputeToastPlacement(1920, 1080, image16x9, 200, 30, pad);
+        Check(wide.inMargin && !wide.drawBackground && wide.text.x == 1680 + 20 && wide.text.width == 200 &&
+                  wide.text.y == 1080 - pad - 30,
+              "text that fits the right margin is centred in it at the bottom, without background");
+        const ToastRect image4x3{0, 0, 1440, 1080};
+        const ToastPlacement corner = ComputeToastPlacement(1440, 1080, image4x3, 200, 30, pad);
+        Check(!corner.inMargin && corner.drawBackground &&
+                  corner.background.x + corner.background.width == 1440 - pad &&
+                  corner.background.y + corner.background.height == 1080 - pad &&
+                  corner.text.x > corner.background.x && corner.text.y > corner.background.y &&
+                  corner.text.x + corner.text.width < corner.background.x + corner.background.width,
+              "without a margin the text sits in the image's bottom-right corner over a background");
+        const ToastPlacement narrow = ComputeToastPlacement(1920, 1080, image16x9, 240, 30, pad);
+        Check(!narrow.inMargin && narrow.drawBackground, "text wider than margin minus padding goes to the corner");
+        Check(ToastMarginFontHeight(30, 300, 240, 10, 18) == 22 && ToastMarginFontHeight(30, 200, 240, 10, 18) == 0 &&
+                  ToastMarginFontHeight(30, 600, 240, 10, 18) == 0,
+              "margin font height shrinks the text to fit, but not below the minimum");
+        Check(ToastFontHeight(1080) > ToastMinFontHeight(1080) && ToastFontHeight(480) >= 12,
+              "toast font height scales with the client height");
+
+        ToastBitmap bmp;
+        Check(RasterizeToastText(ToastText(ToastKind::Saved), 32, bmp) && bmp.width > 100 && bmp.height >= 30 &&
+                  bmp.pixels.size() == static_cast<size_t>(bmp.width) * bmp.height,
+              "RasterizeToastText renders Partida guardada with GDI");
+        bool anyOpaque = false;
+        bool anyClear = false;
+        bool allWhite = !bmp.pixels.empty();
+        for (uint32_t px : bmp.pixels) {
+            anyOpaque |= (px >> 24) == 0xFF;
+            anyClear |= (px >> 24) == 0;
+            allWhite &= (px & 0x00FFFFFFu) == 0x00FFFFFFu;
+        }
+        Check(anyOpaque && anyClear && allWhite, "toast bitmap is white with alpha = glyph coverage");
     }
 
     std::printf("%s (%d failure(s))\n", g_failures == 0 ? "OK" : "FAILED", g_failures);

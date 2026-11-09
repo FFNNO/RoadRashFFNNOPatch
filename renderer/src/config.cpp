@@ -103,88 +103,99 @@ uint32_t ParseVirtualKey(const wchar_t* str, uint32_t defaultKey) {
     return defaultKey;
 }
 
-void ConfigInit(const std::wstring& iniFilePath) {
+void ParseConfigFile(const std::wstring& iniFilePath, Config& cfg) {
     UINT enabledVal = GetPrivateProfileIntW(L"General", L"Enabled", 1, iniFilePath.c_str());
-    g_config.enabled = (enabledVal != 0);
+    cfg.enabled = (enabledVal != 0);
 
     wchar_t levelBuf[64] = {0};
     GetPrivateProfileStringW(L"General", L"LogLevel", L"info", levelBuf, 64, iniFilePath.c_str());
-    g_config.logLevel = ParseLogLevel(levelBuf);
+    cfg.logLevel = ParseLogLevel(levelBuf);
 
     UINT presenterEnabledVal = GetPrivateProfileIntW(L"Presenter", L"Enabled", 1, iniFilePath.c_str());
-    g_config.presenterEnabled = (presenterEnabledVal != 0);
+    cfg.presenterEnabled = (presenterEnabledVal != 0);
 
     wchar_t generalFilterBuf[64] = {0};
     GetPrivateProfileStringW(L"General", L"Filter", L"bilinear", generalFilterBuf, 64, iniFilePath.c_str());
 
     wchar_t filterBuf[64] = {0};
     GetPrivateProfileStringW(L"Presenter", L"Filter", generalFilterBuf, filterBuf, 64, iniFilePath.c_str());
-    if (!ParseFilterMode(filterBuf, g_config.filter)) {
-        g_config.unknownFilterWarning = true;
-        g_config.rawFilterString = filterBuf;
+    if (!ParseFilterMode(filterBuf, cfg.filter)) {
+        cfg.unknownFilterWarning = true;
+        cfg.rawFilterString = filterBuf;
     } else {
-        g_config.unknownFilterWarning = false;
-        g_config.rawFilterString.clear();
+        cfg.unknownFilterWarning = false;
+        cfg.rawFilterString.clear();
     }
 
     UINT vsyncVal = GetPrivateProfileIntW(L"Presenter", L"VSync", 0, iniFilePath.c_str());
-    g_config.vsync = (vsyncVal != 0);
+    cfg.vsync = (vsyncVal != 0);
 
     UINT captureEnabledVal = GetPrivateProfileIntW(L"Capture", L"Enabled", 0, iniFilePath.c_str());
-    g_config.captureEnabled = (captureEnabledVal != 0);
+    cfg.captureEnabled = (captureEnabledVal != 0);
 
     UINT autoDumpVal = GetPrivateProfileIntW(L"Capture", L"AutoDumpFrame", 0, iniFilePath.c_str());
-    g_config.captureAutoDumpFrame = static_cast<int>(autoDumpVal);
+    cfg.captureAutoDumpFrame = static_cast<int>(autoDumpVal);
 
     UINT generalGpuWorld = GetPrivateProfileIntW(L"General", L"GpuWorld", 0, iniFilePath.c_str());
     UINT presenterGpuWorld = GetPrivateProfileIntW(L"Presenter", L"GpuWorld", generalGpuWorld, iniFilePath.c_str());
     UINT worldGpuWorld = GetPrivateProfileIntW(L"World", L"GpuWorld", presenterGpuWorld, iniFilePath.c_str());
-    g_config.gpuWorld = (worldGpuWorld != 0);
+    cfg.gpuWorld = (worldGpuWorld != 0);
 
     INT generalHeight = static_cast<INT>(GetPrivateProfileIntW(L"General", L"InternalHeight", 1080, iniFilePath.c_str()));
     INT presenterHeight = static_cast<INT>(GetPrivateProfileIntW(L"Presenter", L"InternalHeight", generalHeight, iniFilePath.c_str()));
     INT worldHeight = static_cast<INT>(GetPrivateProfileIntW(L"World", L"InternalHeight", presenterHeight, iniFilePath.c_str()));
-    g_config.internalHeight = ClampInternalHeight(worldHeight);
-    g_config.internalWidth = (g_config.internalHeight * 4) / 3;
+    cfg.internalHeight = ClampInternalHeight(worldHeight);
+    cfg.internalWidth = (cfg.internalHeight * 4) / 3;
 
     wchar_t toggleKeyBuf[64] = {0};
     GetPrivateProfileStringW(L"World", L"ToggleKey", L"ScrollLock", toggleKeyBuf, 64, iniFilePath.c_str());
-    g_config.toggleKey = ParseVirtualKey(toggleKeyBuf, VK_SCROLL);
+    cfg.toggleKey = ParseVirtualKey(toggleKeyBuf, VK_SCROLL);
 
     UINT subPixelVal = GetPrivateProfileIntW(L"World", L"SubPixel", 1, iniFilePath.c_str());
-    g_config.subPixel = (subPixelVal != 0);
+    cfg.subPixel = (subPixelVal != 0);
 
     wchar_t mipBuf[64] = {0};
     GetPrivateProfileStringW(L"World", L"MipFilter", L"trilinear", mipBuf, 64, iniFilePath.c_str());
-    ParseMipFilter(mipBuf, g_config.mipFilter);
+    ParseMipFilter(mipBuf, cfg.mipFilter);
 
     const INT aniso = static_cast<INT>(GetPrivateProfileIntW(L"World", L"Anisotropy", 8, iniFilePath.c_str()));
-    g_config.anisotropy = ClampAnisotropy(aniso);
+    cfg.anisotropy = ClampAnisotropy(aniso);
 
     UINT tpEnabled = GetPrivateProfileIntW(L"TexturePack", L"Enabled", 1, iniFilePath.c_str());
-    g_config.texturePackEnabled = (tpEnabled != 0);
+    cfg.texturePackEnabled = (tpEnabled != 0);
 
     wchar_t tpPathBuf[MAX_PATH] = {0};
     GetPrivateProfileStringW(L"TexturePack", L"Path", L"texture-pack", tpPathBuf, MAX_PATH, iniFilePath.c_str());
-    g_config.texturePackPath = tpPathBuf;
+    cfg.texturePackPath = tpPathBuf;
 
     INT tpMaxMiB = static_cast<INT>(GetPrivateProfileIntW(L"TexturePack", L"MaxMiB", 512, iniFilePath.c_str()));
     if (tpMaxMiB < 16) tpMaxMiB = 16;
     if (tpMaxMiB > 2048) tpMaxMiB = 2048;
-    g_config.texturePackMaxMiB = tpMaxMiB;
+    cfg.texturePackMaxMiB = tpMaxMiB;
 
     INT tpBudget = static_cast<INT>(GetPrivateProfileIntW(L"TexturePack", L"DecodeBudgetMs", 4, iniFilePath.c_str()));
-    g_config.texturePackDecodeBudgetMs = (tpBudget < 1) ? 1 : tpBudget;
+    cfg.texturePackDecodeBudgetMs = (tpBudget < 1) ? 1 : tpBudget;
 
     UINT tpPreload = GetPrivateProfileIntW(L"TexturePack", L"Preload", 1, iniFilePath.c_str());
-    g_config.texturePackPreload = (tpPreload != 0);
+    cfg.texturePackPreload = (tpPreload != 0);
 
     UINT tpDump = GetPrivateProfileIntW(L"TexturePack", L"Dump", 0, iniFilePath.c_str());
-    g_config.texturePackDump = (tpDump != 0);
+    cfg.texturePackDump = (tpDump != 0);
 
     wchar_t tpDumpPathBuf[MAX_PATH] = {0};
     GetPrivateProfileStringW(L"TexturePack", L"DumpPath", L"texture-dump", tpDumpPathBuf, MAX_PATH, iniFilePath.c_str());
-    g_config.texturePackDumpPath = tpDumpPathBuf;
+    cfg.texturePackDumpPath = tpDumpPathBuf;
+
+    UINT saveEnabled = GetPrivateProfileIntW(L"Save", L"Enabled", 1, iniFilePath.c_str());
+    cfg.saveRedirectEnabled = (saveEnabled != 0);
+
+    wchar_t saveFileBuf[MAX_PATH] = {0};
+    GetPrivateProfileStringW(L"Save", L"File", L"Partida 1.RRS", saveFileBuf, MAX_PATH, iniFilePath.c_str());
+    cfg.saveFile = saveFileBuf;
+}
+
+void ConfigInit(const std::wstring& iniFilePath) {
+    ParseConfigFile(iniFilePath, g_config);
 }
 
 int ClampInternalHeight(int h) {

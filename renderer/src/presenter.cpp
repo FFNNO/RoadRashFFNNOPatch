@@ -11,6 +11,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -181,6 +182,65 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
     return c;
 }
 )";
+
+// Save/load toast overlay: one textured quad in client pixels, alpha blended over the final image.
+const char* kOverlayVertexShaderSrc = R"(
+cbuffer OverlayCB : register(b0) {
+    float4 rect;   // x0, y0, x1, y1 in NDC
+    float4 color;  // multiplied with the texel
+};
+
+struct VSOut {
+    float4 pos : SV_Position;
+    float2 uv  : TEXCOORD0;
+};
+
+VSOut main(uint id : SV_VertexID) {
+    VSOut o;
+    float2 t = float2(id & 1, id >> 1);
+    o.uv = t;
+    o.pos = float4(lerp(rect.x, rect.z, t.x), lerp(rect.y, rect.w, t.y), 0.0, 1.0);
+    return o;
+}
+)";
+
+const char* kOverlayPixelShaderSrc = R"(
+cbuffer OverlayCB : register(b0) {
+    float4 rect;
+    float4 color;
+};
+
+Texture2D<float4> texOverlay : register(t0);
+SamplerState      samp       : register(s0);
+
+float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    return texOverlay.Sample(samp, uv) * color;
+}
+)";
+
+struct alignas(16) OverlayConstants {
+    float rect[4];
+    float color[4];
+};
+
+// Current toast, shared with the hook threads: (start ms << 2) | ToastKind, 0 = none.
+std::atomic<uint64_t> g_toastState{0};
+
+uint64_t PackToastState(ToastKind kind, uint64_t startMs) {
+    return (startMs << 2) | (static_cast<uint64_t>(kind) & 3u);
+}
+
+constexpr UINT_PTR kToastTimerId = 0x52523935;  // 'RR95'; the game's own timers use 7, 9 and 0x7264
+
+void CALLBACK ToastTimerProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD time);
+
+struct InPresentScope {
+    explicit InPresentScope(bool& flag) : m_flag(flag) { m_flag = true; }
+    ~InPresentScope() { m_flag = false; }
+    InPresentScope(const InPresentScope&) = delete;
+    InPresentScope& operator=(const InPresentScope&) = delete;
+    bool& m_flag;
+};
 
 const char* kWorldVertexShaderSrc = R"(
 struct VSIn {
@@ -369,6 +429,7 @@ public:
     }
 
     bool Present8bpp(HWND hwnd, const uint8_t* surface, int pitch, const uint8_t* palette, int width, int height) {
+        const InPresentScope inPresent(m_inPresent);
         const uint64_t nowMs = GetTickCount64();
         if (!PresenterCanAttempt(m_failureState, nowMs)) {
             m_inBackoffCooldown = true;
@@ -429,6 +490,7 @@ public:
     }
 
     bool PresentBgra(HWND hwnd, const uint32_t* dib, int width, int height) {
+        const InPresentScope inPresent(m_inPresent);
         const uint64_t nowMs = GetTickCount64();
         if (!PresenterCanAttempt(m_failureState, nowMs)) {
             m_inBackoffCooldown = true;
@@ -475,6 +537,37 @@ public:
         m_windowChangePending = true;
     }
 
+    // Threading: the D3D11 immediate context is game-thread only. The save/load routines run on
+    // the game thread from its menu command handler (the same thread that runs the present
+    // hooks), but this is checked at run time: only when the caller is the thread that made the
+    // last present is the last frame re-presented here and the timer armed. From any other thread
+    // nothing D3D is touched and the next present draws the toast.
+    void OnToastStarted() {
+        if (GetCurrentThreadId() != m_presentThreadId.load(std::memory_order_relaxed)) {
+            LOG_DEBUG("Toast started off the present thread; it appears with the next present");
+            return;
+        }
+        RepresentLastFrame();
+        StartToastTimer();
+    }
+
+    // WM_TIMER callback, dispatched on the window's (game) thread by the game's own message loop.
+    // Keeps the fade going and removes the toast while the game does not present (static menus).
+    void OnToastTimer(HWND hwnd) {
+        const uint64_t nowMs = GetTickCount64();
+        const uint64_t state = g_toastState.load(std::memory_order_acquire);
+        const bool expired = state == 0 || ToastExpired(state >> 2, nowMs);
+        if (ToastNeedsRepresent(nowMs, m_lastPresentMs, expired, m_lastFrameHadToast)) {
+            RepresentLastFrame();
+        }
+        if (expired) {
+            KillTimer(hwnd, kToastTimerId);
+            if (m_toastTimerHwnd == hwnd) {
+                m_toastTimerHwnd = nullptr;
+            }
+        }
+    }
+
     PresenterSubPixelStats TakeSubPixelStats() {
         const PresenterSubPixelStats s = m_subPixelStats;
         m_subPixelStats = PresenterSubPixelStats{};
@@ -493,6 +586,21 @@ public:
         TexturePackClearD3DResources();
         m_worldTexSrvCache.clear();
         m_fadePaletteValid = false;
+        if (m_toastTimerHwnd) {
+            KillTimer(m_toastTimerHwnd, kToastTimerId);
+            m_toastTimerHwnd = nullptr;
+        }
+        m_lastFrame = LastFrame{};
+        m_lastFrameHadToast = false;
+        m_toastSrv.Reset();
+        m_toastTex.Reset();
+        m_toastTexKind = ToastKind::None;
+        m_toastTexFontH = 0;
+        m_toastLayoutKind = ToastKind::None;
+        m_overlayCB.Reset();
+        m_overlayPS.Reset();
+        m_overlayVS.Reset();
+        m_overlayFailed = false;
         m_srvWorld.Reset();
         m_rtvWorld.Reset();
         m_texWorld.Reset();
@@ -1732,6 +1840,249 @@ private:
         return DrawAndPresent(worldW, worldH, clientW, clientH, true, m_srvWorld.Get(), nowMs);
     }
 
+    // Draws the last presented frame again (its source textures are unchanged until the next game
+    // present), with the current toast. Game thread only; refused inside a present, before the
+    // first present, after a resize, or while the presenter is backing off.
+    bool RepresentLastFrame() {
+        if (m_inPresent || !m_lastFrame.valid || !m_device || !m_hwnd || m_windowChangePending) {
+            return false;
+        }
+        if (GetCurrentThreadId() != m_presentThreadId.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        const uint64_t nowMs = GetTickCount64();
+        if (!PresenterCanAttempt(m_failureState, nowMs)) {
+            return false;
+        }
+        RECT rc = {};
+        if (!GetClientRect(m_hwnd, &rc) || (rc.right - rc.left) != m_backbufferWidth ||
+            (rc.bottom - rc.top) != m_backbufferHeight || m_backbufferWidth <= 0 || m_backbufferHeight <= 0) {
+            return false;
+        }
+        ID3D11ShaderResourceView* srv = m_lastFrame.world ? m_srvWorld.Get() : m_srvBgra.Get();
+        if (!srv || !m_srv8bpp || !m_srvPalette) {
+            return false;
+        }
+        const InPresentScope inPresent(m_inPresent);
+        return DrawAndPresent(m_lastFrame.srcW, m_lastFrame.srcH, m_backbufferWidth, m_backbufferHeight,
+                              m_lastFrame.useBgra, srv, nowMs);
+    }
+
+    void StartToastTimer() {
+        if (!m_hwnd || GetWindowThreadProcessId(m_hwnd, nullptr) != GetCurrentThreadId()) {
+            return;
+        }
+        // A TIMERPROC timer: DispatchMessage calls ToastTimerProc directly, so the game's window
+        // procedure never sees this WM_TIMER.
+        if (SetTimer(m_hwnd, kToastTimerId, static_cast<UINT>(kToastTimerMs), &ToastTimerProc) != 0) {
+            m_toastTimerHwnd = m_hwnd;
+        } else {
+            LOG_WARN("SetTimer for the toast failed (error %lu); it fades only when the game presents",
+                     GetLastError());
+        }
+    }
+
+    bool EnsureOverlayResources() {
+        if (m_overlayVS && m_overlayPS && m_overlayCB) {
+            return true;
+        }
+        ComPtr<ID3DBlob> blob;
+        ComPtr<ID3DBlob> errBlob;
+        HRESULT hr = D3DCompile(kOverlayVertexShaderSrc, std::strlen(kOverlayVertexShaderSrc), "overlay_vs",
+                                nullptr, nullptr, "main", "vs_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                                &blob, &errBlob);
+        if (FAILED(hr) ||
+            FAILED(m_device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+                                                &m_overlayVS))) {
+            LOG_ERROR("Overlay VS creation failed (0x%08lX): %s", static_cast<unsigned long>(hr),
+                      errBlob ? static_cast<const char*>(errBlob->GetBufferPointer()) : "");
+            return false;
+        }
+        blob.Reset();
+        errBlob.Reset();
+        hr = D3DCompile(kOverlayPixelShaderSrc, std::strlen(kOverlayPixelShaderSrc), "overlay_ps",
+                        nullptr, nullptr, "main", "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &errBlob);
+        if (FAILED(hr) ||
+            FAILED(m_device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+                                               &m_overlayPS))) {
+            LOG_ERROR("Overlay PS creation failed (0x%08lX): %s", static_cast<unsigned long>(hr),
+                      errBlob ? static_cast<const char*>(errBlob->GetBufferPointer()) : "");
+            return false;
+        }
+        D3D11_BUFFER_DESC cbd = {};
+        cbd.ByteWidth = sizeof(OverlayConstants);
+        cbd.Usage = D3D11_USAGE_DYNAMIC;
+        cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        hr = m_device->CreateBuffer(&cbd, nullptr, &m_overlayCB);
+        if (FAILED(hr)) {
+            LOG_ERROR("CreateBuffer(overlayCB) failed: 0x%08lX", static_cast<unsigned long>(hr));
+            return false;
+        }
+        return true;
+    }
+
+    // Text texture for kind at fontH, rasterized with GDI once per string and size.
+    bool EnsureToastTexture(ToastKind kind, int fontH) {
+        if (m_toastSrv && m_toastTexKind == kind && m_toastTexFontH == fontH) {
+            return true;
+        }
+        m_toastSrv.Reset();
+        m_toastTex.Reset();
+        m_toastTexKind = ToastKind::None;
+        ToastBitmap bmp;
+        if (!RasterizeToastText(ToastText(kind), fontH, bmp)) {
+            LOG_ERROR("RasterizeToastText failed (font height %d)", fontH);
+            return false;
+        }
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = static_cast<UINT>(bmp.width);
+        td.Height = static_cast<UINT>(bmp.height);
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_IMMUTABLE;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA init = {bmp.pixels.data(), static_cast<UINT>(bmp.width) * 4u, 0};
+        HRESULT hr = m_device->CreateTexture2D(&td, &init, &m_toastTex);
+        if (SUCCEEDED(hr)) {
+            hr = m_device->CreateShaderResourceView(m_toastTex.Get(), nullptr, &m_toastSrv);
+        }
+        if (FAILED(hr)) {
+            LOG_ERROR("Toast texture creation failed: 0x%08lX", static_cast<unsigned long>(hr));
+            m_toastTex.Reset();
+            m_toastSrv.Reset();
+            return false;
+        }
+        m_toastTexKind = kind;
+        m_toastTexFontH = fontH;
+        m_toastTexW = bmp.width;
+        m_toastTexH = bmp.height;
+        return true;
+    }
+
+    // Picks the font size once per string and layout: the base size, or a smaller one (not below
+    // ToastMinFontHeight) that fits the right pillarbox margin.
+    bool EnsureToastLayout(ToastKind kind, int clientW, int clientH, const LetterboxViewport& lvp) {
+        if (m_toastSrv && m_toastLayoutKind == kind && m_toastLayoutClientW == clientW &&
+            m_toastLayoutClientH == clientH && m_toastLayoutImageX == lvp.x && m_toastLayoutImageW == lvp.width) {
+            return true;
+        }
+        m_toastLayoutKind = ToastKind::None;
+        const int baseFontH = ToastFontHeight(clientH);
+        if (!EnsureToastTexture(kind, baseFontH)) {
+            return false;
+        }
+        const ToastRect image{lvp.x, lvp.y, lvp.width, lvp.height};
+        const int marginW = ToastRightMargin(clientW, image);
+        const int padding = ToastPadding(clientH);
+        const int minFontH = ToastMinFontHeight(clientH);
+        int fontH = ToastMarginFontHeight(baseFontH, m_toastTexW, marginW, padding, minFontH);
+        // GDI hinting can make the smaller text a pixel or two wider than the linear estimate, so
+        // step down a few sizes; back to the base size (corner placement) when none fits.
+        bool fits = false;
+        for (int attempt = 0; fontH >= minFontH && fontH > 0 && attempt < 4; ++attempt, --fontH) {
+            if (!EnsureToastTexture(kind, fontH)) {
+                return false;
+            }
+            if (m_toastTexW + 2 * padding <= marginW) {
+                fits = true;
+                break;
+            }
+        }
+        if (!fits && !EnsureToastTexture(kind, baseFontH)) {
+            return false;
+        }
+        m_toastLayoutKind = kind;
+        m_toastLayoutClientW = clientW;
+        m_toastLayoutClientH = clientH;
+        m_toastLayoutImageX = lvp.x;
+        m_toastLayoutImageW = lvp.width;
+        return true;
+    }
+
+    bool DrawOverlayQuad(const ToastRect& r, int clientW, int clientH, ID3D11ShaderResourceView* srv,
+                         float red, float green, float blue, float alpha) {
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (FAILED(m_context->Map(m_overlayCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+            return false;
+        }
+        auto* cb = static_cast<OverlayConstants*>(mapped.pData);
+        const float w = static_cast<float>(clientW);
+        const float h = static_cast<float>(clientH);
+        cb->rect[0] = static_cast<float>(r.x) / w * 2.0f - 1.0f;
+        cb->rect[1] = 1.0f - static_cast<float>(r.y) / h * 2.0f;
+        cb->rect[2] = static_cast<float>(r.x + r.width) / w * 2.0f - 1.0f;
+        cb->rect[3] = 1.0f - static_cast<float>(r.y + r.height) / h * 2.0f;
+        cb->color[0] = red;
+        cb->color[1] = green;
+        cb->color[2] = blue;
+        cb->color[3] = alpha;
+        m_context->Unmap(m_overlayCB.Get(), 0);
+        m_context->PSSetShaderResources(0, 1, &srv);
+        m_context->Draw(4, 0);
+        return true;
+    }
+
+    // Returns true when the toast was drawn into this frame. An expired toast is cleared here, so
+    // the first present after it expires shows the frame without it. A toast that cannot be drawn
+    // (overlay or texture failure) is skipped for the session's device without failing the present.
+    bool DrawToastOverlay(int clientW, int clientH, const LetterboxViewport& lvp, uint64_t nowMs) {
+        const uint64_t state = g_toastState.load(std::memory_order_acquire);
+        if (state == 0) {
+            return false;
+        }
+        const ToastKind kind = static_cast<ToastKind>(state & 3u);
+        const float alpha = ToastAlpha(state >> 2, nowMs);
+        if (alpha <= 0.0f || kind == ToastKind::None) {
+            uint64_t expected = state;
+            g_toastState.compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
+            return false;
+        }
+        if (m_overlayFailed || !m_srvWhite || !m_samplerClamp || !m_blendAlpha) {
+            return false;
+        }
+        if (!EnsureOverlayResources() || !EnsureToastLayout(kind, clientW, clientH, lvp)) {
+            m_overlayFailed = true;
+            LOG_WARN("Toast overlay unavailable; save/load messages are not drawn");
+            return false;
+        }
+        const ToastRect image{lvp.x, lvp.y, lvp.width, lvp.height};
+        const ToastPlacement placement =
+            ComputeToastPlacement(clientW, clientH, image, m_toastTexW, m_toastTexH, ToastPadding(clientH));
+
+        D3D11_VIEWPORT vp = {};
+        vp.Width = static_cast<FLOAT>(clientW);
+        vp.Height = static_cast<FLOAT>(clientH);
+        vp.MaxDepth = 1.0f;
+        m_context->RSSetViewports(1, &vp);
+        m_context->IASetInputLayout(nullptr);
+        m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        m_context->VSSetShader(m_overlayVS.Get(), nullptr, 0);
+        m_context->PSSetShader(m_overlayPS.Get(), nullptr, 0);
+        m_context->VSSetConstantBuffers(0, 1, m_overlayCB.GetAddressOf());
+        m_context->PSSetConstantBuffers(0, 1, m_overlayCB.GetAddressOf());
+        m_context->PSSetSamplers(0, 1, m_samplerClamp.GetAddressOf());
+        const float blendFactor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        m_context->OMSetBlendState(m_blendAlpha.Get(), blendFactor, 0xFFFFFFFFu);
+
+        bool drawn = true;
+        if (placement.drawBackground) {
+            drawn = DrawOverlayQuad(placement.background, clientW, clientH, m_srvWhite.Get(), 0.0f, 0.0f, 0.0f,
+                                    0.6f * alpha);
+        }
+        drawn = drawn && DrawOverlayQuad(placement.text, clientW, clientH, m_toastSrv.Get(), 1.0f, 1.0f, 1.0f, alpha);
+
+        ID3D11ShaderResourceView* nullSrv = nullptr;
+        ID3D11Buffer* nullCb = nullptr;
+        m_context->PSSetShaderResources(0, 1, &nullSrv);
+        m_context->VSSetConstantBuffers(0, 1, &nullCb);
+        m_context->OMSetBlendState(nullptr, blendFactor, 0xFFFFFFFFu);
+        m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        return drawn;
+    }
+
     bool DrawAndPresent(int srcW, int srcH, int clientW, int clientH, bool useBgra,
                         ID3D11ShaderResourceView* bgraSrv, uint64_t nowMs) {
         const LetterboxViewport lvp = ComputeLetterboxViewport(srcW, srcH, clientW, clientH);
@@ -1787,6 +2138,18 @@ private:
 
         ID3D11ShaderResourceView* nullSrvs[3] = {nullptr, nullptr, nullptr};
         m_context->PSSetShaderResources(0, 3, nullSrvs);
+
+        // Save/load toast over the final image (pillarbox margin or image corner). Remember what was
+        // presented so the toast can re-present this frame without the game.
+        const bool toastDrawn = DrawToastOverlay(clientW, clientH, lvp, nowMs);
+        m_lastFrame.valid = true;
+        m_lastFrame.srcW = srcW;
+        m_lastFrame.srcH = srcH;
+        m_lastFrame.useBgra = useBgra;
+        m_lastFrame.world = (bgraSrv != nullptr && bgraSrv == m_srvWorld.Get());
+        m_lastFrameHadToast = toastDrawn;
+        m_lastPresentMs = nowMs;
+        m_presentThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
 
         const UINT syncInterval = GetConfig().vsync ? 1u : 0u;
         hr = m_swapChain->Present(syncInterval, 0);
@@ -1876,6 +2239,36 @@ private:
     bool m_fadePaletteValid = false;
     bool m_nonUniformFadeWarned = false;
     float m_replacementFade[3] = {1.0f, 1.0f, 1.0f};
+
+    // Save/load toast (see PresenterShowToast).
+    struct LastFrame {
+        bool valid = false;
+        int srcW = 0;
+        int srcH = 0;
+        bool useBgra = false;
+        bool world = false;  // source is m_srvWorld, else m_srvBgra / m_srv8bpp
+    };
+    LastFrame m_lastFrame;
+    bool m_lastFrameHadToast = false;
+    uint64_t m_lastPresentMs = 0;
+    std::atomic<DWORD> m_presentThreadId{0};
+    bool m_inPresent = false;
+    HWND m_toastTimerHwnd = nullptr;
+    ComPtr<ID3D11VertexShader> m_overlayVS;
+    ComPtr<ID3D11PixelShader> m_overlayPS;
+    ComPtr<ID3D11Buffer> m_overlayCB;
+    bool m_overlayFailed = false;
+    ComPtr<ID3D11Texture2D> m_toastTex;
+    ComPtr<ID3D11ShaderResourceView> m_toastSrv;
+    ToastKind m_toastTexKind = ToastKind::None;
+    int m_toastTexFontH = 0;
+    int m_toastTexW = 0;
+    int m_toastTexH = 0;
+    ToastKind m_toastLayoutKind = ToastKind::None;
+    int m_toastLayoutClientW = 0;
+    int m_toastLayoutClientH = 0;
+    int m_toastLayoutImageX = 0;
+    int m_toastLayoutImageW = 0;
 };
 
 // Intentionally leaked singleton: it is never destroyed. Its destructor would release D3D11/DXGI
@@ -1883,6 +2276,10 @@ private:
 // loader lock and after the OS killed every other thread, which can hang the exit forever.
 // Explicit Shutdown() calls during a session (device loss, window change) are unaffected.
 D3D11Presenter& g_presenter = *new D3D11Presenter();
+
+void CALLBACK ToastTimerProc(HWND hwnd, UINT, UINT_PTR, DWORD) {
+    g_presenter.OnToastTimer(hwnd);
+}
 
 }  // namespace
 
@@ -1916,4 +2313,12 @@ void PresenterNotifyWindowChange() {
 
 void PresenterShutdown() {
     g_presenter.Shutdown();
+}
+
+void PresenterShowToast(ToastKind kind) {
+    if (kind == ToastKind::None) {
+        return;
+    }
+    g_toastState.store(PackToastState(kind, GetTickCount64()), std::memory_order_release);
+    g_presenter.OnToastStarted();
 }
