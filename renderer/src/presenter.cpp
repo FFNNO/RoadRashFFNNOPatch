@@ -448,6 +448,10 @@ public:
             return true;
         }
 
+        // Menus present through this path, so servicing the pack here lets the preload finish
+        // before the first race frame instead of starting with it.
+        ServiceTexturePack();
+
         D3D11_MAPPED_SUBRESOURCE mapped = {};
         HRESULT hr = m_context->Map(m_texBgra.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
         if (FAILED(hr)) {
