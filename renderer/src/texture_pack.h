@@ -3,6 +3,7 @@
 #include <d3d11.h>
 #include <wrl/client.h>
 #include <cstdint>
+#include <deque>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -77,6 +78,11 @@ bool SaveDumpManifest(const std::wstring& manPath,
 // True when fileName matches ^[0-9]+x[0-9]+_[0-9a-f]{8}\.png$ (extension case-insensitive).
 bool IsTextureIdPngName(const std::wstring& fileName);
 
+// Parses the original size encoded in a texture ID "<w>x<h>_<crc32 as 8 lowercase hex digits>".
+// Uses the IsTextureIdPngName rule on "<id>.png". False when the ID does not match it or when
+// w or h is outside 1..8192; outW and outH are 0 then.
+bool ParseTextureIdSize(const std::string& id, int32_t& outW, int32_t& outH);
+
 // The game's full-brightness palette, relative to the game folder: 256 entries x 4 bytes (RGBx).
 constexpr const wchar_t* kBasePaletteRelPath = L"DATA\\PALETTE.RAW";
 constexpr size_t kBasePaletteBytes = 1024;
@@ -114,6 +120,37 @@ struct ReplacementTexture {
     size_t totalBytes = 0;
 };
 
+struct PackLoadRequest {
+    std::string id;
+    std::wstring filePath;
+    int32_t origW = 0;
+    int32_t origH = 0;
+};
+
+// Decode queue of the texture pack. On-demand requests (a texture drawn now) are always served
+// before preload requests, and each kind is served in FIFO order. Not thread-safe: the owner locks.
+class PackLoadQueue {
+public:
+    void PushPreload(PackLoadRequest req);
+    void PushDemand(PackLoadRequest req);
+    // Moves a still-queued preload request for id behind the on-demand requests, ahead of every
+    // other preload request. False when id is not waiting as a preload request.
+    bool Promote(const std::string& id);
+    // Pops the next request: on-demand first, then preload only when allowPreload is true.
+    bool PopNext(PackLoadRequest& out, bool allowPreload);
+    bool HasDemand() const { return !m_demand.empty(); }
+    bool HasPreload() const { return !m_preload.empty(); }
+    size_t DemandSize() const { return m_demand.size(); }
+    size_t PreloadSize() const { return m_preload.size(); }
+    // Drops every queued preload request and returns their IDs; on-demand requests stay.
+    std::vector<std::string> ClearPreload();
+    void Clear();
+
+private:
+    std::deque<PackLoadRequest> m_demand;
+    std::deque<PackLoadRequest> m_preload;
+};
+
 struct TexturePackStats {
     uint32_t loadedCount = 0;
     uint32_t pendingCount = 0;
@@ -121,7 +158,10 @@ struct TexturePackStats {
     size_t totalBytes = 0;
 };
 
-void TexturePackInit(const std::wstring& packDir, int32_t maxMiB, int32_t decodeBudgetMs);
+// Indexes <packDir>/*.png. With preload, every file whose name is a texture ID is queued for a
+// background decode at a lower priority than on-demand requests; TexturePackUpdate still creates
+// the D3D textures on the game thread within decodeBudgetMs.
+void TexturePackInit(const std::wstring& packDir, int32_t maxMiB, int32_t decodeBudgetMs, bool preload);
 void TexturePackShutdown();
 void TexturePackClearD3DResources();
 void TexturePackUpdate(ID3D11Device* device);

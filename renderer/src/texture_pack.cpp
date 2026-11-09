@@ -313,6 +313,30 @@ bool IsTextureIdPngName(const std::wstring& fileName) {
     return n - i == 4 && _wcsicmp(fileName.c_str() + i, L".png") == 0;
 }
 
+bool ParseTextureIdSize(const std::string& id, int32_t& outW, int32_t& outH) {
+    outW = 0;
+    outH = 0;
+    std::wstring name;
+    name.reserve(id.size() + 4);
+    for (char ch : id) {
+        name.push_back(static_cast<wchar_t>(static_cast<unsigned char>(ch)));
+    }
+    name += L".png";
+    if (!IsTextureIdPngName(name)) {
+        return false;
+    }
+    // The name check guarantees "<digits>x<digits>_"; strtoul saturates on overflow.
+    char* end = nullptr;
+    const unsigned long w = std::strtoul(id.c_str(), &end, 10);
+    const unsigned long h = std::strtoul(end + 1, nullptr, 10);
+    if (w == 0 || h == 0 || w > 8192 || h > 8192) {
+        return false;
+    }
+    outW = static_cast<int32_t>(w);
+    outH = static_cast<int32_t>(h);
+    return true;
+}
+
 int32_t ComputeMipLevelCount(int32_t width, int32_t height) {
     if (width <= 0 || height <= 0) {
         return 0;
@@ -834,12 +858,57 @@ uint32_t TextureDumpGetQueuedCount() {
 // Texture Pack Manager (Work Unit 2)
 // -----------------------------------------------------------------------------
 
-struct PackLoadRequest {
-    std::string id;
-    std::wstring filePath;
-    int32_t origW = 0;
-    int32_t origH = 0;
-};
+void PackLoadQueue::PushPreload(PackLoadRequest req) {
+    m_preload.push_back(std::move(req));
+}
+
+void PackLoadQueue::PushDemand(PackLoadRequest req) {
+    m_demand.push_back(std::move(req));
+}
+
+bool PackLoadQueue::Promote(const std::string& id) {
+    auto it = std::find_if(m_preload.begin(), m_preload.end(),
+                           [&](const PackLoadRequest& r) { return r.id == id; });
+    if (it == m_preload.end()) {
+        return false;
+    }
+    m_demand.push_back(std::move(*it));
+    m_preload.erase(it);
+    return true;
+}
+
+bool PackLoadQueue::PopNext(PackLoadRequest& out, bool allowPreload) {
+    if (!m_demand.empty()) {
+        out = std::move(m_demand.front());
+        m_demand.pop_front();
+        return true;
+    }
+    if (allowPreload && !m_preload.empty()) {
+        out = std::move(m_preload.front());
+        m_preload.pop_front();
+        return true;
+    }
+    return false;
+}
+
+std::vector<std::string> PackLoadQueue::ClearPreload() {
+    std::vector<std::string> ids;
+    ids.reserve(m_preload.size());
+    for (const PackLoadRequest& r : m_preload) {
+        ids.push_back(r.id);
+    }
+    m_preload.clear();
+    return ids;
+}
+
+void PackLoadQueue::Clear() {
+    m_demand.clear();
+    m_preload.clear();
+}
+
+// Decoded preload results waiting for TexturePackUpdate are capped at this many bytes, so a pack
+// decoded while no frame consumes it (menus, a minimized window) cannot fill the 32-bit address space.
+static constexpr size_t kPreloadReadyBytesLimit = 64u * 1024u * 1024u;
 
 struct DecodedReplacement {
     std::string id;
@@ -863,7 +932,7 @@ public:
     // Never reached by the leaked global instance (see g_texturePackManager).
     ~TexturePackManager() { Shutdown(); }
 
-    void Init(const std::wstring& packDir, int32_t maxMiB, int32_t decodeBudgetMs) {
+    void Init(const std::wstring& packDir, int32_t maxMiB, int32_t decodeBudgetMs, bool preload) {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_running) {
             return;
@@ -877,8 +946,9 @@ public:
         m_replacements.clear();
         m_pendingSet.clear();
         m_rejectedIds.clear();
-        m_loadQueue.clear();
+        m_loadQueue.Clear();
         m_readyQueue.clear();
+        ResetPreloadState();
 
         const std::wstring search = packDir + L"\\*.png";
         WIN32_FIND_DATAW fd = {};
@@ -907,6 +977,9 @@ public:
         }
         LOG_INFO("TexturePack: %u files indexed", count);
         m_indexedCount.store(count, std::memory_order_relaxed);
+        if (preload) {
+            QueuePreload();
+        }
 
         m_stop = false;
         m_running = true;
@@ -920,7 +993,7 @@ public:
                 return;
             }
             m_stop = true;
-            m_loadQueue.clear();
+            m_loadQueue.Clear();
         }
         m_cv.notify_all();
         if (m_worker.joinable()) {
@@ -933,8 +1006,9 @@ public:
         m_indexedCount.store(0, std::memory_order_relaxed);
         m_pendingSet.clear();
         m_rejectedIds.clear();
-        m_loadQueue.clear();
+        m_loadQueue.Clear();
         m_readyQueue.clear();
+        ResetPreloadState();
         m_totalAllocatedBytes = 0;
         m_maxMibWarned = false;
     }
@@ -988,6 +1062,12 @@ public:
             return nullptr;
         }
         if (m_pendingSet.find(id) != m_pendingSet.end()) {
+            // Drawn while queued or decoding: the original may now be cached, so the pack generation
+            // must change when this replacement arrives. A queued preload request moves ahead of the
+            // remaining preload requests.
+            if (m_demandedIds.insert(id).second && m_loadQueue.Promote(id)) {
+                m_cv.notify_one();
+            }
             if (outPending) {
                 *outPending = true;
             }
@@ -1005,7 +1085,8 @@ public:
         }
 
         m_pendingSet.insert(id);
-        m_loadQueue.push_back(PackLoadRequest{id, itFile->second, origW, origH});
+        m_demandedIds.insert(id);
+        m_loadQueue.PushDemand(PackLoadRequest{id, itFile->second, origW, origH});
         m_cv.notify_one();
         if (outPending) {
             *outPending = true;
@@ -1023,10 +1104,16 @@ public:
 
         const double budgetSec = static_cast<double>(m_decodeBudgetMs) / 1000.0;
         const uint64_t maxBytes = static_cast<uint64_t>(m_maxMiB) * 1024ULL * 1024ULL;
-        bool loadedAny = false;
+        // Bumped only for replacements that were drawn while pending: a preloaded replacement that
+        // is ready before its first use has no cached original to invalidate.
+        bool loadedDemanded = false;
+        bool poppedAny = false;
 
         while (true) {
             DecodedReplacement item;
+            bool demanded = false;
+            bool preloaded = false;
+            bool preloadStopped = false;
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 if (m_readyQueue.empty()) {
@@ -1035,10 +1122,19 @@ public:
                 item = std::move(m_readyQueue.front());
                 m_readyQueue.pop_front();
                 m_pendingSet.erase(item.id);
+                m_readyBytes -= std::min(m_readyBytes, item.totalBytes);
+                demanded = m_demandedIds.erase(item.id) > 0;
+                preloaded = m_preloadIds.erase(item.id) > 0;
+                preloadStopped = m_preloadStopped;
+                poppedAny = true;
             }
 
             if (item.rejected) {
                 std::lock_guard<std::mutex> lock(m_mutex);
+                if (preloaded) {
+                    ++(item.loadResult == PngLoadResult::SizeRejected ? m_preloadRejected : m_preloadFailed);
+                    MaybeLogPreloadDone();
+                }
                 // m_rejectedIds keeps the ID from being queued again, so each line is logged once.
                 m_rejectedIds.insert(item.id);
                 if (item.exceptionLogged) {
@@ -1059,8 +1155,29 @@ public:
                 continue;
             }
 
+            if (preloaded && !demanded &&
+                (preloadStopped || m_totalAllocatedBytes + item.totalBytes > maxBytes)) {
+                // Not drawn yet and it does not fit (or preloading already stopped): stop preloading
+                // and drop it without rejecting it, so a later draw can still load it if it fits.
+                std::lock_guard<std::mutex> lock(m_mutex);
+                ++m_preloadSkipped;
+                StopPreload();
+                MaybeLogPreloadDone();
+
+                QueryPerformanceCounter(&now);
+                const double elapsed = static_cast<double>(now.QuadPart - start.QuadPart) / static_cast<double>(freq.QuadPart);
+                if (elapsed >= budgetSec) {
+                    break;
+                }
+                continue;
+            }
+
             if (m_totalAllocatedBytes + item.totalBytes > maxBytes) {
                 std::lock_guard<std::mutex> lock(m_mutex);
+                if (preloaded) {
+                    ++m_preloadSkipped;
+                    MaybeLogPreloadDone();
+                }
                 if (!m_maxMibWarned) {
                     m_maxMibWarned = true;
                     LOG_WARN("TexturePack: MaxMiB (%d MiB) reached; skipping further replacements", m_maxMiB);
@@ -1098,6 +1215,10 @@ public:
             HRESULT hr = device->CreateTexture2D(&td, initData.data(), &tex);
             if (FAILED(hr)) {
                 std::lock_guard<std::mutex> lock(m_mutex);
+                if (preloaded) {
+                    ++m_preloadFailed;
+                    MaybeLogPreloadDone();
+                }
                 m_rejectedIds.insert(item.id);
                 LOG_WARN("TexturePack: CreateTexture2D failed for %s: 0x%08lX", item.id.c_str(), static_cast<unsigned long>(hr));
                 QueryPerformanceCounter(&now);
@@ -1112,6 +1233,10 @@ public:
             hr = device->CreateShaderResourceView(tex.Get(), nullptr, &srv);
             if (FAILED(hr)) {
                 std::lock_guard<std::mutex> lock(m_mutex);
+                if (preloaded) {
+                    ++m_preloadFailed;
+                    MaybeLogPreloadDone();
+                }
                 m_rejectedIds.insert(item.id);
                 LOG_WARN("TexturePack: CreateShaderResourceView failed for %s: 0x%08lX", item.id.c_str(), static_cast<unsigned long>(hr));
                 QueryPerformanceCounter(&now);
@@ -1133,7 +1258,13 @@ public:
                 rep.totalBytes = item.totalBytes;
                 m_replacements.emplace(item.id, std::move(rep));
                 m_totalAllocatedBytes += item.totalBytes;
-                loadedAny = true;
+                if (demanded) {
+                    loadedDemanded = true;
+                }
+                if (preloaded) {
+                    ++m_preloadLoaded;
+                    MaybeLogPreloadDone();
+                }
             }
             LOG_INFO("TexturePack: %s loaded %dx%d (k=%d, %zu bytes)",
                      item.id.c_str(), item.width, item.height, item.k, item.totalBytes);
@@ -1144,8 +1275,12 @@ public:
                 break;
             }
         }
-        if (loadedAny) {
+        if (loadedDemanded) {
             m_generation.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (poppedAny) {
+            // The ready queue shrank: a worker held back by kPreloadReadyBytesLimit may continue.
+            m_cv.notify_one();
         }
     }
 
@@ -1160,6 +1295,75 @@ public:
     }
 
 private:
+    // All helpers below run with m_mutex held.
+    void ResetPreloadState() {
+        m_preloadIds.clear();
+        m_demandedIds.clear();
+        m_preloadActive = false;
+        m_preloadStopped = false;
+        m_preloadLoaded = 0;
+        m_preloadRejected = 0;
+        m_preloadFailed = 0;
+        m_preloadSkipped = 0;
+        m_preloadStartMs = 0;
+        m_readyBytes = 0;
+    }
+
+    // Queues every indexed file whose name is a texture ID; the original size comes from the ID.
+    void QueuePreload() {
+        std::vector<std::pair<std::string, std::wstring>> files(m_indexedFiles.begin(), m_indexedFiles.end());
+        std::sort(files.begin(), files.end());
+        for (auto& file : files) {
+            int32_t w = 0, h = 0;
+            if (!ParseTextureIdSize(file.first, w, h)) {
+                continue;
+            }
+            m_pendingSet.insert(file.first);
+            m_preloadIds.insert(file.first);
+            m_loadQueue.PushPreload(PackLoadRequest{file.first, std::move(file.second), w, h});
+        }
+        if (!m_preloadIds.empty()) {
+            m_preloadActive = true;
+            m_preloadStartMs = GetTickCount64();
+            LOG_INFO("TexturePack: preloading %u files", static_cast<unsigned>(m_preloadIds.size()));
+        }
+    }
+
+    bool PreloadMayDecode() const {
+        return !m_preloadStopped && m_readyBytes < kPreloadReadyBytesLimit;
+    }
+
+    // MaxMiB reached by a preload: drop every preload request still queued. Requests already decoded
+    // or decoding are dropped by Update unless they were drawn meanwhile.
+    void StopPreload() {
+        if (m_preloadStopped) {
+            return;
+        }
+        m_preloadStopped = true;
+        LOG_WARN("TexturePack: MaxMiB (%d MiB) reached; preload stopped, on-demand loads continue while they fit",
+                 m_maxMiB);
+        for (const std::string& id : m_loadQueue.ClearPreload()) {
+            m_pendingSet.erase(id);
+            m_preloadIds.erase(id);
+            ++m_preloadSkipped;
+        }
+    }
+
+    void MaybeLogPreloadDone() {
+        if (!m_preloadActive || !m_preloadIds.empty()) {
+            return;
+        }
+        m_preloadActive = false;
+        const unsigned long long ms = GetTickCount64() - m_preloadStartMs;
+        if (m_preloadSkipped > 0) {
+            LOG_INFO("TexturePack: preload done, %u loaded in %llu ms (%u rejected, %u failed, %u skipped over MaxMiB)",
+                     m_preloadLoaded, ms, m_preloadRejected, m_preloadFailed, m_preloadSkipped);
+        } else {
+            LOG_INFO("TexturePack: preload done, %u loaded in %llu ms (%u rejected, %u failed)",
+                     m_preloadLoaded, ms, m_preloadRejected, m_preloadFailed);
+        }
+    }
+
     void WorkerLoop() {
         HRESULT hrCom = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         const bool needUninit = (hrCom == S_OK || hrCom == S_FALSE);
@@ -1168,12 +1372,18 @@ private:
             PackLoadRequest req;
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
-                m_cv.wait(lock, [this] { return m_stop.load() || !m_loadQueue.empty(); });
+                // On-demand requests are always served; preload requests wait while preloading is
+                // stopped or too many decoded bytes are waiting for TexturePackUpdate.
+                m_cv.wait(lock, [this] {
+                    return m_stop.load() || m_loadQueue.HasDemand() ||
+                           (m_loadQueue.HasPreload() && PreloadMayDecode());
+                });
                 if (m_stop) {
                     break;
                 }
-                req = std::move(m_loadQueue.front());
-                m_loadQueue.pop_front();
+                if (!m_loadQueue.PopNext(req, PreloadMayDecode())) {
+                    continue;
+                }
             }
 
             DecodedReplacement item;
@@ -1215,6 +1425,7 @@ private:
 
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
+                m_readyBytes += item.totalBytes;
                 m_readyQueue.push_back(std::move(item));
             }
         }
@@ -1242,16 +1453,29 @@ private:
     std::unordered_set<std::string> m_pendingSet;
     std::unordered_set<std::string> m_rejectedIds;
     std::atomic<uint64_t> m_generation{1};
-    std::deque<PackLoadRequest> m_loadQueue;
+    PackLoadQueue m_loadQueue;
     std::deque<DecodedReplacement> m_readyQueue;
+    size_t m_readyBytes = 0;  // totalBytes of the decoded items in m_readyQueue
+
+    // IDs drawn while their replacement was pending: only these bump the pack generation.
+    std::unordered_set<std::string> m_demandedIds;
+    // Preload IDs whose decode result has not reached Update yet.
+    std::unordered_set<std::string> m_preloadIds;
+    bool m_preloadActive = false;   // preload queued at Init and the done line not logged yet
+    bool m_preloadStopped = false;  // MaxMiB reached by a preload: no further preload work
+    uint32_t m_preloadLoaded = 0;
+    uint32_t m_preloadRejected = 0;
+    uint32_t m_preloadFailed = 0;
+    uint32_t m_preloadSkipped = 0;
+    ULONGLONG m_preloadStartMs = 0;
 };
 
 // Intentionally leaked singleton, for the same reason as g_textureDumper: at process exit its
 // destructor would join a killed worker and release D3D11 SRVs under the loader lock.
 static TexturePackManager& g_texturePackManager = *new TexturePackManager();
 
-void TexturePackInit(const std::wstring& packDir, int32_t maxMiB, int32_t decodeBudgetMs) {
-    g_texturePackManager.Init(packDir, maxMiB, decodeBudgetMs);
+void TexturePackInit(const std::wstring& packDir, int32_t maxMiB, int32_t decodeBudgetMs, bool preload) {
+    g_texturePackManager.Init(packDir, maxMiB, decodeBudgetMs, preload);
 }
 
 void TexturePackShutdown() {

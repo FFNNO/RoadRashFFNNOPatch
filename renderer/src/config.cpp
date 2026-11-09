@@ -176,6 +176,9 @@ void ConfigInit(const std::wstring& iniFilePath) {
     INT tpBudget = static_cast<INT>(GetPrivateProfileIntW(L"TexturePack", L"DecodeBudgetMs", 4, iniFilePath.c_str()));
     g_config.texturePackDecodeBudgetMs = (tpBudget < 1) ? 1 : tpBudget;
 
+    UINT tpPreload = GetPrivateProfileIntW(L"TexturePack", L"Preload", 1, iniFilePath.c_str());
+    g_config.texturePackPreload = (tpPreload != 0);
+
     UINT tpDump = GetPrivateProfileIntW(L"TexturePack", L"Dump", 0, iniFilePath.c_str());
     g_config.texturePackDump = (tpDump != 0);
 

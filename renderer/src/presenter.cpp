@@ -388,6 +388,7 @@ public:
             return true;
         }
 
+        ServiceTexturePack();
         if (GetConfig().gpuWorld && CaptureHasWorldFrame()) {
             return PresentWorldFrame(surface, pitch, palette, width, height, clientW, clientH, nowMs);
         }
@@ -1291,6 +1292,25 @@ private:
         return true;
     }
 
+    // With GpuWorld on, the texture pack is indexed as soon as the device exists, in menus too, so
+    // with [TexturePack] Preload=1 the replacements are decoded before the race starts instead of
+    // on their first draw. D3D textures are still created here, on the game thread, within
+    // DecodeBudgetMs per frame. A device loss runs Shutdown, and the next frame indexes and
+    // preloads again. GpuWorld=0 or Enabled=0 does no texture pack work.
+    void ServiceTexturePack() {
+        if (!GetConfig().gpuWorld || !GetConfig().texturePackEnabled) {
+            return;
+        }
+        if (!m_texturePackInitialized) {
+            TexturePackInit(ResolveGamePath(GetConfig().texturePackPath),
+                            GetConfig().texturePackMaxMiB,
+                            GetConfig().texturePackDecodeBudgetMs,
+                            GetConfig().texturePackPreload);
+            m_texturePackInitialized = true;
+        }
+        TexturePackUpdate(m_device.Get());
+    }
+
     // Texture pack replacements are fixed full-brightness RGBA, while originals are converted through
     // the current palette and fade with it. The world shader scales replacements by the per-channel
     // fade f = sum(current[1..255]) / sum(base[1..255]) against DATA\PALETTE.RAW. It is computed only
@@ -1340,15 +1360,6 @@ private:
             m_textureDumpInitialized = true;
         }
 
-        if (GetConfig().texturePackEnabled && !m_texturePackInitialized) {
-            TexturePackInit(ResolveGamePath(GetConfig().texturePackPath),
-                            GetConfig().texturePackMaxMiB,
-                            GetConfig().texturePackDecodeBudgetMs);
-            m_texturePackInitialized = true;
-        }
-        if (GetConfig().texturePackEnabled) {
-            TexturePackUpdate(m_device.Get());
-        }
         UpdateReplacementFade(palette);
 
         const uint32_t curGen = CaptureGetCacheGeneration();

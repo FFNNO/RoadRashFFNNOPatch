@@ -1201,8 +1201,8 @@ int main() {
         const Config& cfg = GetConfig();
         Check(cfg.texturePackEnabled && cfg.texturePackPath == L"texture-pack" &&
               cfg.texturePackMaxMiB == 512 && cfg.texturePackDecodeBudgetMs == 4 &&
-              !cfg.texturePackDump && cfg.texturePackDumpPath == L"texture-dump",
-              "[TexturePack] defaults match brief (Enabled=1, Path=texture-pack, MaxMiB=512, Budget=4, Dump=0, DumpPath=texture-dump)");
+              !cfg.texturePackDump && cfg.texturePackDumpPath == L"texture-dump" && cfg.texturePackPreload,
+              "[TexturePack] defaults match brief (Enabled=1, Path=texture-pack, MaxMiB=512, Budget=4, Dump=0, DumpPath=texture-dump, Preload=1)");
         std::wstring absPath = ResolveGamePath(L"texture-pack");
         Check(!absPath.empty() && absPath.find(L"texture-pack") != std::wstring::npos,
               "ResolveGamePath resolves relative pack path");
@@ -1223,7 +1223,7 @@ int main() {
         if (_wfopen_s(&fp, dummyFile2.c_str(), L"wb") == 0 && fp) { fputc(0, fp); fclose(fp); }
         if (_wfopen_s(&fp, dummyTxt.c_str(), L"wb") == 0 && fp) { fputc(0, fp); fclose(fp); }
 
-        TexturePackInit(testDir, 512, 4);
+        TexturePackInit(testDir, 512, 4, false);
         Check(TexturePackHasIndexed("32x67_c1968fce"), "TexturePack indexes 32x67_c1968fce.png");
         Check(TexturePackHasIndexed("256x32_e2819544"), "TexturePack indexes 256x32_e2819544.png");
         Check(!TexturePackHasIndexed("readme"), "TexturePack ignores non-PNG files");
@@ -1707,6 +1707,169 @@ int main() {
         Check(!PaletteIsUniformScale(base, tinted, f), "A remapped palette is not a uniform scale of the base");
     }
 
+
+    // 19. The original size is parsed from a texture ID with the IsTextureIdPngName rule.
+    {
+        int32_t w = -1, h = -1;
+        Check(ParseTextureIdSize("32x67_c1968fce", w, h) && w == 32 && h == 67,
+              "ParseTextureIdSize reads 32x67 from 32x67_c1968fce");
+        Check(ParseTextureIdSize("256x32_e2819544", w, h) && w == 256 && h == 32,
+              "ParseTextureIdSize reads 256x32 from 256x32_e2819544");
+        Check(!ParseTextureIdSize("32x67_C1968FCE", w, h) && w == 0 && h == 0,
+              "ParseTextureIdSize rejects upper-case CRC digits");
+        Check(!ParseTextureIdSize("32x67_c1968fc", w, h), "ParseTextureIdSize rejects a 7-digit CRC");
+        Check(!ParseTextureIdSize("32x67_c1968fce.png", w, h), "ParseTextureIdSize rejects an ID with an extension");
+        Check(!ParseTextureIdSize("readme", w, h), "ParseTextureIdSize rejects a stray name");
+        Check(!ParseTextureIdSize("0x8_00000000", w, h), "ParseTextureIdSize rejects a zero width");
+        Check(!ParseTextureIdSize("8x0_00000000", w, h), "ParseTextureIdSize rejects a zero height");
+        Check(!ParseTextureIdSize("99999999999x8_00000000", w, h) && !ParseTextureIdSize("8x8193_00000000", w, h),
+              "ParseTextureIdSize rejects sizes above 8192");
+    }
+
+    // 20. On-demand decode requests are served before preload requests.
+    {
+        auto req = [](const char* id) {
+            PackLoadRequest r;
+            r.id = id;
+            r.origW = 8;
+            r.origH = 8;
+            return r;
+        };
+        PackLoadQueue q;
+        q.PushPreload(req("a"));
+        q.PushPreload(req("b"));
+        q.PushPreload(req("c"));
+        q.PushDemand(req("d"));
+        PackLoadRequest out;
+        std::string order;
+        while (q.PopNext(out, true)) {
+            order += out.id;
+        }
+        Check(order == "dabc", "PackLoadQueue serves an on-demand request ahead of queued preload requests");
+
+        q.PushPreload(req("a"));
+        q.PushPreload(req("b"));
+        q.PushPreload(req("c"));
+        q.PushDemand(req("d"));
+        Check(q.Promote("c"), "PackLoadQueue promotes a still-queued preload request");
+        Check(!q.Promote("c") && !q.Promote("zz"),
+              "PackLoadQueue does not promote an ID that is not waiting as a preload request");
+        Check(q.DemandSize() == 2 && q.PreloadSize() == 2, "Promotion moves the request between the queues");
+        order.clear();
+        while (q.PopNext(out, true)) {
+            order += out.id;
+        }
+        Check(order == "dcab", "A promoted preload request jumps ahead of the remaining preload requests");
+
+        q.PushPreload(req("a"));
+        Check(!q.PopNext(out, false) && q.PreloadSize() == 1,
+              "PackLoadQueue holds preload requests back when preload is not allowed");
+        q.PushPreload(req("b"));
+        q.PushDemand(req("d"));
+        const std::vector<std::string> dropped = q.ClearPreload();
+        Check(dropped.size() == 2 && dropped[0] == "a" && dropped[1] == "b" && !q.HasPreload() && q.HasDemand(),
+              "ClearPreload drops only the preload requests and returns their IDs");
+        q.Clear();
+        Check(!q.HasDemand() && !q.HasPreload() && !q.PopNext(out, true), "Clear empties both queues");
+    }
+
+    // 21. Init queues every texture-ID file with Preload=1 and nothing with Preload=0.
+    {
+        const std::wstring dir = MakeTestTempPath(L"rr95_preload_");
+        CreateDirectoryW(dir.c_str(), nullptr);
+        const std::wstring f1 = dir + L"\\32x67_c1968fce.png";
+        const std::wstring f2 = dir + L"\\256x32_e2819544.png";
+        const std::wstring stray = dir + L"\\notes.png";
+        WriteDummyFile(f1);
+        WriteDummyFile(f2);
+        WriteDummyFile(stray);
+
+        // Without a device TexturePackUpdate never runs, so queued IDs stay pending.
+        TexturePackInit(dir, 512, 4, false);
+        TexturePackStats stats = TexturePackGetStats();
+        Check(TexturePackGetIndexedCount() == 3 && stats.pendingCount == 0,
+              "Preload=0 indexes the pack and queues nothing at Init");
+        Check(TexturePackGetState("32x67_c1968fce") == ReplacementState::None,
+              "Preload=0 leaves an indexed ID idle until it is drawn");
+        TexturePackShutdown();
+
+        TexturePackInit(dir, 512, 4, true);
+        stats = TexturePackGetStats();
+        Check(stats.pendingCount == 2 && TexturePackGetState("32x67_c1968fce") == ReplacementState::Pending &&
+                  TexturePackGetState("256x32_e2819544") == ReplacementState::Pending,
+              "Preload=1 queues every texture-ID file at Init");
+        Check(TexturePackGetState("notes") == ReplacementState::None,
+              "Preload=1 skips files whose name is not a texture ID");
+        TexturePackShutdown();
+        Check(TexturePackGetStats().pendingCount == 0, "Shutdown drops the preload queue");
+
+        DeleteFileW(f1.c_str());
+        DeleteFileW(f2.c_str());
+        DeleteFileW(stray.c_str());
+        RemoveDirectoryW(dir.c_str());
+    }
+
+    // 22. A preloaded replacement ready before first use does not bump the pack generation, while
+    // one that was drawn as the original first does (WARP device).
+    {
+        ComPtr<ID3D11Device> device;
+        const HRESULT hrDev = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
+                                                D3D11_SDK_VERSION, &device, nullptr, nullptr);
+        if (FAILED(hrDev) || !device) {
+            std::printf("[SKIP] WARP device unavailable (0x%08lX); pack generation test skipped\n",
+                        static_cast<unsigned long>(hrDev));
+        } else {
+            const std::wstring dir = MakeTestTempPath(L"rr95_pregen_");
+            CreateDirectoryW(dir.c_str(), nullptr);
+            std::vector<uint32_t> px(8 * 8, 0xFF336699u);
+            const std::wstring pngA = dir + L"\\8x8_0000000a.png";
+            const std::wstring pngB = dir + L"\\8x8_0000000b.png";
+            SaveRgbaPngWithWic(pngA, 8, 8, px.data());
+            SaveRgbaPngWithWic(pngB, 16, 4, px.data());  // not a k multiple of 8x8: rejected
+
+            auto pumpUntil = [&](uint32_t loaded, uint32_t rejected) {
+                const ULONGLONG deadline = GetTickCount64() + 10000;
+                TexturePackStats st = TexturePackGetStats();
+                while (GetTickCount64() < deadline) {
+                    TexturePackUpdate(device.Get());
+                    st = TexturePackGetStats();
+                    if (st.loadedCount >= loaded && st.rejectedCount >= rejected && st.pendingCount == 0) {
+                        break;
+                    }
+                    Sleep(2);
+                }
+                return st;
+            };
+
+            TexturePackInit(dir, 512, 4, true);
+            const uint64_t genBefore = TexturePackGetGeneration();
+            TexturePackStats st = pumpUntil(1, 1);
+            Check(st.loadedCount == 1 && st.rejectedCount == 1 && st.pendingCount == 0,
+                  "Preload loads the valid replacement and rejects the bad size without a draw");
+            Check(TexturePackGetState("8x8_0000000a") == ReplacementState::Ready,
+                  "A preloaded replacement is ready before its first use");
+            Check(TexturePackGetGeneration() == genBefore,
+                  "A replacement ready before first use does not bump the pack generation");
+            bool pending = true;
+            ReplacementTexture* rep = TexturePackGetOrQueue("8x8_0000000a", 8, 8, &pending);
+            Check(rep && rep->srv && rep->k == 1 && !pending, "The first draw gets the preloaded replacement");
+            TexturePackShutdown();
+
+            TexturePackInit(dir, 512, 4, false);
+            const uint64_t genLazy = TexturePackGetGeneration();
+            pending = false;
+            rep = TexturePackGetOrQueue("8x8_0000000a", 8, 8, &pending);
+            Check(!rep && pending, "Preload=0 queues the replacement on its first draw");
+            st = pumpUntil(1, 0);
+            Check(st.loadedCount == 1 && TexturePackGetGeneration() > genLazy,
+                  "A replacement drawn as the original first bumps the pack generation");
+            TexturePackShutdown();
+
+            DeleteFileW(pngA.c_str());
+            DeleteFileW(pngB.c_str());
+            RemoveDirectoryW(dir.c_str());
+        }
+    }
 
     std::printf("%s (%d failure(s))\n", g_failures == 0 ? "OK" : "FAILED", g_failures);
     return g_failures == 0 ? 0 : 1;

@@ -36,6 +36,7 @@ struct Config {
     std::wstring texturePackPath = L"texture-pack";
     int texturePackMaxMiB = 512;
     int texturePackDecodeBudgetMs = 4;
+    bool texturePackPreload = true;  // [TexturePack] Preload: decode the whole pack in the background at Init
     bool texturePackDump = false;
     std::wstring texturePackDumpPath = L"texture-dump";
 };
