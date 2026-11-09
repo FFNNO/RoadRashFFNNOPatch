@@ -3,6 +3,7 @@
 #include "capture.h"
 #include "log.h"
 #include "quad_mapping.h"
+#include "texture_pack.h"
 
 #include <d3d11.h>
 #include <dxgi.h>
@@ -468,6 +469,10 @@ public:
     }
 
     void Shutdown() {
+        if (m_textureDumpInitialized) {
+            TextureDumpShutdown();
+            m_textureDumpInitialized = false;
+        }
         m_worldTexSrvCache.clear();
         m_srvWorld.Reset();
         m_rtvWorld.Reset();
@@ -1092,6 +1097,19 @@ private:
             chain.width[0] <= 0 || chain.height[0] <= 0) {
             return m_srvWhite.Get();
         }
+
+        if (GetConfig().texturePackDump) {
+            TextureDumpInfo dumpInfo;
+            dumpInfo.id = FormatTextureId(q.texWidth, q.texHeight, q.level0Crc32);
+            dumpInfo.width = chain.width[0];
+            dumpInfo.height = chain.height[0];
+            dumpInfo.colorKey = colorKey;
+            dumpInfo.mipLevels = q.mipLevels;
+            dumpInfo.kind = ((q.pdatFlags & 0x2000u) != 0) ? "sprite" : "texture";
+            dumpInfo.spriteClut = q.spriteClut;
+            dumpInfo.frameNumber = CaptureGetFrameNumber();
+            TextureDumpQueue(dumpInfo, chain.pixels[0], palette);
+        }
         // MipFilter=chosen keeps the B4 single level; trilinear uploads every engine level.
         const int32_t levels = (GetConfig().mipFilter == MipFilter::Trilinear) ? chain.levels : 1;
         const int32_t tw = chain.width[0];
@@ -1217,6 +1235,11 @@ private:
         const int worldH = GetConfig().internalHeight;
         if (!EnsureWorldRenderTarget(worldW, worldH)) {
             return RecordFailure(nowMs);
+        }
+
+        if (GetConfig().texturePackDump && !m_textureDumpInitialized) {
+            TextureDumpInit(ResolveGamePath(GetConfig().texturePackDumpPath));
+            m_textureDumpInitialized = true;
         }
 
         const uint32_t curGen = CaptureGetCacheGeneration();
@@ -1676,6 +1699,7 @@ private:
     std::vector<uint32_t> m_tempRgbaUpload;
     std::vector<WorldVertex> m_worldVerts;
     std::vector<WorldDrawBatch> m_worldBatches;
+    bool m_textureDumpInitialized = false;
 };
 
 D3D11Presenter g_presenter;

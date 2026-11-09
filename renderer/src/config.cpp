@@ -160,12 +160,51 @@ void ConfigInit(const std::wstring& iniFilePath) {
 
     const INT aniso = static_cast<INT>(GetPrivateProfileIntW(L"World", L"Anisotropy", 8, iniFilePath.c_str()));
     g_config.anisotropy = ClampAnisotropy(aniso);
+
+    UINT tpEnabled = GetPrivateProfileIntW(L"TexturePack", L"Enabled", 1, iniFilePath.c_str());
+    g_config.texturePackEnabled = (tpEnabled != 0);
+
+    wchar_t tpPathBuf[MAX_PATH] = {0};
+    GetPrivateProfileStringW(L"TexturePack", L"Path", L"texture-pack", tpPathBuf, MAX_PATH, iniFilePath.c_str());
+    g_config.texturePackPath = tpPathBuf;
+
+    INT tpMaxMiB = static_cast<INT>(GetPrivateProfileIntW(L"TexturePack", L"MaxMiB", 512, iniFilePath.c_str()));
+    g_config.texturePackMaxMiB = (tpMaxMiB < 16) ? 16 : tpMaxMiB;
+
+    INT tpBudget = static_cast<INT>(GetPrivateProfileIntW(L"TexturePack", L"DecodeBudgetMs", 4, iniFilePath.c_str()));
+    g_config.texturePackDecodeBudgetMs = (tpBudget < 1) ? 1 : tpBudget;
+
+    UINT tpDump = GetPrivateProfileIntW(L"TexturePack", L"Dump", 0, iniFilePath.c_str());
+    g_config.texturePackDump = (tpDump != 0);
+
+    wchar_t tpDumpPathBuf[MAX_PATH] = {0};
+    GetPrivateProfileStringW(L"TexturePack", L"DumpPath", L"texture-dump", tpDumpPathBuf, MAX_PATH, iniFilePath.c_str());
+    g_config.texturePackDumpPath = tpDumpPathBuf;
 }
 
 int ClampInternalHeight(int h) {
     if (h < 240) return 240;
     if (h > 4320) return 4320;
     return h;
+}
+
+std::wstring ResolveGamePath(const std::wstring& relOrAbsPath) {
+    if (relOrAbsPath.empty()) return L"";
+    if (relOrAbsPath.size() >= 2 && relOrAbsPath[1] == L':') {
+        return relOrAbsPath;
+    }
+    if (relOrAbsPath[0] == L'\\' || relOrAbsPath[0] == L'/') {
+        return relOrAbsPath;
+    }
+    wchar_t exePath[MAX_PATH] = {0};
+    DWORD len = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return relOrAbsPath;
+    wchar_t* lastSlash = wcsrchr(exePath, L'\\');
+    if (!lastSlash) lastSlash = wcsrchr(exePath, L'/');
+    if (lastSlash) {
+        *lastSlash = L'\0';
+    }
+    return std::wstring(exePath) + L"\\" + relOrAbsPath;
 }
 
 bool ToggleGpuWorld() {

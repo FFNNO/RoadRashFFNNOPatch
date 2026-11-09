@@ -20,6 +20,7 @@
 #include "../src/presenter.h"
 #include "../src/capture.h"
 #include "../src/quad_mapping.h"
+#include "../src/texture_pack.h"
 
 namespace {
 
@@ -1092,6 +1093,55 @@ int main() {
               "pixel above the top edge (clamped y) keeps the top-row gradient");
         Check(rightOut.uv.x == 64.0f && std::fabs(rightOut.dUvDx.x - rightIn.dUvDx.x) < 1e-4f && rightOut.dUvDx.x > 0.0f,
               "pixel past the right edge (saturated t) keeps the span gradient instead of dropping to zero");
+    }
+
+    // B6 Work Unit 1 unit tests:
+    // 1. FormatTextureId tests (scenery, track, dynamic sprite with CLUT from frame dumps)
+    {
+        Check(FormatTextureId(32, 67, 0xc1968fce) == "32x67_c1968fce",
+              "FormatTextureId formats scenery texture 32x67_c1968fce");
+        Check(FormatTextureId(256, 32, 0xe2819544) == "256x32_e2819544",
+              "FormatTextureId formats track texture 256x32_e2819544");
+        Check(FormatTextureId(54, 24, 0xc6f91bb1) == "54x24_c6f91bb1",
+              "FormatTextureId formats dynamic sprite with CLUT 54x24_c6f91bb1");
+    }
+
+    // 2. ValidateMipLevelPointer tests (advisory B5 review)
+    {
+        uint8_t dummyLevel[32 * 32];
+        Check(ValidateMipLevelPointer(dummyLevel, 64, 64, 1),
+              "ValidateMipLevelPointer accepts valid allocated memory");
+        Check(!ValidateMipLevelPointer(nullptr, 64, 64, 1),
+              "ValidateMipLevelPointer rejects null pointer");
+        Check(!ValidateMipLevelPointer(reinterpret_cast<const void*>(0xDEADBEEF), 64, 64, 1),
+              "ValidateMipLevelPointer rejects uncommitted pointer 0xDEADBEEF");
+        Check(!ValidateMipLevelPointer(dummyLevel, 32, 32, 6),
+              "ValidateMipLevelPointer rejects level where dimension shifts to zero (32 >> 6 == 0)");
+    }
+
+    // 3. SaveRgbaPngWithWic test
+    {
+        wchar_t tempPath[MAX_PATH] = {0};
+        GetTempPathW(MAX_PATH, tempPath);
+        std::wstring testPng = std::wstring(tempPath) + L"rr95_wic_test.png";
+        const uint32_t pixels[4] = {0xFF0000FFu, 0xFF00FF00u, 0xFFFF0000u, 0x00000000u};
+        bool saved = SaveRgbaPngWithWic(testPng, 2, 2, pixels);
+        Check(saved, "SaveRgbaPngWithWic encodes a 2x2 RGBA PNG using WIC");
+        DWORD attr = GetFileAttributesW(testPng.c_str());
+        Check(attr != INVALID_FILE_ATTRIBUTES, "WIC test PNG was written to disk");
+        DeleteFileW(testPng.c_str());
+    }
+
+    // 4. [TexturePack] config defaults and path resolution
+    {
+        const Config& cfg = GetConfig();
+        Check(cfg.texturePackEnabled && cfg.texturePackPath == L"texture-pack" &&
+              cfg.texturePackMaxMiB == 512 && cfg.texturePackDecodeBudgetMs == 4 &&
+              !cfg.texturePackDump && cfg.texturePackDumpPath == L"texture-dump",
+              "[TexturePack] defaults match brief (Enabled=1, Path=texture-pack, MaxMiB=512, Budget=4, Dump=0, DumpPath=texture-dump)");
+        std::wstring absPath = ResolveGamePath(L"texture-pack");
+        Check(!absPath.empty() && absPath.find(L"texture-pack") != std::wstring::npos,
+              "ResolveGamePath resolves relative pack path");
     }
 
     // PNG and JSON writer unit tests (B3 item 5).

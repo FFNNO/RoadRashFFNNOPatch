@@ -8,6 +8,7 @@ Outputs OUT_DIR/<kind>/<id>.png plus OUT_DIR/manifest.json.
 Texture ID format: "<w>x<h>_<crc32 of level-0 indices as 8 hex digits>". The same ID is
 computed by the GPU renderer at runtime to look up replacement textures, so it must only
 depend on the original level-0 pixel indices and size.
+Note: IDs extracted here from offline RSCs differ from runtime pack IDs (sprites hash the CLUT descriptor and track textures differ); use runtime dump [TexturePack] Dump=1 for texture pack authoring.
 
 Palette index 0 is exported as fully transparent (colour-key), every other index opaque.
 """

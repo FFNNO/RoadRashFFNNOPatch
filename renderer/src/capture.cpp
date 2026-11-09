@@ -3,12 +3,14 @@
 #include "hook.h"
 #include "log.h"
 #include "presenter.h"
+#include "texture_pack.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -700,11 +702,13 @@ bool WriteFrameJsonFromQuads(const std::wstring& path,
 
     for (uint32_t i = 0; i < quadCount; ++i) {
         const CapturedQuad& q = quads[i];
-        char texId[64];
+        std::string texId;
         if (q.kind == QuadKind::Flat) {
-            std::snprintf(texId, sizeof(texId), "flat_%u", static_cast<unsigned int>(q.flatColor));
+            char flatBuf[32];
+            std::snprintf(flatBuf, sizeof(flatBuf), "flat_%u", static_cast<unsigned int>(q.flatColor));
+            texId = flatBuf;
         } else {
-            std::snprintf(texId, sizeof(texId), "%dx%d_%08x", q.texWidth, q.texHeight, q.level0Crc32);
+            texId = FormatTextureId(q.texWidth, q.texHeight, q.level0Crc32);
         }
 
         std::fprintf(
@@ -731,7 +735,7 @@ bool WriteFrameJsonFromQuads(const std::wstring& path,
             q.culled ? "true" : "false",
             q.pdatPtr,
             q.pdatMagic,
-            texId,
+            texId.c_str(),
             q.texWidth,
             q.texHeight,
             q.mipLevels,
@@ -960,6 +964,10 @@ uint32_t CaptureGetCacheGeneration() {
     return g_cacheGeneration;
 }
 
+uint32_t CaptureGetFrameNumber() {
+    return g_raceFrameNumber;
+}
+
 void CaptureOnBatchStart() {
     CheckAndInvalidateCacheOnLevelChange();
     if (g_batchIndex == 0 && !g_dumpTriggeredCheckedThisFrame) {
@@ -1090,8 +1098,17 @@ int CaptureTexturedQuadBefore() {
                 if (GetConfig().mipFilter == MipFilter::Trilinear) {
                     const int32_t levels = ClampMipLevelCount(pdatPitch, pdatHeight, q.mipLevels);
                     for (int32_t level = 1; level < levels; ++level) {
-                        extraLevels[level - 1] =
+                        const uint8_t* lvlPtr =
                             *reinterpret_cast<const uint8_t* const*>(pdat + 0x38 + level * 0x0c);
+                        if (!ValidateMipLevelPointer(lvlPtr, pdatPitch, pdatHeight, level)) {
+                            static std::unordered_set<uint32_t> s_warnedPdats;
+                            if (s_warnedPdats.insert(q.pdatPtr).second) {
+                                LOG_WARN("PDAT 0x%08X level %d pointer %p is invalid; truncating mip chain to %d levels",
+                                         q.pdatPtr, level, lvlPtr, level);
+                            }
+                            break;
+                        }
+                        extraLevels[level - 1] = lvlPtr;
                         ++extraCount;
                     }
                 }

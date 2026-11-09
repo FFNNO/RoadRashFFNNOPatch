@@ -32,12 +32,19 @@ struct Config {
     bool subPixel = true;       // [World] SubPixel: draw world quads at their 16.16 corners
     MipFilter mipFilter = MipFilter::Trilinear;
     int anisotropy = 8;         // [World] Anisotropy: 2..16 = anisotropic filtering, 0 or 1 = off
+    bool texturePackEnabled = true;
+    std::wstring texturePackPath = L"texture-pack";
+    int texturePackMaxMiB = 512;
+    int texturePackDecodeBudgetMs = 4;
+    bool texturePackDump = false;
+    std::wstring texturePackDumpPath = L"texture-dump";
 };
 
 void ConfigInit(const std::wstring& iniFilePath);
 const Config& GetConfig();
 bool ToggleGpuWorld();
 int ClampInternalHeight(int h);
+std::wstring ResolveGamePath(const std::wstring& relOrAbsPath);
 // Accepts F1..F12, ScrollLock, Pause, or a full decimal/hex code in 1..255.
 // Anything else (including trailing garbage such as "0x7Bzz") returns defaultKey.
 uint32_t ParseVirtualKey(const wchar_t* str, uint32_t defaultKey = 0x91);

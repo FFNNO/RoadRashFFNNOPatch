@@ -4,6 +4,7 @@
 #include "presenter.h"
 #include "capture.h"
 #include "log.h"
+#include "texture_pack.h"
 #include <windows.h>
 #include <atomic>
 #include <cstdint>
@@ -197,6 +198,11 @@ void RecordFrameAndLogFps(bool presentedByD3D) {
                      static_cast<double>(sp.fallbackQuads) / static_cast<double>(sp.frames),
                      sp.fallbackQuads,
                      sp.maxFallbackPerFrame);
+        }
+        if (GetConfig().texturePackDump) {
+            LOG_INFO("TexturePack: %u textures dumped (%u queued)",
+                     TextureDumpGetDumpedCount(),
+                     TextureDumpGetQueuedCount());
         }
         s_frameCount = 0;
         s_lastTime = now;

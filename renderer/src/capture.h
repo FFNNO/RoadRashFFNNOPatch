@@ -209,6 +209,7 @@ const uint8_t* CaptureLookupTexturePixels(uint32_t pdatPtr,
                                           int32_t& outWidth,
                                           int32_t& outHeight);
 uint32_t CaptureGetCacheGeneration();
+uint32_t CaptureGetFrameNumber();
 
 bool WriteIndexedPng(const std::wstring& path, const uint8_t* surface, int pitch, const uint8_t* palette, int width, int height);
 bool WriteFrameJsonFromQuads(const std::wstring& path,
