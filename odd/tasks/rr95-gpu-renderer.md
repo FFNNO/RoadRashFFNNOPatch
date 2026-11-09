@@ -66,6 +66,7 @@ Local-only git repository (`mods-rr`, branch `feat/gpu-renderer`), no remote: pu
 - Replacement textures load when present and fall back to originals otherwise.
 
 ## Progress
+- 2026-11-09: B6 correction `4fb788a` fixes most review-1 items (hook_test 182) but adds 2 blockers: joinable `std::thread` members make every process exit call `std::terminate`, and each replacement load clears the whole world SRV cache. Also: the exact rejection log line is lost, scanned PNGs get `color_key:false`, and `m_queuedSet` is not cleared on Shutdown. Correction budget used; escalated to the user.
 - 2026-11-08: B6 returned by Antigravity (`859d10f`, `7710b00`, `5625dfa`); all checks pass (hook_test 172) but review found 2 blockers (manifest lost across sessions, manifest I/O under the game-thread mutex) and 6 should-fix items; correction round sent as `out/gemini/B6/review-1.md`.
 - 2026-11-08: B6 brief written for Antigravity; runtime/texdump texture ID mismatch found and folded into the plan.
 - 2026-11-08: B5 (T5d, T5b, T6) implemented here in 3 commits, reviewed and verified in game: sub-pixel edges and blended engine mips at 60 fps.
