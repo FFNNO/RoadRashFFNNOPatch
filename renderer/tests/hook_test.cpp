@@ -28,6 +28,7 @@ int g_failures = 0;
 
 void Check(bool condition, const char* what) {
     std::printf("[%s] %s\n", condition ? "PASS" : "FAIL", what);
+    std::fflush(stdout);
     if (!condition) {
         ++g_failures;
     }
@@ -1142,6 +1143,149 @@ int main() {
         std::wstring absPath = ResolveGamePath(L"texture-pack");
         Check(!absPath.empty() && absPath.find(L"texture-pack") != std::wstring::npos,
               "ResolveGamePath resolves relative pack path");
+    }
+
+    // B6 Work Unit 2 unit tests:
+    // 5. Pack index lookup test
+    {
+        wchar_t tempDir[MAX_PATH] = {0};
+        GetTempPathW(MAX_PATH, tempDir);
+        std::wstring testDir = std::wstring(tempDir) + L"rr95_pack_test_" + std::to_wstring(GetCurrentProcessId());
+        CreateDirectoryW(testDir.c_str(), nullptr);
+        std::wstring dummyFile1 = testDir + L"\\32x67_c1968fce.png";
+        std::wstring dummyFile2 = testDir + L"\\256x32_e2819544.png";
+        std::wstring dummyTxt = testDir + L"\\readme.txt";
+        FILE* fp = nullptr;
+        if (_wfopen_s(&fp, dummyFile1.c_str(), L"wb") == 0 && fp) { fputc(0, fp); fclose(fp); }
+        if (_wfopen_s(&fp, dummyFile2.c_str(), L"wb") == 0 && fp) { fputc(0, fp); fclose(fp); }
+        if (_wfopen_s(&fp, dummyTxt.c_str(), L"wb") == 0 && fp) { fputc(0, fp); fclose(fp); }
+
+        TexturePackInit(testDir, 512, 4);
+        Check(TexturePackHasIndexed("32x67_c1968fce"), "TexturePack indexes 32x67_c1968fce.png");
+        Check(TexturePackHasIndexed("256x32_e2819544"), "TexturePack indexes 256x32_e2819544.png");
+        Check(!TexturePackHasIndexed("readme"), "TexturePack ignores non-PNG files");
+        Check(!TexturePackHasIndexed("nonexistent"), "TexturePack returns false for unindexed IDs");
+        TexturePackShutdown();
+
+        DeleteFileW(dummyFile1.c_str());
+        DeleteFileW(dummyFile2.c_str());
+        DeleteFileW(dummyTxt.c_str());
+        RemoveDirectoryW(testDir.c_str());
+    }
+
+    // 6. The k-multiple validation test
+    {
+        int32_t k = 0;
+        Check(ValidateReplacementDimensions(32, 64, 32, 64, k) && k == 1,
+              "ValidateReplacementDimensions accepts k=1 (32x64 -> 32x64)");
+        Check(ValidateReplacementDimensions(32, 64, 64, 128, k) && k == 2,
+              "ValidateReplacementDimensions accepts k=2 (32x64 -> 64x128)");
+        Check(ValidateReplacementDimensions(32, 64, 128, 256, k) && k == 4,
+              "ValidateReplacementDimensions accepts k=4 (32x64 -> 128x256)");
+        Check(ValidateReplacementDimensions(32, 64, 256, 512, k) && k == 8,
+              "ValidateReplacementDimensions accepts k=8 (32x64 -> 256x512)");
+        Check(!ValidateReplacementDimensions(32, 64, 64, 64, k),
+              "ValidateReplacementDimensions rejects asymmetric scale (64x64 for 32x64)");
+        Check(!ValidateReplacementDimensions(32, 64, 96, 192, k),
+              "ValidateReplacementDimensions rejects non-power-of-two multiple k=3 (96x192)");
+        Check(!ValidateReplacementDimensions(32, 64, 512, 1024, k),
+              "ValidateReplacementDimensions rejects scale > 8 (k=16: 512x1024)");
+        Check(!ValidateReplacementDimensions(32, 64, 16, 32, k),
+              "ValidateReplacementDimensions rejects scale < 1 (16x32)");
+    }
+
+    // 7. Premultiplied conversion of a replacement
+    {
+        // 3 pixels:
+        // Pixel 0: Opaque (100, 150, 200, 255)
+        // Pixel 1: Transparent with non-zero color (255, 128, 64, 0) -> must become (0,0,0,0)
+        // Pixel 2: Semi-transparent (200, 100, 50, 128)
+        const uint8_t src[12] = {
+            100, 150, 200, 255,
+            255, 128, 64, 0,
+            200, 100, 50, 128
+        };
+        uint32_t dst[3] = {};
+        ConvertToPremultipliedRgba(src, 3, 1, dst);
+
+        const uint32_t p0 = dst[0];
+        Check((p0 & 0xFF) == 100 && ((p0 >> 8) & 0xFF) == 150 && ((p0 >> 16) & 0xFF) == 200 && ((p0 >> 24) & 0xFF) == 255,
+              "ConvertToPremultipliedRgba preserves opaque pixels");
+        Check(dst[1] == 0x00000000u,
+              "ConvertToPremultipliedRgba zeros transparent pixels (alpha 0 -> 0x00000000)");
+
+        const uint32_t p2 = dst[2];
+        const uint32_t expR = (200u * 128u + 127u) / 255u;
+        const uint32_t expG = (100u * 128u + 127u) / 255u;
+        const uint32_t expB = (50u * 128u + 127u) / 255u;
+        Check((p2 & 0xFF) == expR && ((p2 >> 8) & 0xFF) == expG && ((p2 >> 16) & 0xFF) == expB && ((p2 >> 24) & 0xFF) == 128,
+              "ConvertToPremultipliedRgba correctly premultiplies semi-transparent pixels");
+    }
+
+    // 8. Box mip filter on a colour-keyed edge (no halos)
+    {
+        // 2x2 image: (0,0) is pure green (0, 255, 0, 255), others are transparent (0, 0, 0, 0).
+        // Stored in premultiplied RGBA8:
+        // p00 = 0xFF00FF00u (a=255, g=255)
+        // p10 = 0, p01 = 0, p11 = 0
+        const uint32_t base2x2[4] = {
+            0xFF00FF00u, 0x00000000u,
+            0x00000000u, 0x00000000u
+        };
+        std::vector<std::vector<uint32_t>> mips;
+        bool ok = GeneratePremultipliedMipChain(2, 2, base2x2, mips);
+        Check(ok && mips.size() == 2, "GeneratePremultipliedMipChain builds 2 levels for 2x2 base");
+        Check(mips[1].size() == 1, "Level 1 is 1x1 texel");
+
+        const uint32_t p = mips[1][0];
+        const uint32_t r = p & 0xFFu;
+        const uint32_t g = (p >> 8) & 0xFFu;
+        const uint32_t b = (p >> 16) & 0xFFu;
+        const uint32_t a = (p >> 24) & 0xFFu;
+
+        // Box filter averages components: g = (255 + 2) / 4 = 64, a = (255 + 2) / 4 = 64.
+        Check(r == 0 && b == 0 && g == 64 && a == 64,
+              "Premultiplied 2x2 box filter averages premultiplied channels (G=64, A=64, R=0, B=0)");
+
+        // Un-premultiplied in shader: g_unpremul = g / (a / 255.0) = 64 / (64 / 255.0) = 255!
+        const float unpremulG = (static_cast<float>(g) / 255.0f) / (static_cast<float>(a) / 255.0f);
+        Check(std::fabs(unpremulG - 1.0f) < 1e-4f,
+              "Un-premultiplying the downsampled pixel recovers pure green 1.0 with ZERO halo");
+    }
+
+    // 9. Normalised uv_box for k = 4
+    {
+        const int32_t origW = 64;
+        const int32_t origH = 64;
+        const int32_t clampTexel[4] = { 16, 20, 31, 39 }; // minX, minY, maxX, maxY
+        const float normBox[4] = {
+            static_cast<float>(clampTexel[0]) / static_cast<float>(origW),
+            static_cast<float>(clampTexel[1]) / static_cast<float>(origH),
+            static_cast<float>(clampTexel[2] + 1) / static_cast<float>(origW),
+            static_cast<float>(clampTexel[3] + 1) / static_cast<float>(origH)
+        };
+
+        // At level 0 of a k=4 replacement (256x256):
+        const float size4x[2] = { 256.0f, 256.0f };
+        const float loX = std::ceil(normBox[0] * size4x[0]);
+        const float loY = std::ceil(normBox[1] * size4x[1]);
+        const float hiX = std::max(std::floor(normBox[2] * size4x[0]) - 1.0f, loX);
+        const float hiY = std::max(std::floor(normBox[3] * size4x[1]) - 1.0f, loY);
+
+        Check(static_cast<int32_t>(loX) == clampTexel[0] * 4 &&
+              static_cast<int32_t>(loY) == clampTexel[1] * 4,
+              "Normalized uv_box at level 0 of k=4 replacement scales min texel by 4");
+        Check(static_cast<int32_t>(hiX) == (clampTexel[2] + 1) * 4 - 1 &&
+              static_cast<int32_t>(hiY) == (clampTexel[3] + 1) * 4 - 1,
+              "Normalized uv_box at level 0 of k=4 replacement scales max texel by 4");
+
+        // At level log2(4) = 2 of the k=4 replacement (size 64x64):
+        const float size2x[2] = { 64.0f, 64.0f };
+        const float loX_lvl2 = std::ceil(normBox[0] * size2x[0]);
+        const float hiX_lvl2 = std::max(std::floor(normBox[2] * size2x[0]) - 1.0f, loX_lvl2);
+        Check(static_cast<int32_t>(loX_lvl2) == clampTexel[0] &&
+              static_cast<int32_t>(hiX_lvl2) == clampTexel[2],
+              "Normalized uv_box at level 2 of k=4 replacement exactly recovers original level 0 clamp range");
     }
 
     // PNG and JSON writer unit tests (B3 item 5).

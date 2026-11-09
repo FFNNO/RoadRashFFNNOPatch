@@ -204,6 +204,14 @@ void RecordFrameAndLogFps(bool presentedByD3D) {
                      TextureDumpGetDumpedCount(),
                      TextureDumpGetQueuedCount());
         }
+        if (GetConfig().texturePackEnabled) {
+            const TexturePackStats stats = TexturePackGetStats();
+            LOG_INFO("TexturePack: %u loaded, %u pending, %u rejected (%.2f MiB)",
+                     stats.loadedCount,
+                     stats.pendingCount,
+                     stats.rejectedCount,
+                     static_cast<double>(stats.totalBytes) / (1024.0 * 1024.0));
+        }
         s_frameCount = 0;
         s_lastTime = now;
     }
