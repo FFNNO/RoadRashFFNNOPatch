@@ -66,6 +66,7 @@ Local-only git repository (`mods-rr`, branch `feat/gpu-renderer`), no remote: pu
 - Replacement textures load when present and fall back to originals otherwise.
 
 ## Progress
+- 2026-11-08: B6 returned by Antigravity (`859d10f`, `7710b00`, `5625dfa`); all checks pass (hook_test 172) but review found 2 blockers (manifest lost across sessions, manifest I/O under the game-thread mutex) and 6 should-fix items; correction round sent as `out/gemini/B6/review-1.md`.
 - 2026-11-08: B6 brief written for Antigravity; runtime/texdump texture ID mismatch found and folded into the plan.
 - 2026-11-08: B5 (T5d, T5b, T6) implemented here in 3 commits, reviewed and verified in game: sub-pixel edges and blended engine mips at 60 fps.
 - 2026-11-08: T5c `0abba21` verified in game in motion: straight road lines, chase HUD back, F12 toggle without camera change; F12/Steam clash and test gaps moved to T5d.
@@ -74,4 +75,4 @@ Local-only git repository (`mods-rr`, branch `feat/gpu-renderer`), no remote: pu
 - 2026-11-05: Exe byte patch (sub-pixel HiRes snap + HALFTONE present) installed and confirmed by the user to improve jitter with unchanged performance.
 
 ## Next step
-Antigravity implements B6 from `out/gemini/B6/brief.md`; Claude reviews it (build, tests, native review, in-game dump and pack checks). User playtest of B5 still pending for T5b.
+Antigravity applies the B6 correction round from `out/gemini/B6/review-1.md`; then Claude reviews it (build, tests, native review, in-game dump and pack checks). User playtest of B5 still pending for T5b.
