@@ -31,8 +31,8 @@ The user wants saving and loading to be one step and wants visual confirmation t
 - No teardown at process exit (leaked singletons, as in the renderer).
 
 ## Tasks
-- [ ] S1 Redirect the COMDLG32 save and open dialogs to the default file (generalized IAT helper, config, path resolution) with unit tests. Route: delegated writer (2+ non-trivial files).
-- [ ] S2 Detect a successful save and load and draw the toast in both present paths (GDI-rendered text texture, margin placement) with unit tests for placement and timing. Route: delegated writer, same work unit as S1 if it stays coherent.
+- [x] S1 Redirect the COMDLG32 save and open dialogs to the default file (generalized IAT helper, config, path resolution) with unit tests. Route: delegated writer (2+ non-trivial files).
+- [x] S2 Detect a successful save and load and draw the toast in both present paths (GDI-rendered text texture, margin placement) with unit tests for placement and timing. Route: delegated writer, same work unit as S1 if it stays coherent.
 - [ ] S3 In-game check: save from the menu without a dialog, file written at the default path, toast visible; load from the menu without a dialog; missing file falls back to the dialog.
 
 ## Acceptance criteria
@@ -47,7 +47,8 @@ The user wants saving and loading to be one step and wants visual confirmation t
 - In-game: Steam game folder, screenshots in `out/screens/2026-11-09-save/`.
 
 ## Progress
+- 2026-11-09: S1+S2 in one work unit `b595d61` (delegated writer; no clean file split, S1 alone does not compile). Generalized IAT helper; COMDLG32 GetSaveFileNameA/GetOpenFileNameA detours; inline hooks on FUN_0043f7c0 (`55 8B EC 83 EC 0C`) and FUN_0043f580 (`55 8B EC 83 EC 10`), bytes verified in original, patched and Steam exes. Success rule: the detours clear the block magic at 0x5c4d0c first; save succeeds when the block is valid afterwards, dirty flag 0x5cd47e is 0, and the file is 160 bytes and new or re-timestamped; load succeeds when the block is valid and the dirty flag is 0. Toast: GDI text into a BGRA texture, alpha-blended quad after the final pass, right side margin (36 px font down to 20 px) or image corner on a 60% dark box; a 50 ms TIMERPROC on the game thread re-presents the last frame in static menus. RED 272 PASS / 34 FAIL with stubs; GREEN hook_test 306 PASS / 0 failures, forward_test OK, check_hook_sites 16 OK. Native review approved (1 lens, lineage review-f2175d6fb565d047) and acknowledged; reviewed boundary `b595d61`. Advisories: R3-001 toast leaves PS CB0/sampler 0/viewport/shaders bound (benign: the world pass and the final pass rebind them every frame); R3-002 no tests for the presenter toast glue and the dialog/save detours; R3-003 coarse timestamps can hide a toast for two saves in the same tick. Installed in Steam (DLL backup ddraw.dll.b6-19a3d34; save backup backups/saves/Partida 1.RRS.2026-11-09). S3 pending: automated menu navigation could not reach the save menu (intro and attract videos), so the in-game check needs the user.
 - 2026-11-09: Feature document created after a read-only map of the save and load flow.
 
 ## Next step
-S1 and S2 through one delegated writer.
+S3: user saves and loads from the in-game menu and reports dialog, file and toast.
