@@ -1223,7 +1223,7 @@ int main() {
         if (_wfopen_s(&fp, dummyFile2.c_str(), L"wb") == 0 && fp) { fputc(0, fp); fclose(fp); }
         if (_wfopen_s(&fp, dummyTxt.c_str(), L"wb") == 0 && fp) { fputc(0, fp); fclose(fp); }
 
-        TexturePackInit(testDir, 512, 4, false);
+        TexturePackInit(testDir, 512, 4, false, nullptr);
         Check(TexturePackHasIndexed("32x67_c1968fce"), "TexturePack indexes 32x67_c1968fce.png");
         Check(TexturePackHasIndexed("256x32_e2819544"), "TexturePack indexes 256x32_e2819544.png");
         Check(!TexturePackHasIndexed("readme"), "TexturePack ignores non-PNG files");
@@ -1785,7 +1785,7 @@ int main() {
         WriteDummyFile(stray);
 
         // Without a device TexturePackUpdate never runs, so queued IDs stay pending.
-        TexturePackInit(dir, 512, 4, false);
+        TexturePackInit(dir, 512, 4, false, nullptr);
         TexturePackStats stats = TexturePackGetStats();
         Check(TexturePackGetIndexedCount() == 3 && stats.pendingCount == 0,
               "Preload=0 indexes the pack and queues nothing at Init");
@@ -1793,7 +1793,7 @@ int main() {
               "Preload=0 leaves an indexed ID idle until it is drawn");
         TexturePackShutdown();
 
-        TexturePackInit(dir, 512, 4, true);
+        TexturePackInit(dir, 512, 4, true, nullptr);
         stats = TexturePackGetStats();
         Check(stats.pendingCount == 2 && TexturePackGetState("32x67_c1968fce") == ReplacementState::Pending &&
                   TexturePackGetState("256x32_e2819544") == ReplacementState::Pending,
@@ -1841,7 +1841,7 @@ int main() {
                 return st;
             };
 
-            TexturePackInit(dir, 512, 4, true);
+            TexturePackInit(dir, 512, 4, true, device.Get());
             const uint64_t genBefore = TexturePackGetGeneration();
             TexturePackStats st = pumpUntil(1, 1);
             Check(st.loadedCount == 1 && st.rejectedCount == 1 && st.pendingCount == 0,
@@ -1855,7 +1855,7 @@ int main() {
             Check(rep && rep->srv && rep->k == 1 && !pending, "The first draw gets the preloaded replacement");
             TexturePackShutdown();
 
-            TexturePackInit(dir, 512, 4, false);
+            TexturePackInit(dir, 512, 4, false, device.Get());
             const uint64_t genLazy = TexturePackGetGeneration();
             pending = false;
             rep = TexturePackGetOrQueue("8x8_0000000a", 8, 8, &pending);
@@ -1868,6 +1868,92 @@ int main() {
             DeleteFileW(pngA.c_str());
             DeleteFileW(pngB.c_str());
             RemoveDirectoryW(dir.c_str());
+        }
+    }
+
+    // 23. The preload finishes without TexturePackUpdate: the decode worker creates the D3D11
+    // textures itself, because intros and static menus present no frames (WARP device).
+    {
+        ComPtr<ID3D11Device> device;
+        const HRESULT hrDev = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
+                                                D3D11_SDK_VERSION, &device, nullptr, nullptr);
+        if (FAILED(hrDev) || !device) {
+            std::printf("[SKIP] WARP device unavailable (0x%08lX); worker texture creation test skipped\n",
+                        static_cast<unsigned long>(hrDev));
+        } else {
+            // Polls the stats, never calling TexturePackUpdate, until nothing is pending.
+            auto waitIdle = [](uint32_t timeoutMs) {
+                const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+                TexturePackStats st = TexturePackGetStats();
+                while (st.pendingCount != 0 && GetTickCount64() < deadline) {
+                    Sleep(5);
+                    st = TexturePackGetStats();
+                }
+                return st;
+            };
+
+            const std::wstring dir = MakeTestTempPath(L"rr95_workercreate_");
+            CreateDirectoryW(dir.c_str(), nullptr);
+            std::vector<uint32_t> px(32 * 32, 0xFF2080C0u);
+            const char* validIds[4] = {"8x8_000000a1", "8x8_000000a2", "4x4_000000a3", "16x8_000000a4"};
+            std::vector<std::wstring> files;
+            files.push_back(dir + L"\\8x8_000000a1.png");   // 16x16, k=2
+            files.push_back(dir + L"\\8x8_000000a2.png");   // 32x32, k=4
+            files.push_back(dir + L"\\4x4_000000a3.png");   // 16x16, k=4
+            files.push_back(dir + L"\\16x8_000000a4.png");  // 32x16, k=2
+            files.push_back(dir + L"\\8x8_000000bb.png");   // 24x24: not a k multiple, rejected
+            SaveRgbaPngWithWic(files[0], 16, 16, px.data());
+            SaveRgbaPngWithWic(files[1], 32, 32, px.data());
+            SaveRgbaPngWithWic(files[2], 16, 16, px.data());
+            SaveRgbaPngWithWic(files[3], 32, 16, px.data());
+            SaveRgbaPngWithWic(files[4], 24, 24, px.data());
+
+            TexturePackInit(dir, 512, 4, true, device.Get());
+            TexturePackStats st = waitIdle(5000);
+            Check(st.pendingCount == 0 && st.loadedCount == 4 && st.rejectedCount == 1,
+                  "Preload creates every replacement without a TexturePackUpdate call (no presented frame)");
+            bool allReady = true;
+            for (const char* id : validIds) {
+                bool pending = true;
+                ReplacementTexture* rep = TexturePackGetOrQueue(id, 0, 0, &pending);
+                allReady = allReady && TexturePackGetState(id) == ReplacementState::Ready && rep &&
+                           rep->srv && !pending;
+            }
+            Check(allReady, "Each preloaded replacement is Ready with an SRV created on the worker");
+            Check(TexturePackGetState("8x8_000000bb") == ReplacementState::None,
+                  "A wrong-size replacement ends as None without a TexturePackUpdate call");
+            TexturePackShutdown();
+            Check(TexturePackGetStats().loadedCount == 0, "Shutdown releases the worker-created replacements");
+
+            // MaxMiB=16 (the smallest accepted value) with five 1024x1024 replacements of 5,592,404
+            // bytes each (full mip chain): three fit in 16 MiB, the fourth stops the preload.
+            const std::wstring bigDir = MakeTestTempPath(L"rr95_workermaxmib_");
+            CreateDirectoryW(bigDir.c_str(), nullptr);
+            std::vector<uint32_t> big(1024 * 1024, 0xFF406080u);
+            std::vector<std::wstring> bigFiles;
+            for (int i = 0; i < 5; ++i) {
+                wchar_t name[64];
+                swprintf_s(name, L"\\512x512_0000c0%02d.png", i);
+                bigFiles.push_back(bigDir + name);
+                SaveRgbaPngWithWic(bigFiles.back(), 1024, 1024, big.data());
+            }
+            TexturePackInit(bigDir, 16, 4, true, device.Get());
+            st = waitIdle(10000);
+            const size_t maxBytes = 16u * 1024u * 1024u;
+            Check(st.pendingCount == 0 && st.loadedCount == 3 && st.totalBytes <= maxBytes,
+                  "MaxMiB stops the preload on the worker without overshooting the budget");
+            Check(TexturePackGetState("512x512_0000c004") == ReplacementState::None,
+                  "Replacements past MaxMiB are not loaded by the preload");
+            TexturePackShutdown();
+
+            for (const std::wstring& f : files) {
+                DeleteFileW(f.c_str());
+            }
+            for (const std::wstring& f : bigFiles) {
+                DeleteFileW(f.c_str());
+            }
+            RemoveDirectoryW(dir.c_str());
+            RemoveDirectoryW(bigDir.c_str());
         }
     }
 

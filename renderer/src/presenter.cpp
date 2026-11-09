@@ -357,9 +357,6 @@ struct WorldDrawBatch {
 };
 
 constexpr size_t kMaxWorldVertices = 65536;
-// Texture pack creation budget per menu frame. Menus redraw at about 1 fps, so a longer frame there
-// is not visible, while race frames keep [TexturePack] DecodeBudgetMs.
-constexpr int32_t kMenuTexturePackBudgetMs = 50;
 
 class D3D11Presenter {
 public:
@@ -451,10 +448,9 @@ public:
             return true;
         }
 
-        // Menus present through this path, so servicing the pack here lets the preload finish
-        // before the first race frame instead of starting with it. Menus redraw at about 1 fps,
-        // so they get a larger texture creation budget than race frames.
-        ServiceTexturePack(kMenuTexturePackBudgetMs);
+        // Menus present through this path, so servicing the pack here starts the preload before
+        // the first race frame instead of with it.
+        ServiceTexturePack();
 
         D3D11_MAPPED_SUBRESOURCE mapped = {};
         HRESULT hr = m_context->Map(m_texBgra.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -583,6 +579,9 @@ private:
     }
 
     bool InitializeDeviceAndSwapChain(HWND hwnd, int clientW, int clientH) {
+        // No D3D11_CREATE_DEVICE_SINGLETHREADED: the texture pack worker creates replacement textures
+        // and SRVs on this device from its own thread, which relies on ID3D11Device being
+        // free-threaded. The immediate context stays game-thread only.
         UINT createFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
         D3D_FEATURE_LEVEL featureLevels[] = {
             D3D_FEATURE_LEVEL_11_0,
@@ -1301,11 +1300,13 @@ private:
     }
 
     // With GpuWorld on, the texture pack is indexed as soon as the device exists, in menus too, so
-    // with [TexturePack] Preload=1 the replacements are decoded before the race starts instead of
-    // on their first draw. D3D textures are still created here, on the game thread, within
-    // DecodeBudgetMs per frame. A device loss runs Shutdown, and the next frame indexes and
-    // preloads again. GpuWorld=0 or Enabled=0 does no texture pack work.
-    void ServiceTexturePack(int32_t budgetMsOverride = 0) {
+    // with [TexturePack] Preload=1 the replacements are loaded before the race starts instead of
+    // on their first draw. The pack's decode worker creates the D3D textures on m_device itself, so
+    // the preload also advances while the game presents no frame (intro, static menus). A device
+    // loss runs Shutdown, which joins that worker and releases its device reference, and the next
+    // frame indexes and preloads again on the new device. GpuWorld=0 or Enabled=0 does no texture
+    // pack work.
+    void ServiceTexturePack() {
         if (!GetConfig().gpuWorld || !GetConfig().texturePackEnabled) {
             return;
         }
@@ -1313,10 +1314,11 @@ private:
             TexturePackInit(ResolveGamePath(GetConfig().texturePackPath),
                             GetConfig().texturePackMaxMiB,
                             GetConfig().texturePackDecodeBudgetMs,
-                            GetConfig().texturePackPreload);
+                            GetConfig().texturePackPreload,
+                            m_device.Get());
             m_texturePackInitialized = true;
         }
-        TexturePackUpdate(m_device.Get(), budgetMsOverride);
+        TexturePackUpdate(m_device.Get());
     }
 
     // Texture pack replacements are fixed full-brightness RGBA, while originals are converted through

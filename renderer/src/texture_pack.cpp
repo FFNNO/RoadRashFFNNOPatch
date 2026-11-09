@@ -906,10 +906,6 @@ void PackLoadQueue::Clear() {
     m_preload.clear();
 }
 
-// Decoded preload results waiting for TexturePackUpdate are capped at this many bytes, so a pack
-// decoded while no frame consumes it (menus, a minimized window) cannot fill the 32-bit address space.
-static constexpr size_t kPreloadReadyBytesLimit = 64u * 1024u * 1024u;
-
 struct DecodedReplacement {
     std::string id;
     int32_t origW = 0;
@@ -932,22 +928,27 @@ public:
     // Never reached by the leaked global instance (see g_texturePackManager).
     ~TexturePackManager() { Shutdown(); }
 
-    void Init(const std::wstring& packDir, int32_t maxMiB, int32_t decodeBudgetMs, bool preload) {
+    // decodeBudgetMs is no longer used: the worker creates the D3D11 textures, so there is no
+    // per-frame creation budget. It stays in the signature, and [TexturePack] DecodeBudgetMs is
+    // still parsed, so existing configs keep working.
+    void Init(const std::wstring& packDir, int32_t maxMiB, int32_t /*decodeBudgetMs*/, bool preload,
+              ID3D11Device* device) {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_running) {
             return;
         }
         m_packDir = packDir;
         m_maxMiB = (maxMiB >= 16 && maxMiB <= 2048) ? maxMiB : 512;
-        m_decodeBudgetMs = decodeBudgetMs > 0 ? decodeBudgetMs : 4;
         m_maxMibWarned = false;
         m_totalAllocatedBytes = 0;
+        m_reservedBytes = 0;
+        m_deviceLost = false;
+        m_device = device;  // AddRef: the worker creates every replacement on this device
         m_indexedFiles.clear();
         m_replacements.clear();
         m_pendingSet.clear();
         m_rejectedIds.clear();
         m_loadQueue.Clear();
-        m_readyQueue.clear();
         ResetPreloadState();
 
         const std::wstring search = packDir + L"\\*.png";
@@ -983,9 +984,19 @@ public:
 
         m_stop = false;
         m_running = true;
+        if (!m_device) {
+            // Nothing can create textures: queued requests stay Pending until a re-init with a device.
+            LOG_WARN("TexturePack: no D3D11 device; replacements stay pending");
+            return;
+        }
         m_worker = std::thread(&TexturePackManager::WorkerLoop, this);
     }
 
+    // Runs during a session only (presenter Shutdown on a device loss or a window change). It joins
+    // the worker, so no texture created on this device is published after it returns, and the device
+    // reference is released only after the join. Nothing calls it at process exit: the manager is a
+    // leaked singleton and DllMain does no teardown, so no join runs under the loader lock and no
+    // joinable std::thread is ever destroyed (no std::terminate).
     void Shutdown() {
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -1007,10 +1018,12 @@ public:
         m_pendingSet.clear();
         m_rejectedIds.clear();
         m_loadQueue.Clear();
-        m_readyQueue.clear();
         ResetPreloadState();
         m_totalAllocatedBytes = 0;
+        m_reservedBytes = 0;
+        m_deviceLost = false;
         m_maxMibWarned = false;
+        m_device.Reset();
     }
 
     void ClearD3DResources() {
@@ -1052,6 +1065,9 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         auto itRep = m_replacements.find(id);
         if (itRep != m_replacements.end()) {
+            // The worker emplaces under m_mutex while the caller may still hold this pointer: an
+            // unordered_map rehash keeps element addresses, and a published entry is never modified.
+            // Only Shutdown and ClearD3DResources erase entries; the presenter drops its pointers then.
             return &itRep->second;
         }
         if (m_rejectedIds.find(id) != m_rejectedIds.end()) {
@@ -1074,8 +1090,7 @@ public:
             return nullptr;
         }
 
-        const uint64_t maxBytes = static_cast<uint64_t>(m_maxMiB) * 1024ULL * 1024ULL;
-        if (m_totalAllocatedBytes >= maxBytes) {
+        if (m_totalAllocatedBytes + m_reservedBytes >= MaxBytes()) {
             if (!m_maxMibWarned) {
                 m_maxMibWarned = true;
                 LOG_WARN("TexturePack: MaxMiB (%d MiB) reached; skipping further replacements", m_maxMiB);
@@ -1094,196 +1109,9 @@ public:
         return nullptr;
     }
 
-    void Update(ID3D11Device* device, int32_t budgetMsOverride) {
-        if (!device) {
-            return;
-        }
-        LARGE_INTEGER freq, start, now;
-        QueryPerformanceFrequency(&freq);
-        QueryPerformanceCounter(&start);
-
-        const int32_t budgetMs = budgetMsOverride > 0 ? budgetMsOverride : m_decodeBudgetMs;
-        const double budgetSec = static_cast<double>(budgetMs) / 1000.0;
-        const uint64_t maxBytes = static_cast<uint64_t>(m_maxMiB) * 1024ULL * 1024ULL;
-        // Bumped only for replacements that were drawn while pending: a preloaded replacement that
-        // is ready before its first use has no cached original to invalidate.
-        bool loadedDemanded = false;
-        bool poppedAny = false;
-
-        while (true) {
-            DecodedReplacement item;
-            bool demanded = false;
-            bool preloaded = false;
-            bool preloadStopped = false;
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                if (m_readyQueue.empty()) {
-                    break;
-                }
-                item = std::move(m_readyQueue.front());
-                m_readyQueue.pop_front();
-                m_pendingSet.erase(item.id);
-                m_readyBytes -= std::min(m_readyBytes, item.totalBytes);
-                demanded = m_demandedIds.erase(item.id) > 0;
-                preloaded = m_preloadIds.erase(item.id) > 0;
-                preloadStopped = m_preloadStopped;
-                poppedAny = true;
-            }
-
-            if (item.rejected) {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                if (preloaded) {
-                    ++(item.loadResult == PngLoadResult::SizeRejected ? m_preloadRejected : m_preloadFailed);
-                    MaybeLogPreloadDone();
-                }
-                // m_rejectedIds keeps the ID from being queued again, so each line is logged once.
-                m_rejectedIds.insert(item.id);
-                if (item.exceptionLogged) {
-                    // Already logged by the worker.
-                } else if (item.loadResult == PngLoadResult::SizeRejected) {
-                    LOG_WARN("%s", FormatReplacementRejectLog(item.id, item.width, item.height,
-                                                              item.origW, item.origH).c_str());
-                } else {
-                    LOG_WARN("TexturePack: %s decode failed (0x%08lX)", item.id.c_str(),
-                             static_cast<unsigned long>(item.decodeHr));
-                }
-
-                QueryPerformanceCounter(&now);
-                const double elapsed = static_cast<double>(now.QuadPart - start.QuadPart) / static_cast<double>(freq.QuadPart);
-                if (elapsed >= budgetSec) {
-                    break;
-                }
-                continue;
-            }
-
-            if (preloaded && !demanded &&
-                (preloadStopped || m_totalAllocatedBytes + item.totalBytes > maxBytes)) {
-                // Not drawn yet and it does not fit (or preloading already stopped): stop preloading
-                // and drop it without rejecting it, so a later draw can still load it if it fits.
-                std::lock_guard<std::mutex> lock(m_mutex);
-                ++m_preloadSkipped;
-                StopPreload();
-                MaybeLogPreloadDone();
-
-                QueryPerformanceCounter(&now);
-                const double elapsed = static_cast<double>(now.QuadPart - start.QuadPart) / static_cast<double>(freq.QuadPart);
-                if (elapsed >= budgetSec) {
-                    break;
-                }
-                continue;
-            }
-
-            if (m_totalAllocatedBytes + item.totalBytes > maxBytes) {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                if (preloaded) {
-                    ++m_preloadSkipped;
-                    MaybeLogPreloadDone();
-                }
-                if (!m_maxMibWarned) {
-                    m_maxMibWarned = true;
-                    LOG_WARN("TexturePack: MaxMiB (%d MiB) reached; skipping further replacements", m_maxMiB);
-                }
-                m_rejectedIds.insert(item.id);
-
-                QueryPerformanceCounter(&now);
-                const double elapsed = static_cast<double>(now.QuadPart - start.QuadPart) / static_cast<double>(freq.QuadPart);
-                if (elapsed >= budgetSec) {
-                    break;
-                }
-                continue;
-            }
-
-            D3D11_TEXTURE2D_DESC td = {};
-            td.Width = static_cast<UINT>(item.width);
-            td.Height = static_cast<UINT>(item.height);
-            td.MipLevels = static_cast<UINT>(item.levels);
-            td.ArraySize = 1;
-            td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-            td.SampleDesc.Count = 1;
-            td.Usage = D3D11_USAGE_IMMUTABLE;
-            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-
-            std::vector<D3D11_SUBRESOURCE_DATA> initData(item.levels);
-            int32_t curW = item.width;
-            for (int32_t l = 0; l < item.levels; ++l) {
-                initData[l].pSysMem = item.mips[l].data();
-                initData[l].SysMemPitch = static_cast<UINT>(curW * sizeof(uint32_t));
-                initData[l].SysMemSlicePitch = 0;
-                curW = std::max(1, curW / 2);
-            }
-
-            ComPtr<ID3D11Texture2D> tex;
-            HRESULT hr = device->CreateTexture2D(&td, initData.data(), &tex);
-            if (FAILED(hr)) {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                if (preloaded) {
-                    ++m_preloadFailed;
-                    MaybeLogPreloadDone();
-                }
-                m_rejectedIds.insert(item.id);
-                LOG_WARN("TexturePack: CreateTexture2D failed for %s: 0x%08lX", item.id.c_str(), static_cast<unsigned long>(hr));
-                QueryPerformanceCounter(&now);
-                const double elapsed = static_cast<double>(now.QuadPart - start.QuadPart) / static_cast<double>(freq.QuadPart);
-                if (elapsed >= budgetSec) {
-                    break;
-                }
-                continue;
-            }
-
-            ComPtr<ID3D11ShaderResourceView> srv;
-            hr = device->CreateShaderResourceView(tex.Get(), nullptr, &srv);
-            if (FAILED(hr)) {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                if (preloaded) {
-                    ++m_preloadFailed;
-                    MaybeLogPreloadDone();
-                }
-                m_rejectedIds.insert(item.id);
-                LOG_WARN("TexturePack: CreateShaderResourceView failed for %s: 0x%08lX", item.id.c_str(), static_cast<unsigned long>(hr));
-                QueryPerformanceCounter(&now);
-                const double elapsed = static_cast<double>(now.QuadPart - start.QuadPart) / static_cast<double>(freq.QuadPart);
-                if (elapsed >= budgetSec) {
-                    break;
-                }
-                continue;
-            }
-
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                ReplacementTexture rep;
-                rep.srv = srv;
-                rep.width = item.width;
-                rep.height = item.height;
-                rep.k = item.k;
-                rep.levels = item.levels;
-                rep.totalBytes = item.totalBytes;
-                m_replacements.emplace(item.id, std::move(rep));
-                m_totalAllocatedBytes += item.totalBytes;
-                if (demanded) {
-                    loadedDemanded = true;
-                }
-                if (preloaded) {
-                    ++m_preloadLoaded;
-                    MaybeLogPreloadDone();
-                }
-            }
-            LOG_INFO("TexturePack: %s loaded %dx%d (k=%d, %zu bytes)",
-                     item.id.c_str(), item.width, item.height, item.k, item.totalBytes);
-
-            QueryPerformanceCounter(&now);
-            const double elapsed = static_cast<double>(now.QuadPart - start.QuadPart) / static_cast<double>(freq.QuadPart);
-            if (elapsed >= budgetSec) {
-                break;
-            }
-        }
-        if (loadedDemanded) {
-            m_generation.fetch_add(1, std::memory_order_relaxed);
-        }
-        if (poppedAny) {
-            // The ready queue shrank: a worker held back by kPreloadReadyBytesLimit may continue.
-            m_cv.notify_one();
-        }
-    }
+    // The decode worker creates and publishes every replacement itself, so the preload finishes
+    // even while the game presents no frame (intro, static menus). Nothing is left to do here.
+    void Update(ID3D11Device* /*device*/, int32_t /*budgetMsOverride*/) {}
 
     TexturePackStats GetStats() {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -1307,7 +1135,6 @@ private:
         m_preloadFailed = 0;
         m_preloadSkipped = 0;
         m_preloadStartMs = 0;
-        m_readyBytes = 0;
     }
 
     // Queues every indexed file whose name is a texture ID; the original size comes from the ID.
@@ -1330,12 +1157,12 @@ private:
         }
     }
 
-    bool PreloadMayDecode() const {
-        return !m_preloadStopped && m_readyBytes < kPreloadReadyBytesLimit;
+    uint64_t MaxBytes() const {
+        return static_cast<uint64_t>(m_maxMiB) * 1024ULL * 1024ULL;
     }
 
-    // MaxMiB reached by a preload: drop every preload request still queued. Requests already decoded
-    // or decoding are dropped by Update unless they were drawn meanwhile.
+    // MaxMiB reached by a preload: drop every preload request still queued. The request being decoded
+    // is dropped by the worker unless it was drawn meanwhile.
     void StopPreload() {
         if (m_preloadStopped) {
             return;
@@ -1365,26 +1192,204 @@ private:
         }
     }
 
+    // Ends the pending state of a request that will not be published (rejected, failed, skipped).
+    // Returns whether it was a preload request.
+    bool FinishUnpublished(const std::string& id) {
+        m_pendingSet.erase(id);
+        m_demandedIds.erase(id);
+        return m_preloadIds.erase(id) > 0;
+    }
+
+    void FinishRejected(const DecodedReplacement& item) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_stop) {
+            return;  // Shutdown is joining this worker and clears every map after the join
+        }
+        if (FinishUnpublished(item.id)) {
+            ++(item.loadResult == PngLoadResult::SizeRejected ? m_preloadRejected : m_preloadFailed);
+            MaybeLogPreloadDone();
+        }
+        // m_rejectedIds keeps the ID from being queued again, so each line is logged once.
+        m_rejectedIds.insert(item.id);
+        if (item.exceptionLogged) {
+            // Already logged by the worker.
+        } else if (item.loadResult == PngLoadResult::SizeRejected) {
+            LOG_WARN("%s", FormatReplacementRejectLog(item.id, item.width, item.height,
+                                                      item.origW, item.origH).c_str());
+        } else {
+            LOG_WARN("TexturePack: %s decode failed (0x%08lX)", item.id.c_str(),
+                     static_cast<unsigned long>(item.decodeHr));
+        }
+    }
+
+    // Checks MaxMiB and reserves item.totalBytes in one locked section, so the texture being created
+    // counts against the budget before it exists. False when the item is dropped.
+    bool ReserveBytes(const DecodedReplacement& item) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_stop) {
+            return false;
+        }
+        const bool demanded = m_demandedIds.count(item.id) > 0;
+        const bool preloaded = m_preloadIds.count(item.id) > 0;
+        const bool fits = m_totalAllocatedBytes + m_reservedBytes + item.totalBytes <= MaxBytes();
+        if (preloaded && !demanded && (m_preloadStopped || !fits)) {
+            // Not drawn yet and it does not fit (or preloading already stopped): stop preloading and
+            // drop it without rejecting it, so a later draw can still load it if it fits.
+            FinishUnpublished(item.id);
+            ++m_preloadSkipped;
+            StopPreload();
+            MaybeLogPreloadDone();
+            return false;
+        }
+        if (!fits) {
+            if (FinishUnpublished(item.id)) {
+                ++m_preloadSkipped;
+                MaybeLogPreloadDone();
+            }
+            if (!m_maxMibWarned) {
+                m_maxMibWarned = true;
+                LOG_WARN("TexturePack: MaxMiB (%d MiB) reached; skipping further replacements", m_maxMiB);
+            }
+            m_rejectedIds.insert(item.id);
+            return false;
+        }
+        m_reservedBytes += item.totalBytes;
+        return true;
+    }
+
+    // Creates the immutable texture and its SRV. ID3D11Device resource creation is free-threaded
+    // (the presenter never passes D3D11_CREATE_DEVICE_SINGLETHREADED), so this runs on the worker
+    // while the game thread uses the immediate context. outWhat names the failing call.
+    static HRESULT CreateReplacementSrv(ID3D11Device* device, const DecodedReplacement& item,
+                                        ComPtr<ID3D11ShaderResourceView>& outSrv, const char*& outWhat) {
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = static_cast<UINT>(item.width);
+        td.Height = static_cast<UINT>(item.height);
+        td.MipLevels = static_cast<UINT>(item.levels);
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_IMMUTABLE;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        std::vector<D3D11_SUBRESOURCE_DATA> initData(item.levels);
+        int32_t curW = item.width;
+        for (int32_t l = 0; l < item.levels; ++l) {
+            initData[l].pSysMem = item.mips[l].data();
+            initData[l].SysMemPitch = static_cast<UINT>(curW * sizeof(uint32_t));
+            initData[l].SysMemSlicePitch = 0;
+            curW = std::max(1, curW / 2);
+        }
+
+        ComPtr<ID3D11Texture2D> tex;
+        outWhat = "CreateTexture2D";
+        const HRESULT hr = device->CreateTexture2D(&td, initData.data(), &tex);
+        if (FAILED(hr)) {
+            return hr;
+        }
+        outWhat = "CreateShaderResourceView";
+        return device->CreateShaderResourceView(tex.Get(), nullptr, &outSrv);
+    }
+
+    // Creates the texture of a decoded item and publishes it, or records why it was not published.
+    void CreateAndPublish(ID3D11Device* device, DecodedReplacement& item) {
+        if (!ReserveBytes(item)) {
+            return;
+        }
+        ComPtr<ID3D11ShaderResourceView> srv;
+        const char* what = "CreateTexture2D";
+        HRESULT hr = E_OUTOFMEMORY;
+        try {
+            hr = CreateReplacementSrv(device, item, srv, what);
+        } catch (const std::bad_alloc&) {
+            // initData allocation failed; reported below as a failed CreateTexture2D.
+        }
+        // The pixels now live in the texture (or creation failed): free them before taking the lock.
+        std::vector<std::vector<uint32_t>>().swap(item.mips);
+
+        bool published = false;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_reservedBytes -= std::min(m_reservedBytes, item.totalBytes);
+            if (m_stop) {
+                // Shutdown is joining this worker: it clears every map after the join, and this
+                // texture belongs to a device that is about to be released. Never publish it.
+                return;
+            }
+            const bool demanded = m_demandedIds.count(item.id) > 0;
+            if (FAILED(hr)) {
+                if (FinishUnpublished(item.id)) {
+                    ++m_preloadFailed;
+                    MaybeLogPreloadDone();
+                }
+                m_rejectedIds.insert(item.id);
+                LOG_WARN("TexturePack: %s failed for %s: 0x%08lX", what, item.id.c_str(),
+                         static_cast<unsigned long>(hr));
+                if ((hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) && !m_deviceLost) {
+                    // Every further creation would fail too: idle until the presenter re-creates the
+                    // device and re-initializes the pack. Queued requests stay Pending meanwhile.
+                    m_deviceLost = true;
+                    LOG_WARN("TexturePack: D3D11 device lost; texture creation paused until re-init");
+                }
+                return;
+            }
+            ReplacementTexture rep;
+            rep.srv = srv;
+            rep.width = item.width;
+            rep.height = item.height;
+            rep.k = item.k;
+            rep.levels = item.levels;
+            rep.totalBytes = item.totalBytes;
+            // The pending mark is erased and the replacement inserted in one locked section, so
+            // GetState never reports the ID as None in between.
+            m_replacements.emplace(item.id, std::move(rep));
+            m_totalAllocatedBytes += item.totalBytes;
+            m_pendingSet.erase(item.id);
+            m_demandedIds.erase(item.id);
+            if (m_preloadIds.erase(item.id) > 0) {
+                ++m_preloadLoaded;
+                MaybeLogPreloadDone();
+            }
+            if (demanded) {
+                // Bumped only for replacements drawn while pending: a preloaded replacement ready
+                // before its first use has no cached original to invalidate.
+                m_generation.fetch_add(1, std::memory_order_relaxed);
+            }
+            published = true;
+        }
+        if (published) {
+            LOG_INFO("TexturePack: %s loaded %dx%d (k=%d, %zu bytes)",
+                     item.id.c_str(), item.width, item.height, item.k, item.totalBytes);
+        }
+    }
+
+    // Decodes, creates and publishes one request at a time, so at most one decoded replacement (its
+    // PNG pixels and mip chain) is held in memory at any moment.
     void WorkerLoop() {
         HRESULT hrCom = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         const bool needUninit = (hrCom == S_OK || hrCom == S_FALSE);
 
         while (true) {
             PackLoadRequest req;
+            ComPtr<ID3D11Device> device;
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
                 // On-demand requests are always served; preload requests wait while preloading is
-                // stopped or too many decoded bytes are waiting for TexturePackUpdate.
+                // stopped. Nothing is served after a device loss until Shutdown.
                 m_cv.wait(lock, [this] {
-                    return m_stop.load() || m_loadQueue.HasDemand() ||
-                           (m_loadQueue.HasPreload() && PreloadMayDecode());
+                    return m_stop.load() ||
+                           (!m_deviceLost && (m_loadQueue.HasDemand() ||
+                                              (m_loadQueue.HasPreload() && !m_preloadStopped)));
                 });
                 if (m_stop) {
                     break;
                 }
-                if (!m_loadQueue.PopNext(req, PreloadMayDecode())) {
+                if (!m_loadQueue.PopNext(req, !m_preloadStopped)) {
                     continue;
                 }
+                // Shutdown releases m_device only after joining this thread; the local reference
+                // keeps the device alive for this item regardless.
+                device = m_device;
             }
 
             DecodedReplacement item;
@@ -1417,17 +1422,25 @@ private:
             } catch (const std::bad_alloc&) {
                 item.rejected = true;
                 item.exceptionLogged = true;
+                std::vector<std::vector<uint32_t>>().swap(item.mips);
                 LOG_ERROR("TexturePack: bad_alloc loading %s", req.id.c_str());
             } catch (const std::exception& e) {
                 item.rejected = true;
                 item.exceptionLogged = true;
+                std::vector<std::vector<uint32_t>>().swap(item.mips);
                 LOG_ERROR("TexturePack: exception loading %s: %s", req.id.c_str(), e.what());
             }
 
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                m_readyBytes += item.totalBytes;
-                m_readyQueue.push_back(std::move(item));
+            try {
+                if (item.rejected) {
+                    FinishRejected(item);
+                } else {
+                    CreateAndPublish(device.Get(), item);
+                }
+            } catch (const std::exception& e) {
+                // An allocation failure while publishing: the ID stays Pending until re-init, and the
+                // worker keeps serving other requests instead of terminating the process.
+                LOG_ERROR("TexturePack: exception publishing %s: %s", req.id.c_str(), e.what());
             }
         }
 
@@ -1438,12 +1451,16 @@ private:
 
     std::wstring m_packDir;
     int32_t m_maxMiB = 512;
-    int32_t m_decodeBudgetMs = 4;
     bool m_running = false;
     std::atomic<bool> m_stop{false};
     std::atomic<uint32_t> m_indexedCount{0};
     bool m_maxMibWarned = false;
+    // Guarded by m_mutex. m_totalAllocatedBytes counts the published replacements and m_reservedBytes
+    // the one the worker is creating; both count against MaxMiB.
     size_t m_totalAllocatedBytes = 0;
+    size_t m_reservedBytes = 0;
+    bool m_deviceLost = false;      // a creation returned DEVICE_REMOVED/RESET: idle until Shutdown
+    ComPtr<ID3D11Device> m_device;  // set by Init, released by Shutdown after the worker is joined
 
     std::thread m_worker;
     mutable std::mutex m_mutex;
@@ -1455,12 +1472,10 @@ private:
     std::unordered_set<std::string> m_rejectedIds;
     std::atomic<uint64_t> m_generation{1};
     PackLoadQueue m_loadQueue;
-    std::deque<DecodedReplacement> m_readyQueue;
-    size_t m_readyBytes = 0;  // totalBytes of the decoded items in m_readyQueue
 
     // IDs drawn while their replacement was pending: only these bump the pack generation.
     std::unordered_set<std::string> m_demandedIds;
-    // Preload IDs whose decode result has not reached Update yet.
+    // Preload IDs not published, rejected or skipped yet.
     std::unordered_set<std::string> m_preloadIds;
     bool m_preloadActive = false;   // preload queued at Init and the done line not logged yet
     bool m_preloadStopped = false;  // MaxMiB reached by a preload: no further preload work
@@ -1475,8 +1490,9 @@ private:
 // destructor would join a killed worker and release D3D11 SRVs under the loader lock.
 static TexturePackManager& g_texturePackManager = *new TexturePackManager();
 
-void TexturePackInit(const std::wstring& packDir, int32_t maxMiB, int32_t decodeBudgetMs, bool preload) {
-    g_texturePackManager.Init(packDir, maxMiB, decodeBudgetMs, preload);
+void TexturePackInit(const std::wstring& packDir, int32_t maxMiB, int32_t decodeBudgetMs, bool preload,
+                     ID3D11Device* device) {
+    g_texturePackManager.Init(packDir, maxMiB, decodeBudgetMs, preload, device);
 }
 
 void TexturePackShutdown() {

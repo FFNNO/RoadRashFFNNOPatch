@@ -159,13 +159,18 @@ struct TexturePackStats {
 };
 
 // Indexes <packDir>/*.png. With preload, every file whose name is a texture ID is queued for a
-// background decode at a lower priority than on-demand requests; TexturePackUpdate still creates
-// the D3D textures on the game thread within decodeBudgetMs.
-void TexturePackInit(const std::wstring& packDir, int32_t maxMiB, int32_t decodeBudgetMs, bool preload);
+// background decode at a lower priority than on-demand requests. The decode worker also creates the
+// D3D11 texture and SRV on `device` (AddRef'd until TexturePackShutdown; resource creation is
+// free-threaded) and publishes it, so loading needs no presented frame. With a null device files
+// are indexed and queued, but no worker starts and queued IDs stay Pending. decodeBudgetMs is
+// unused (kept for the [TexturePack] DecodeBudgetMs ini key). TexturePackShutdown joins the worker
+// and releases the device, so call it before re-initializing with a new device after a loss.
+void TexturePackInit(const std::wstring& packDir, int32_t maxMiB, int32_t decodeBudgetMs, bool preload,
+                     ID3D11Device* device);
 void TexturePackShutdown();
 void TexturePackClearD3DResources();
-// budgetMsOverride > 0 replaces DecodeBudgetMs for this call (used by the menu present path, where
-// a longer frame is not visible, so the preload finishes before the race).
+// No-op kept for the presenter: replacements are created and published by the decode worker.
+// Both parameters are ignored.
 void TexturePackUpdate(ID3D11Device* device, int32_t budgetMsOverride = 0);
 uint64_t TexturePackGetGeneration();
 // Number of PNG files indexed by the last TexturePackInit (0 when not initialized). Lock-free.
@@ -176,7 +181,7 @@ bool TexturePackHasIndexed(const std::string& id);
 
 enum class ReplacementState {
     None,     // no replacement will arrive (not indexed, rejected or over MaxMiB)
-    Pending,  // queued or decoding; it becomes Ready or None in a later TexturePackUpdate
+    Pending,  // queued, decoding or being created; the worker makes it Ready or None
     Ready,    // the replacement SRV exists
 };
 
