@@ -26,6 +26,21 @@ bool LoadRgbaPngWithWic(const std::wstring& path, int32_t origW, int32_t origH,
                         int32_t& outW, int32_t& outH, int32_t& outK,
                         std::vector<uint32_t>& outPremulRgba);
 
+enum class PngLoadResult {
+    Ok,
+    SizeRejected,  // outW/outH hold the PNG size, which is not a valid multiple of the original
+    DecodeFailed,  // outHr holds the failing HRESULT
+};
+
+// Same as LoadRgbaPngWithWic, but tells a size rejection apart from a decode failure.
+PngLoadResult LoadRgbaPngWithWicEx(const std::wstring& path, int32_t origW, int32_t origH,
+                                   int32_t& outW, int32_t& outH, int32_t& outK,
+                                   std::vector<uint32_t>& outPremulRgba, HRESULT& outHr);
+
+// "TexturePack: <id> rejected (<W>x<H> is not a power-of-two multiple of <w>x<h>)"
+std::string FormatReplacementRejectLog(const std::string& id, int32_t replW, int32_t replH,
+                                       int32_t origW, int32_t origH);
+
 // Validates whether (replW, replH) is k * (origW, origH) with k in {1, 2, 4, 8}.
 bool ValidateReplacementDimensions(int32_t origW, int32_t origH, int32_t replW, int32_t replH, int32_t& outK);
 
@@ -42,8 +57,10 @@ struct TextureDumpInfo {
     int32_t width = 0;
     int32_t height = 0;
     bool colorKey = false;
+    bool colorKeyKnown = true;    // false: recovered from a disk scan, "color_key" is omitted
     int32_t mipLevels = 1;
     std::string kind = "texture"; // "texture" or "sprite"
+    bool kindKnown = true;        // false: recovered from a disk scan, "kind" is omitted
     uint8_t spriteClut = 0;
     uint32_t frameNumber = 0;
 };
@@ -52,8 +69,13 @@ struct TextureDumpInfo {
 bool LoadDumpManifest(const std::wstring& manPath,
                       std::unordered_map<std::string, TextureDumpInfo>& entries,
                       std::unordered_set<std::string>& dumpedSet);
+// Writes manifest.json.tmp and moves it over manPath. On any write, close or move error the tmp
+// file is deleted, the old manifest is kept and false is returned.
 bool SaveDumpManifest(const std::wstring& manPath,
                       const std::unordered_map<std::string, TextureDumpInfo>& entries);
+
+// True when fileName matches ^[0-9]+x[0-9]+_[0-9a-f]{8}\.png$ (extension case-insensitive).
+bool IsTextureIdPngName(const std::wstring& fileName);
 
 void TextureDumpInit(const std::wstring& dumpDir);
 void TextureDumpShutdown();
@@ -89,4 +111,50 @@ uint64_t TexturePackGetGeneration();
 ReplacementTexture* TexturePackGetOrQueue(const std::string& id, int32_t origW, int32_t origH);
 TexturePackStats TexturePackGetStats();
 bool TexturePackHasIndexed(const std::string& id);
+
+// Marks DLL detach (process exit or FreeLibrary). From then on the worker destructors never join
+// and never block on a mutex: they set the stop flag and detach the worker thread.
 void TexturePackSetProcessTerminating();
+
+enum class ReplacementState {
+    None,     // no replacement will arrive (not indexed, rejected or over MaxMiB)
+    Pending,  // queued or decoding; it becomes Ready or None in a later TexturePackUpdate
+    Ready,    // the replacement SRV exists
+};
+
+// Same as TexturePackGetOrQueue; *outPending is true when the replacement is queued or decoding.
+ReplacementTexture* TexturePackGetOrQueue(const std::string& id, int32_t origW, int32_t origH,
+                                          bool* outPending);
+ReplacementState TexturePackGetState(const std::string& id);
+
+// On a pack generation change, erases only the cache entries that were built from the original
+// texture while their replacement was pending and whose replacement is now ready. Entries whose
+// replacement can no longer arrive keep their original SRV and lose the pending mark.
+// Cache is a map whose mapped type has a std::string member named pendingReplacementId.
+template <typename Cache, typename StateFn>
+size_t InvalidateReadyReplacementEntries(Cache& cache, StateFn&& stateOf) {
+    size_t erased = 0;
+    for (auto it = cache.begin(); it != cache.end();) {
+        std::string& pendingId = it->second.pendingReplacementId;
+        if (pendingId.empty()) {
+            ++it;
+            continue;
+        }
+        const ReplacementState state = stateOf(pendingId);
+        if (state == ReplacementState::Ready) {
+            it = cache.erase(it);
+            ++erased;
+            continue;
+        }
+        if (state == ReplacementState::None) {
+            pendingId.clear();
+        }
+        ++it;
+    }
+    return erased;
+}
+
+// Test seam: starts a dumper and a pack worker in dir, lets both worker threads return while their
+// std::thread objects stay joinable (the state a thread killed at process exit leaves), simulates
+// process termination and destroys both objects. Returns false if a worker did not exit in time.
+bool TexturePackTestDestroyAtProcessExit(const std::wstring& dir);

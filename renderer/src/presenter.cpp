@@ -1120,9 +1120,17 @@ private:
             }
         }
 
+        // Set when the original is cached while its replacement is queued or decoding, so a pack
+        // generation change can drop just this entry once the replacement is ready.
+        std::string pendingReplacementId;
         if (GetConfig().texturePackEnabled) {
-            const std::string texPackId = FormatTextureId(q.texWidth, q.texHeight, q.level0Crc32);
-            ReplacementTexture* rep = TexturePackGetOrQueue(texPackId, q.texWidth, q.texHeight);
+            std::string texPackId = FormatTextureId(q.texWidth, q.texHeight, q.level0Crc32);
+            bool replacementPending = false;
+            ReplacementTexture* rep =
+                TexturePackGetOrQueue(texPackId, q.texWidth, q.texHeight, &replacementPending);
+            if (replacementPending) {
+                pendingReplacementId = std::move(texPackId);
+            }
             if (rep && rep->srv) {
                 if (outLevels) {
                     *outLevels = rep->levels;
@@ -1199,7 +1207,8 @@ private:
             *outLevels = levels;
         }
         ID3D11ShaderResourceView* rawSrv = srv.Get();
-        m_worldTexSrvCache.emplace(srvKey, CachedWorldTexture{std::move(srv), levels, 1});
+        m_worldTexSrvCache.emplace(srvKey, CachedWorldTexture{std::move(srv), levels, 1,
+                                                              std::move(pendingReplacementId)});
         return rawSrv;
     }
 
@@ -1285,11 +1294,16 @@ private:
 
         const uint32_t curGen = CaptureGetCacheGeneration();
         const uint64_t tpGen = TexturePackGetGeneration();
-        if (curGen != m_cachedWorldGen || tpGen != m_cachedTexPackGen ||
-            std::memcmp(m_cachedPalette, palette, 1024) != 0) {
+        if (curGen != m_cachedWorldGen || std::memcmp(m_cachedPalette, palette, 1024) != 0) {
             m_worldTexSrvCache.clear();
             std::memcpy(m_cachedPalette, palette, 1024);
             m_cachedWorldGen = curGen;
+            m_cachedTexPackGen = tpGen;
+        } else if (tpGen != m_cachedTexPackGen) {
+            // A replacement finished loading: rebuild only the originals that were waiting for it.
+            InvalidateReadyReplacementEntries(m_worldTexSrvCache, [](const std::string& id) {
+                return TexturePackGetState(id);
+            });
             m_cachedTexPackGen = tpGen;
         }
 
@@ -1751,6 +1765,7 @@ private:
         ComPtr<ID3D11ShaderResourceView> srv;
         int32_t levels = 1;
         int32_t k = 1;
+        std::string pendingReplacementId;  // replacement ID while it is pending, else empty
     };
     std::unordered_map<uint64_t, CachedWorldTexture> m_worldTexSrvCache;
     uint8_t m_cachedPalette[1024] = {};

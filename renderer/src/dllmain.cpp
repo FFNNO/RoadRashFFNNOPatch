@@ -133,9 +133,10 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         g_hModule = hinstDLL;
     } else if (fdwReason == DLL_PROCESS_DETACH) {
         // Never call FreeLibrary or unpatch code under the loader lock.
-        if (lpvReserved != nullptr) {
-            TexturePackSetProcessTerminating();
-        } else {
+        // Both paths run the static destructors under the loader lock, so the texture pack
+        // workers must be stopped without joining: mark the detach before they run.
+        TexturePackSetProcessTerminating();
+        if (lpvReserved == nullptr) {
             LogClose();
         }
     }

@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,51 @@
 namespace {
 
 int g_failures = 0;
+
+std::wstring MakeTestTempPath(const wchar_t* name) {
+    wchar_t tempDir[MAX_PATH] = {};
+    GetTempPathW(MAX_PATH, tempDir);
+    return std::wstring(tempDir) + name + std::to_wstring(GetCurrentProcessId());
+}
+
+std::string ReadWholeFile(const std::wstring& path) {
+    std::string content;
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, path.c_str(), L"rb") != 0 || !fp) {
+        return content;
+    }
+    char buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), fp)) > 0) {
+        content.append(buf, n);
+    }
+    std::fclose(fp);
+    return content;
+}
+
+size_t CountOccurrences(const std::string& haystack, const std::string& needle) {
+    size_t count = 0;
+    for (size_t pos = haystack.find(needle); pos != std::string::npos;
+         pos = haystack.find(needle, pos + needle.size())) {
+        ++count;
+    }
+    return count;
+}
+
+void WriteDummyFile(const std::wstring& path) {
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, path.c_str(), L"wb") == 0 && fp) {
+        std::fputc(0, fp);
+        std::fclose(fp);
+    }
+}
+
+[[noreturn]] void ReportTerminateAndExit() {
+    std::printf("[FAIL] std::terminate called while destroying texture pack workers at process exit\n");
+    std::printf("FAILED (%d failure(s))\n", g_failures + 1);
+    std::fflush(stdout);
+    _exit(1);
+}
 
 void Check(bool condition, const char* what) {
     std::printf("[%s] %s\n", condition ? "PASS" : "FAIL", what);
@@ -1366,8 +1412,178 @@ int main() {
         DeleteFileW(testManPath.c_str());
     }
 
+    // 11. Manifest round-trip with entries recovered from a disk scan (unknown color_key/kind).
+    {
+        const std::wstring manPath = MakeTestTempPath(L"rr95_manifest_unknown_") + L".json";
+        DeleteFileW(manPath.c_str());
+        std::unordered_map<std::string, TextureDumpInfo> entries;
+        TextureDumpInfo known;
+        known.id = "32x67_c1968fce";
+        known.width = 32;
+        known.height = 67;
+        known.colorKey = true;
+        known.kind = "sprite";
+        entries.emplace(known.id, known);
+        TextureDumpInfo scanned;
+        scanned.id = "64x64_0badf00d";
+        scanned.width = 64;
+        scanned.height = 64;
+        scanned.colorKeyKnown = false;
+        scanned.kindKnown = false;
+        entries.emplace(scanned.id, scanned);
+
+        Check(SaveDumpManifest(manPath, entries), "SaveDumpManifest writes a manifest with a scanned entry");
+        const std::string text = ReadWholeFile(manPath);
+        Check(CountOccurrences(text, "\"color_key\"") == 1 && CountOccurrences(text, "\"kind\"") == 1,
+              "SaveDumpManifest omits color_key and kind for scanned entries only");
+
+        std::unordered_map<std::string, TextureDumpInfo> loaded;
+        std::unordered_set<std::string> dumped;
+        Check(LoadDumpManifest(manPath, loaded, dumped) && loaded.size() == 2,
+              "LoadDumpManifest accepts entries without color_key and kind");
+        auto itKnown = loaded.find(known.id);
+        auto itScanned = loaded.find(scanned.id);
+        Check(itKnown != loaded.end() && itKnown->second.colorKeyKnown && itKnown->second.colorKey &&
+                  itKnown->second.kindKnown && itKnown->second.kind == "sprite",
+              "LoadDumpManifest keeps known color_key and kind");
+        Check(itScanned != loaded.end() && !itScanned->second.colorKeyKnown && !itScanned->second.kindKnown &&
+                  itScanned->second.width == 64 && itScanned->second.height == 64,
+              "LoadDumpManifest keeps missing color_key and kind unknown");
+
+        // A second save keeps the scanned entry unknown.
+        Check(SaveDumpManifest(manPath, loaded), "SaveDumpManifest re-writes the loaded manifest");
+        const std::string text2 = ReadWholeFile(manPath);
+        Check(CountOccurrences(text2, "\"color_key\"") == 1, "Scanned entry stays unknown after a round trip");
+        DeleteFileW(manPath.c_str());
+    }
+
+    // 12. SaveDumpManifest keeps the old manifest and deletes the tmp file when the move fails.
+    {
+        const std::wstring manPath = MakeTestTempPath(L"rr95_manifest_isdir_") + L".json";
+        RemoveDirectoryW(manPath.c_str());
+        CreateDirectoryW(manPath.c_str(), nullptr);  // a directory cannot be replaced by a file
+        std::unordered_map<std::string, TextureDumpInfo> entries;
+        TextureDumpInfo e;
+        e.id = "8x8_00000000";
+        e.width = 8;
+        e.height = 8;
+        entries.emplace(e.id, e);
+        const bool ok = SaveDumpManifest(manPath, entries);
+        Check(!ok, "SaveDumpManifest returns false when MoveFileExW fails");
+        Check(GetFileAttributesW((manPath + L".tmp").c_str()) == INVALID_FILE_ATTRIBUTES,
+              "SaveDumpManifest deletes manifest.json.tmp after a failed move");
+        const DWORD attr = GetFileAttributesW(manPath.c_str());
+        Check(attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) != 0,
+              "SaveDumpManifest leaves the existing target untouched after a failed move");
+        DeleteFileW((manPath + L".tmp").c_str());
+        RemoveDirectoryW(manPath.c_str());
+    }
+
+    // 13. Only <w>x<h>_<crc8>.png names count as dumped texture files.
+    {
+        Check(IsTextureIdPngName(L"32x67_c1968fce.png"), "IsTextureIdPngName accepts 32x67_c1968fce.png");
+        Check(IsTextureIdPngName(L"256x32_e2819544.PNG"), "IsTextureIdPngName accepts an upper-case extension");
+        Check(!IsTextureIdPngName(L"stray.png"), "IsTextureIdPngName rejects stray.png");
+        Check(!IsTextureIdPngName(L"32x67_C1968FCE.png"), "IsTextureIdPngName rejects upper-case hex");
+        Check(!IsTextureIdPngName(L"32x67_c1968fc.png"), "IsTextureIdPngName rejects a 7-digit CRC");
+        Check(!IsTextureIdPngName(L"32x67_c1968fce0.png"), "IsTextureIdPngName rejects a 9-digit CRC");
+        Check(!IsTextureIdPngName(L"x67_c1968fce.png"), "IsTextureIdPngName rejects a missing width");
+        Check(!IsTextureIdPngName(L"32x67_c1968fce.png.bak"), "IsTextureIdPngName rejects a trailing suffix");
+    }
+
+    // 14. The dumper adds scanned PNGs to the manifest as unknown and skips stray files.
+    {
+        const std::wstring dir = MakeTestTempPath(L"rr95_dump_scan_");
+        CreateDirectoryW(dir.c_str(), nullptr);
+        const std::wstring files[] = {dir + L"\\32x67_c1968fce.png", dir + L"\\64x64_0badf00d.PNG",
+                                      dir + L"\\stray.png", dir + L"\\32x67_C1968FCE.png"};
+        for (const auto& f : files) {
+            WriteDummyFile(f);
+        }
+        TextureDumpInit(dir);
+        TextureDumpShutdown();
+        std::unordered_map<std::string, TextureDumpInfo> loaded;
+        std::unordered_set<std::string> dumped;
+        LoadDumpManifest(dir + L"\\manifest.json", loaded, dumped);
+        auto it = loaded.find("32x67_c1968fce");
+        Check(loaded.size() == 2 && loaded.count("64x64_0badf00d") == 1 && it != loaded.end(),
+              "Dumper scan adds only files named <w>x<h>_<crc8>.png to the manifest");
+        Check(it != loaded.end() && !it->second.colorKeyKnown && !it->second.kindKnown &&
+                  it->second.width == 32 && it->second.height == 67,
+              "Dumper scan records scanned files with unknown color_key and kind");
+        for (const auto& f : files) {
+            DeleteFileW(f.c_str());
+        }
+        DeleteFileW((dir + L"\\manifest.json").c_str());
+        RemoveDirectoryW(dir.c_str());
+    }
+
+    // 15. Rejected replacements log the exact line; decode failures are told apart.
+    {
+        Check(FormatReplacementRejectLog("8x8_00000000", 24, 24, 8, 8) ==
+                  "TexturePack: 8x8_00000000 rejected (24x24 is not a power-of-two multiple of 8x8)",
+              "FormatReplacementRejectLog matches the brief's rejection line");
+        const std::wstring png = MakeTestTempPath(L"rr95_reject_") + L".png";
+        const uint32_t px[15] = {};
+        SaveRgbaPngWithWic(png, 3, 5, px);
+        int32_t w = 0, h = 0, k = 0;
+        std::vector<uint32_t> pixels;
+        HRESULT hr = S_OK;
+        const PngLoadResult sizeResult = LoadRgbaPngWithWicEx(png, 2, 2, w, h, k, pixels, hr);
+        Check(sizeResult == PngLoadResult::SizeRejected && w == 3 && h == 5 && pixels.empty(),
+              "LoadRgbaPngWithWicEx reports a size rejection with the PNG size");
+        const std::wstring bad = MakeTestTempPath(L"rr95_badpng_") + L".png";
+        WriteDummyFile(bad);
+        const PngLoadResult badResult = LoadRgbaPngWithWicEx(bad, 2, 2, w, h, k, pixels, hr);
+        Check(badResult == PngLoadResult::DecodeFailed && FAILED(hr),
+              "LoadRgbaPngWithWicEx reports a decode failure with its HRESULT");
+        DeleteFileW(png.c_str());
+        DeleteFileW(bad.c_str());
+    }
+
+    // 16. A pack generation change invalidates only entries whose replacement became ready.
+    {
+        struct Entry {
+            int value = 0;
+            std::string pendingReplacementId;
+        };
+        std::unordered_map<uint64_t, Entry> cache;
+        cache[1] = Entry{1, ""};                    // no replacement expected
+        cache[2] = Entry{2, "8x8_00000002"};        // replacement now ready
+        cache[3] = Entry{3, "8x8_00000003"};        // still decoding
+        cache[4] = Entry{4, "8x8_00000004"};        // rejected while pending
+        auto stateOf = [](const std::string& id) {
+            if (id == "8x8_00000002") return ReplacementState::Ready;
+            if (id == "8x8_00000003") return ReplacementState::Pending;
+            return ReplacementState::None;
+        };
+        const size_t erased = InvalidateReadyReplacementEntries(cache, stateOf);
+        Check(erased == 1 && cache.size() == 3 && cache.count(2) == 0,
+              "InvalidateReadyReplacementEntries erases only the entry whose replacement is ready");
+        Check(cache.count(1) == 1 && cache[1].pendingReplacementId.empty(),
+              "InvalidateReadyReplacementEntries keeps entries with no pending replacement");
+        Check(cache.count(3) == 1 && cache[3].pendingReplacementId == "8x8_00000003",
+              "InvalidateReadyReplacementEntries keeps still-pending entries marked");
+        Check(cache.count(4) == 1 && cache[4].pendingReplacementId.empty(),
+              "InvalidateReadyReplacementEntries clears the mark of entries that will never be replaced");
+    }
+
     // PNG and JSON writer unit tests (B3 item 5).
     RunCaptureWritersTest();
+
+    // 17. DLL-detach destructor path: joinable workers must not reach std::terminate. Runs last,
+    // with a terminate handler, so a regression reports FAIL instead of a silent abort.
+    {
+        const std::wstring dir = MakeTestTempPath(L"rr95_exit_");
+        CreateDirectoryW(dir.c_str(), nullptr);
+        const std::terminate_handler previous = std::set_terminate(ReportTerminateAndExit);
+        const bool destroyed = TexturePackTestDestroyAtProcessExit(dir);
+        std::set_terminate(previous);
+        Check(destroyed, "Texture pack workers are destroyed at process exit without std::terminate");
+        DeleteFileW((dir + L"\\manifest.json").c_str());
+        DeleteFileW((dir + L"\\manifest.json.tmp").c_str());
+        RemoveDirectoryW(dir.c_str());
+    }
 
     std::printf("%s (%d failure(s))\n", g_failures == 0 ? "OK" : "FAILED", g_failures);
     return g_failures == 0 ? 0 : 1;

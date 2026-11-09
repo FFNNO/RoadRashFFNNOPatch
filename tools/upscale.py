@@ -16,6 +16,7 @@ Workflow:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -76,6 +77,59 @@ def bleed_colors(rgb: np.ndarray, mask: np.ndarray, iterations: int = 32) -> np.
     return np.stack([np.clip(r, 0, 255), np.clip(g, 0, 255), np.clip(b, 0, 255)], axis=-1).astype(np.uint8)
 
 
+_PLACEHOLDER_RE = re.compile(r"""(["']?)\{(in|input|out|output)\}(["']?)""")
+
+
+def build_external_command(template: str, in_path: str, out_path: str) -> str:
+    """Fills {in}/{input} and {out}/{output} in an --external command template.
+
+    Paths are wrapped in double quotes, unless the template already wraps the placeholder
+    in matching quotes. Other braces in the template are left untouched.
+    """
+    def substitute(match):
+        path = in_path if match.group(2) in ("in", "input") else out_path
+        left, right = match.group(1), match.group(3)
+        if left and left == right:
+            return f"{left}{path}{right}"
+        return f'{left}"{path}"{right}'
+
+    return _PLACEHOLDER_RE.sub(substitute, template)
+
+
+def resolve_color_key(value, im: Image.Image) -> bool:
+    """Returns the manifest color_key, or detects it from the PNG when it is missing.
+
+    Entries the dumper recovered from a disk scan have no color_key. Such a texture is
+    colour-keyed when any texel has alpha 0.
+    """
+    if value is not None:
+        return bool(value)
+    if "A" not in im.getbands():
+        return False
+    alpha = np.array(im.getchannel("A"))
+    return bool((alpha == 0).any())
+
+
+def collect_items(dump_dir: str, manifest: dict, selected_ids):
+    """Lists (id, png_path, color_key) to upscale. color_key is None when it is unknown."""
+    items = []
+    if manifest:
+        for tid, meta in manifest.items():
+            if selected_ids and tid not in selected_ids:
+                continue
+            png_path = os.path.join(dump_dir, f"{tid}.png")
+            if os.path.exists(png_path):
+                items.append((tid, png_path, meta.get("color_key")))
+    elif os.path.exists(dump_dir):
+        for fname in sorted(os.listdir(dump_dir)):
+            if fname.lower().endswith(".png"):
+                tid = fname[:-4]
+                if selected_ids and tid not in selected_ids:
+                    continue
+                items.append((tid, os.path.join(dump_dir, fname), None))
+    return items
+
+
 def upscale_image(im: Image.Image, scale: int = 4, color_key: bool = True,
                   external_cmd: str = None) -> Image.Image:
     """Upscales an image by scale factor (2, 4, or 8) preserving alpha edges."""
@@ -100,10 +154,7 @@ def upscale_image(im: Image.Image, scale: int = 4, color_key: bool = True,
             tmp_out = os.path.join(tmp_dir, "output.png")
             Image.fromarray(rgb_to_save, "RGB").save(tmp_in, format="PNG")
 
-            quoted_in = f'"{tmp_in}"'
-            quoted_out = f'"{tmp_out}"'
-            cmd = external_cmd.replace("{in}", quoted_in).replace("{out}", quoted_out)\
-                              .replace("{input}", quoted_in).replace("{output}", quoted_out)
+            cmd = build_external_command(external_cmd, tmp_in, tmp_out)
             subprocess.run(cmd, shell=True, check=True)
 
             out_im = Image.open(tmp_out).convert("RGB")
@@ -196,6 +247,39 @@ def run_self_test():
     assert arr_ext.shape == (64, 64, 4), f"Expected (64, 64, 4), got {arr_ext.shape}"
     assert set(np.unique(arr_ext[..., 3])).issubset({0, 255}), "External alpha must be binary"
 
+    # 5. --external quoting: placeholders the template already quotes are not quoted again
+    cmd_plain = build_external_command("tool {in} {out}", "C:/t/in.png", "C:/t/out.png")
+    assert cmd_plain == 'tool "C:/t/in.png" "C:/t/out.png"', cmd_plain
+    cmd_quoted = build_external_command("tool -i \"{in}\" -o '{out}'", "C:/t/in.png", "C:/t/out.png")
+    assert cmd_quoted == "tool -i \"C:/t/in.png\" -o 'C:/t/out.png'", cmd_quoted
+    cmd_long = build_external_command("tool --input={input} --output=\"{output}\"", "a b.png", "c.png")
+    assert cmd_long == 'tool --input="a b.png" --output="c.png"', cmd_long
+    cmd_braces = build_external_command("tool {in} {out} --json {x: 1}", "i.png", "o.png")
+    assert cmd_braces == 'tool "i.png" "o.png" --json {x: 1}', cmd_braces
+
+    # 6. Missing color_key (entries recovered from a disk scan) is detected from the PNG alpha
+    opaque_rgba = Image.fromarray(np.dstack([grad_rgb, np.full((16, 16), 255, np.uint8)]), "RGBA")
+    assert resolve_color_key(None, im_hole) is True, "Unknown color_key with alpha 0 must be colour-keyed"
+    assert resolve_color_key(None, opaque_rgba) is False, "Unknown color_key with no alpha 0 must be opaque"
+    assert resolve_color_key(None, im_grad) is False, "Unknown color_key on an RGB image must be opaque"
+    assert resolve_color_key(False, im_hole) is False, "A known color_key must be kept"
+    assert resolve_color_key(True, opaque_rgba) is True, "A known color_key must be kept"
+
+    with tempfile.TemporaryDirectory() as dump_dir:
+        im_hole.save(os.path.join(dump_dir, "16x16_0000000a.png"))
+        im_hole.save(os.path.join(dump_dir, "16x16_0000000b.png"))
+        manifest = {
+            "16x16_0000000a": {"width": 16, "height": 16, "color_key": False, "kind": "texture"},
+            "16x16_0000000b": {"width": 16, "height": 16, "mip_levels": 1},
+        }
+        items = {tid: ck for tid, _, ck in collect_items(dump_dir, manifest, None)}
+        assert items == {"16x16_0000000a": False, "16x16_0000000b": None}, items
+        no_manifest = {tid: ck for tid, _, ck in collect_items(dump_dir, {}, None)}
+        assert no_manifest == {"16x16_0000000a": None, "16x16_0000000b": None}, no_manifest
+
+    unknown_up = np.array(upscale_image(im_hole, scale=scale, color_key=resolve_color_key(None, im_hole)))
+    assert (unknown_up[..., 3] == 0).any(), "A scanned colour-keyed sprite must keep its holes"
+
     print("upscale self-test: OK")
 
 
@@ -232,25 +316,7 @@ def main():
         selected_ids = set(part.strip() for part in args.only.split(",") if part.strip())
 
     # Find candidates from manifest or directly in dump directory
-    items = []
-    if manifest:
-        for tid, meta in manifest.items():
-            if selected_ids and tid not in selected_ids:
-                continue
-            png_name = f"{tid}.png"
-            png_path = os.path.join(args.dump, png_name)
-            if os.path.exists(png_path):
-                color_key = meta.get("color_key", True)
-                items.append((tid, png_path, color_key))
-    else:
-        if os.path.exists(args.dump):
-            for fname in os.listdir(args.dump):
-                if fname.lower().endswith(".png"):
-                    tid = fname[:-4]
-                    if selected_ids and tid not in selected_ids:
-                        continue
-                    png_path = os.path.join(args.dump, fname)
-                    items.append((tid, png_path, True))
+    items = collect_items(args.dump, manifest, selected_ids)
 
     if args.limit and args.limit > 0:
         items = items[:args.limit]
@@ -268,6 +334,7 @@ def main():
         try:
             with Image.open(in_png) as im:
                 im = im.convert("RGBA")
+                color_key = resolve_color_key(color_key, im)
                 up = upscale_image(im, scale=args.scale, color_key=color_key, external_cmd=args.external)
                 up.save(out_png, format="PNG")
                 processed += 1

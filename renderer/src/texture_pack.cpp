@@ -199,22 +199,24 @@ bool ValidateReplacementDimensions(int32_t origW, int32_t origH, int32_t replW, 
     return false;
 }
 
-bool LoadRgbaPngWithWic(const std::wstring& path, int32_t origW, int32_t origH,
-                        int32_t& outW, int32_t& outH, int32_t& outK,
-                        std::vector<uint32_t>& outPremulRgba) {
+PngLoadResult LoadRgbaPngWithWicEx(const std::wstring& path, int32_t origW, int32_t origH,
+                                   int32_t& outW, int32_t& outH, int32_t& outK,
+                                   std::vector<uint32_t>& outPremulRgba, HRESULT& outHr) {
     outW = 0;
     outH = 0;
     outK = 1;
+    outHr = S_OK;
     outPremulRgba.clear();
 
     HRESULT hrCom = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const bool needUninit = (hrCom == S_OK || hrCom == S_FALSE);
-    bool success = false;
+    PngLoadResult result = PngLoadResult::DecodeFailed;
+    HRESULT hr = E_FAIL;
 
     {
         ComPtr<IWICImagingFactory> factory;
-        HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                                      IID_PPV_ARGS(&factory));
+        hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                              IID_PPV_ARGS(&factory));
         if (SUCCEEDED(hr)) {
             ComPtr<IWICBitmapDecoder> decoder;
             hr = factory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
@@ -225,7 +227,10 @@ bool LoadRgbaPngWithWic(const std::wstring& path, int32_t origW, int32_t origH,
                 if (SUCCEEDED(hr)) {
                     UINT w = 0, h = 0;
                     hr = frame->GetSize(&w, &h);
-                    if (SUCCEEDED(hr) && w > 0 && h > 0) {
+                    if (SUCCEEDED(hr) && (w == 0 || h == 0)) {
+                        hr = WINCODEC_ERR_BADIMAGE;
+                    }
+                    if (SUCCEEDED(hr)) {
                         const int32_t imgW = static_cast<int32_t>(w);
                         const int32_t imgH = static_cast<int32_t>(h);
                         int32_t matchedK = 1;
@@ -236,7 +241,11 @@ bool LoadRgbaPngWithWic(const std::wstring& path, int32_t origW, int32_t origH,
                             sizeValid = false;
                         }
 
-                        if (sizeValid) {
+                        if (!sizeValid) {
+                            outW = imgW;
+                            outH = imgH;
+                            result = PngLoadResult::SizeRejected;
+                        } else {
                             outK = matchedK;
                             ComPtr<IWICFormatConverter> converter;
                             hr = factory->CreateFormatConverter(&converter);
@@ -253,7 +262,7 @@ bool LoadRgbaPngWithWic(const std::wstring& path, int32_t origW, int32_t origH,
                                         outH = imgH;
                                         outPremulRgba.resize(static_cast<size_t>(w) * h);
                                         ConvertToPremultipliedRgba(rawPixels.data(), outW, outH, outPremulRgba.data());
-                                        success = true;
+                                        result = PngLoadResult::Ok;
                                     }
                                 }
                             }
@@ -267,7 +276,46 @@ bool LoadRgbaPngWithWic(const std::wstring& path, int32_t origW, int32_t origH,
     if (needUninit) {
         CoUninitialize();
     }
-    return success;
+    if (result == PngLoadResult::DecodeFailed) {
+        outHr = FAILED(hr) ? hr : E_FAIL;
+    }
+    return result;
+}
+
+bool LoadRgbaPngWithWic(const std::wstring& path, int32_t origW, int32_t origH,
+                        int32_t& outW, int32_t& outH, int32_t& outK,
+                        std::vector<uint32_t>& outPremulRgba) {
+    HRESULT hr = S_OK;
+    return LoadRgbaPngWithWicEx(path, origW, origH, outW, outH, outK, outPremulRgba, hr) ==
+           PngLoadResult::Ok;
+}
+
+std::string FormatReplacementRejectLog(const std::string& id, int32_t replW, int32_t replH,
+                                       int32_t origW, int32_t origH) {
+    char buf[192];
+    std::snprintf(buf, sizeof(buf), "TexturePack: %s rejected (%dx%d is not a power-of-two multiple of %dx%d)",
+                  id.c_str(), replW, replH, origW, origH);
+    return std::string(buf);
+}
+
+bool IsTextureIdPngName(const std::wstring& fileName) {
+    // ^[0-9]+x[0-9]+_[0-9a-f]{8}\.png$, with a case-insensitive extension.
+    size_t i = 0;
+    const size_t n = fileName.size();
+    auto isDigit = [](wchar_t c) { return c >= L'0' && c <= L'9'; };
+    auto isHex = [&](wchar_t c) { return isDigit(c) || (c >= L'a' && c <= L'f'); };
+    const size_t wStart = i;
+    while (i < n && isDigit(fileName[i])) ++i;
+    if (i == wStart || i >= n || fileName[i] != L'x') return false;
+    ++i;
+    const size_t hStart = i;
+    while (i < n && isDigit(fileName[i])) ++i;
+    if (i == hStart || i >= n || fileName[i] != L'_') return false;
+    ++i;
+    for (int d = 0; d < 8; ++d, ++i) {
+        if (i >= n || !isHex(fileName[i])) return false;
+    }
+    return n - i == 4 && _wcsicmp(fileName.c_str() + i, L".png") == 0;
 }
 
 int32_t ComputeMipLevelCount(int32_t width, int32_t height) {
@@ -415,8 +463,11 @@ bool LoadDumpManifest(const std::wstring& manPath,
 
         if (!sW.empty()) info.width = std::atoi(sW.c_str());
         if (!sH.empty()) info.height = std::atoi(sH.c_str());
+        // A missing color_key or kind means the entry came from a disk scan: keep it unknown.
+        info.colorKeyKnown = !sColorKey.empty();
         info.colorKey = (sColorKey == "true");
         if (!sMips.empty()) info.mipLevels = std::atoi(sMips.c_str());
+        info.kindKnown = !sKind.empty();
         if (!sKind.empty()) info.kind = sKind;
         if (!sClut.empty()) info.spriteClut = static_cast<uint8_t>(std::atoi(sClut.c_str()));
         if (!sFrame.empty()) info.frameNumber = static_cast<uint32_t>(std::strtoul(sFrame.c_str(), nullptr, 10));
@@ -436,28 +487,50 @@ bool SaveDumpManifest(const std::wstring& manPath,
     if (_wfopen_s(&fp, tmpPath.c_str(), L"wt") != 0 || !fp) {
         return false;
     }
-    std::fprintf(fp, "{\n");
+    bool ok = true;
+    auto put = [&](int written) {
+        if (written < 0) {
+            ok = false;
+        }
+    };
+    put(std::fprintf(fp, "{\n"));
     bool first = true;
     for (const auto& kv : entries) {
         const TextureDumpInfo& e = kv.second;
         if (!first) {
-            std::fprintf(fp, ",\n");
+            put(std::fprintf(fp, ",\n"));
         }
         first = false;
-        std::fprintf(fp, "  \"%s\": {\n", kv.first.c_str());
-        std::fprintf(fp, "    \"width\": %d,\n", e.width);
-        std::fprintf(fp, "    \"height\": %d,\n", e.height);
-        std::fprintf(fp, "    \"color_key\": %s,\n", e.colorKey ? "true" : "false");
-        std::fprintf(fp, "    \"mip_levels\": %d,\n", e.mipLevels);
-        std::fprintf(fp, "    \"kind\": \"%s\",\n", e.kind.c_str());
-        std::fprintf(fp, "    \"sprite_clut\": %u,\n", e.spriteClut);
-        std::fprintf(fp, "    \"first_seen_frame\": %u\n", e.frameNumber);
-        std::fprintf(fp, "  }");
+        put(std::fprintf(fp, "  \"%s\": {\n", kv.first.c_str()));
+        put(std::fprintf(fp, "    \"width\": %d,\n", e.width));
+        put(std::fprintf(fp, "    \"height\": %d,\n", e.height));
+        // Entries recovered from a disk scan leave color_key and kind out: they are unknown.
+        if (e.colorKeyKnown) {
+            put(std::fprintf(fp, "    \"color_key\": %s,\n", e.colorKey ? "true" : "false"));
+        }
+        put(std::fprintf(fp, "    \"mip_levels\": %d,\n", e.mipLevels));
+        if (e.kindKnown) {
+            put(std::fprintf(fp, "    \"kind\": \"%s\",\n", e.kind.c_str()));
+        }
+        put(std::fprintf(fp, "    \"sprite_clut\": %u,\n", e.spriteClut));
+        put(std::fprintf(fp, "    \"first_seen_frame\": %u\n", e.frameNumber));
+        put(std::fprintf(fp, "  }"));
     }
-    std::fprintf(fp, "\n}\n");
-    std::fclose(fp);
-    MoveFileExW(tmpPath.c_str(), manPath.c_str(), MOVEFILE_REPLACE_EXISTING);
-    return true;
+    put(std::fprintf(fp, "\n}\n"));
+    if (std::ferror(fp)) {
+        ok = false;
+    }
+    if (std::fclose(fp) != 0) {
+        ok = false;
+    }
+    if (ok && !MoveFileExW(tmpPath.c_str(), manPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        ok = false;
+    }
+    if (!ok) {
+        // Keep the previous manifest.json and drop the partial tmp file.
+        DeleteFileW(tmpPath.c_str());
+    }
+    return ok;
 }
 
 // -----------------------------------------------------------------------------
@@ -473,7 +546,12 @@ class TextureDumper {
 public:
     TextureDumper() = default;
     ~TextureDumper() {
-        if (!g_isProcessTerminating.load(std::memory_order_relaxed)) {
+        // The global instance is destroyed at DLL detach, under the loader lock. At that point the
+        // worker may already be killed (process exit) and may hold m_mutex, so never join and never
+        // block: a joinable std::thread left in its destructor would call std::terminate.
+        if (g_isProcessTerminating.load()) {
+            StopWithoutBlocking();
+        } else {
             Shutdown();
         }
     }
@@ -493,30 +571,29 @@ public:
         HANDLE hFind = FindFirstFileW(search.c_str(), &fd);
         if (hFind != INVALID_HANDLE_VALUE) {
             do {
-                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                    const std::wstring fn = fd.cFileName;
-                    if (fn.size() > 4) {
-                        const std::wstring ext = fn.substr(fn.size() - 4);
-                        if (_wcsicmp(ext.c_str(), L".png") == 0) {
-                            const std::wstring stem = fn.substr(0, fn.size() - 4);
-                            std::string id;
-                            id.reserve(stem.size());
-                            for (wchar_t ch : stem) {
-                                id.push_back(static_cast<char>(ch));
-                            }
-                            m_dumpedSet.insert(id);
-                            if (m_manifestEntries.find(id) == m_manifestEntries.end()) {
-                                TextureDumpInfo info;
-                                info.id = id;
-                                int w = 0, h = 0;
-                                if (sscanf_s(id.c_str(), "%dx%d_", &w, &h) == 2) {
-                                    info.width = w;
-                                    info.height = h;
-                                }
-                                info.kind = (id.find("x") != std::string::npos && (id.find("_c") != std::string::npos || id.find("_") != std::string::npos)) ? "texture" : "sprite";
-                                m_manifestEntries.emplace(id, info);
-                            }
+                const std::wstring fn = fd.cFileName;
+                // Only <w>x<h>_<crc8>.png files are dumps; stray PNGs are ignored.
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && IsTextureIdPngName(fn)) {
+                    const std::wstring stem = fn.substr(0, fn.size() - 4);
+                    std::string id;
+                    id.reserve(stem.size());
+                    for (wchar_t ch : stem) {
+                        id.push_back(static_cast<char>(ch));
+                    }
+                    m_dumpedSet.insert(id);
+                    if (m_manifestEntries.find(id) == m_manifestEntries.end()) {
+                        // No manifest entry: the size comes from the ID, while color_key and kind
+                        // are unknown and stay out of the written manifest.
+                        TextureDumpInfo info;
+                        info.id = id;
+                        int w = 0, h = 0;
+                        if (sscanf_s(id.c_str(), "%dx%d_", &w, &h) == 2) {
+                            info.width = w;
+                            info.height = h;
                         }
+                        info.colorKeyKnown = false;
+                        info.kindKnown = false;
+                        m_manifestEntries.emplace(id, info);
                     }
                 }
             } while (FindNextFileW(hFind, &fd));
@@ -525,6 +602,7 @@ public:
 
         m_dumpedSessionCount.store(0, std::memory_order_relaxed);
         m_stop = false;
+        m_workerExited = false;
         m_running = true;
         m_worker = std::thread(&TextureDumper::WorkerLoop, this);
     }
@@ -537,12 +615,33 @@ public:
             }
             m_stop = true;
             m_queue.clear();
+            // IDs dropped with the queue must be queueable again after a re-Init.
+            m_queuedSet.clear();
         }
         m_cv.notify_all();
         if (m_worker.joinable()) {
             m_worker.join();
         }
         m_running = false;
+    }
+
+    // DLL-detach path: stop without joining or blocking. Flush the manifest once if m_mutex is
+    // free; a worker killed at process exit may own it, in which case the flush is skipped.
+    void StopWithoutBlocking() {
+        m_stop.store(true);
+        m_cv.notify_all();
+        if (m_running) {
+            std::unique_lock<std::mutex> lock(m_mutex, std::try_to_lock);
+            if (lock.owns_lock()) {
+                const std::unordered_map<std::string, TextureDumpInfo> entries = m_manifestEntries;
+                const std::wstring manPath = m_dumpDir + L"\\manifest.json";
+                lock.unlock();
+                SaveDumpManifest(manPath, entries);
+            }
+        }
+        if (m_worker.joinable()) {
+            m_worker.detach();
+        }
     }
 
     void Queue(const TextureDumpInfo& info, const uint8_t* level0Indices, const uint8_t* palette) {
@@ -583,6 +682,16 @@ public:
         m_cv.notify_one();
     }
 
+    // Test seam: asks the worker to return without joining it, so m_worker stays joinable.
+    void RequestStopForTest() {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_stop = true;
+        }
+        m_cv.notify_all();
+    }
+    bool WorkerExitedForTest() const { return m_workerExited.load(); }
+
     uint32_t GetDumpedCount() const { return m_dumpedSessionCount.load(std::memory_order_relaxed); }
     uint32_t GetQueuedCount() {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -598,7 +707,7 @@ private:
             QueuedDumpItem item;
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
-                m_cv.wait(lock, [this] { return m_stop || !m_queue.empty(); });
+                m_cv.wait(lock, [this] { return m_stop.load() || !m_queue.empty(); });
                 if (m_stop) {
                     break;
                 }
@@ -652,11 +761,13 @@ private:
             finalEntries = m_manifestEntries;
         }
         SaveDumpManifest(m_dumpDir + L"\\manifest.json", finalEntries);
+        m_workerExited.store(true);
     }
 
     std::wstring m_dumpDir;
     bool m_running = false;
-    bool m_stop = false;
+    std::atomic<bool> m_stop{false};
+    std::atomic<bool> m_workerExited{false};
     std::thread m_worker;
     mutable std::mutex m_mutex;
     std::condition_variable m_cv;
@@ -713,14 +824,19 @@ struct DecodedReplacement {
     size_t totalBytes = 0;
     std::vector<std::vector<uint32_t>> mips;
     bool rejected = false;
-    std::string rejectReason;
+    PngLoadResult loadResult = PngLoadResult::Ok;  // SizeRejected or DecodeFailed when rejected
+    bool exceptionLogged = false;                  // the worker already logged the exception
+    HRESULT decodeHr = S_OK;
 };
 
 class TexturePackManager {
 public:
     TexturePackManager() = default;
     ~TexturePackManager() {
-        if (!g_isProcessTerminating.load(std::memory_order_relaxed)) {
+        // Same rule as ~TextureDumper: at DLL detach never join and never take m_mutex.
+        if (g_isProcessTerminating.load()) {
+            StopWithoutBlocking();
+        } else {
             Shutdown();
         }
     }
@@ -770,6 +886,7 @@ public:
         LOG_INFO("TexturePack: %u files indexed", count);
 
         m_stop = false;
+        m_workerExited = false;
         m_running = true;
         m_worker = std::thread(&TexturePackManager::WorkerLoop, this);
     }
@@ -799,6 +916,15 @@ public:
         m_maxMibWarned = false;
     }
 
+    // DLL-detach path: set the stop flag and detach the worker without joining or locking.
+    void StopWithoutBlocking() {
+        m_stop.store(true);
+        m_cv.notify_all();
+        if (m_worker.joinable()) {
+            m_worker.detach();
+        }
+    }
+
     void ClearD3DResources() {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_replacements.clear();
@@ -815,7 +941,21 @@ public:
         return m_indexedFiles.find(id) != m_indexedFiles.end();
     }
 
-    ReplacementTexture* GetOrQueue(const std::string& id, int32_t origW, int32_t origH) {
+    ReplacementState GetState(const std::string& id) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_replacements.find(id) != m_replacements.end()) {
+            return ReplacementState::Ready;
+        }
+        if (m_pendingSet.find(id) != m_pendingSet.end()) {
+            return ReplacementState::Pending;
+        }
+        return ReplacementState::None;
+    }
+
+    ReplacementTexture* GetOrQueue(const std::string& id, int32_t origW, int32_t origH, bool* outPending) {
+        if (outPending) {
+            *outPending = false;
+        }
         std::lock_guard<std::mutex> lock(m_mutex);
         auto itRep = m_replacements.find(id);
         if (itRep != m_replacements.end()) {
@@ -829,6 +969,9 @@ public:
             return nullptr;
         }
         if (m_pendingSet.find(id) != m_pendingSet.end()) {
+            if (outPending) {
+                *outPending = true;
+            }
             return nullptr;
         }
 
@@ -845,6 +988,9 @@ public:
         m_pendingSet.insert(id);
         m_loadQueue.push_back(PackLoadRequest{id, itFile->second, origW, origH});
         m_cv.notify_one();
+        if (outPending) {
+            *outPending = true;
+        }
         return nullptr;
     }
 
@@ -874,8 +1020,17 @@ public:
 
             if (item.rejected) {
                 std::lock_guard<std::mutex> lock(m_mutex);
+                // m_rejectedIds keeps the ID from being queued again, so each line is logged once.
                 m_rejectedIds.insert(item.id);
-                LOG_WARN("TexturePack: %s rejected %s", item.id.c_str(), item.rejectReason.c_str());
+                if (item.exceptionLogged) {
+                    // Already logged by the worker.
+                } else if (item.loadResult == PngLoadResult::SizeRejected) {
+                    LOG_WARN("%s", FormatReplacementRejectLog(item.id, item.width, item.height,
+                                                              item.origW, item.origH).c_str());
+                } else {
+                    LOG_WARN("TexturePack: %s decode failed (0x%08lX)", item.id.c_str(),
+                             static_cast<unsigned long>(item.decodeHr));
+                }
 
                 QueryPerformanceCounter(&now);
                 const double elapsed = static_cast<double>(now.QuadPart - start.QuadPart) / static_cast<double>(freq.QuadPart);
@@ -926,6 +1081,11 @@ public:
                 std::lock_guard<std::mutex> lock(m_mutex);
                 m_rejectedIds.insert(item.id);
                 LOG_WARN("TexturePack: CreateTexture2D failed for %s: 0x%08lX", item.id.c_str(), static_cast<unsigned long>(hr));
+                QueryPerformanceCounter(&now);
+                const double elapsed = static_cast<double>(now.QuadPart - start.QuadPart) / static_cast<double>(freq.QuadPart);
+                if (elapsed >= budgetSec) {
+                    break;
+                }
                 continue;
             }
 
@@ -935,6 +1095,11 @@ public:
                 std::lock_guard<std::mutex> lock(m_mutex);
                 m_rejectedIds.insert(item.id);
                 LOG_WARN("TexturePack: CreateShaderResourceView failed for %s: 0x%08lX", item.id.c_str(), static_cast<unsigned long>(hr));
+                QueryPerformanceCounter(&now);
+                const double elapsed = static_cast<double>(now.QuadPart - start.QuadPart) / static_cast<double>(freq.QuadPart);
+                if (elapsed >= budgetSec) {
+                    break;
+                }
                 continue;
             }
 
@@ -965,6 +1130,16 @@ public:
         }
     }
 
+    // Test seam: asks the worker to return without joining it, so m_worker stays joinable.
+    void RequestStopForTest() {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_stop = true;
+        }
+        m_cv.notify_all();
+    }
+    bool WorkerExitedForTest() const { return m_workerExited.load(); }
+
     TexturePackStats GetStats() {
         std::lock_guard<std::mutex> lock(m_mutex);
         TexturePackStats s;
@@ -984,7 +1159,7 @@ private:
             PackLoadRequest req;
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
-                m_cv.wait(lock, [this] { return m_stop || !m_loadQueue.empty(); });
+                m_cv.wait(lock, [this] { return m_stop.load() || !m_loadQueue.empty(); });
                 if (m_stop) {
                     break;
                 }
@@ -1000,12 +1175,13 @@ private:
             try {
                 std::vector<uint32_t> premulRgba;
                 int32_t w = 0, h = 0, k = 1;
-                if (!LoadRgbaPngWithWic(req.filePath, req.origW, req.origH, w, h, k, premulRgba)) {
+                HRESULT hr = S_OK;
+                item.loadResult = LoadRgbaPngWithWicEx(req.filePath, req.origW, req.origH, w, h, k, premulRgba, hr);
+                if (item.loadResult != PngLoadResult::Ok) {
                     item.rejected = true;
-                    char buf[128];
-                    std::snprintf(buf, sizeof(buf), "(replacement is not a power-of-two multiple of %dx%d or invalid)",
-                                  req.origW, req.origH);
-                    item.rejectReason = buf;
+                    item.width = w;   // the PNG size for SizeRejected
+                    item.height = h;
+                    item.decodeHr = hr;
                 } else {
                     item.width = w;
                     item.height = h;
@@ -1020,11 +1196,11 @@ private:
                 }
             } catch (const std::bad_alloc&) {
                 item.rejected = true;
-                item.rejectReason = "out of memory (bad_alloc)";
+                item.exceptionLogged = true;
                 LOG_ERROR("TexturePack: bad_alloc loading %s", req.id.c_str());
             } catch (const std::exception& e) {
                 item.rejected = true;
-                item.rejectReason = e.what();
+                item.exceptionLogged = true;
                 LOG_ERROR("TexturePack: exception loading %s: %s", req.id.c_str(), e.what());
             }
 
@@ -1037,13 +1213,15 @@ private:
         if (needUninit) {
             CoUninitialize();
         }
+        m_workerExited.store(true);
     }
 
     std::wstring m_packDir;
     int32_t m_maxMiB = 512;
     int32_t m_decodeBudgetMs = 4;
     bool m_running = false;
-    bool m_stop = false;
+    std::atomic<bool> m_stop{false};
+    std::atomic<bool> m_workerExited{false};
     bool m_maxMibWarned = false;
     size_t m_totalAllocatedBytes = 0;
 
@@ -1083,7 +1261,16 @@ uint64_t TexturePackGetGeneration() {
 }
 
 ReplacementTexture* TexturePackGetOrQueue(const std::string& id, int32_t origW, int32_t origH) {
-    return g_texturePackManager.GetOrQueue(id, origW, origH);
+    return g_texturePackManager.GetOrQueue(id, origW, origH, nullptr);
+}
+
+ReplacementTexture* TexturePackGetOrQueue(const std::string& id, int32_t origW, int32_t origH,
+                                          bool* outPending) {
+    return g_texturePackManager.GetOrQueue(id, origW, origH, outPending);
+}
+
+ReplacementState TexturePackGetState(const std::string& id) {
+    return g_texturePackManager.GetState(id);
 }
 
 TexturePackStats TexturePackGetStats() {
@@ -1092,4 +1279,41 @@ TexturePackStats TexturePackGetStats() {
 
 bool TexturePackHasIndexed(const std::string& id) {
     return g_texturePackManager.HasIndexed(id);
+}
+
+// -----------------------------------------------------------------------------
+// Test seam for the DLL-detach destructor path
+// -----------------------------------------------------------------------------
+
+bool TexturePackTestDestroyAtProcessExit(const std::wstring& dir) {
+    TextureDumper* dumper = new TextureDumper();
+    TexturePackManager* pack = new TexturePackManager();
+    dumper->Init(dir);
+    pack->Init(dir, 16, 4);
+
+    // A thread killed by the OS at process exit leaves its std::thread joinable. Reproduce that
+    // state in-process: let both workers return on their own, but never join them.
+    dumper->RequestStopForTest();
+    pack->RequestStopForTest();
+    bool exited = false;
+    for (int i = 0; i < 500; ++i) {
+        if (dumper->WorkerExitedForTest() && pack->WorkerExitedForTest()) {
+            exited = true;
+            break;
+        }
+        Sleep(10);
+    }
+    if (!exited) {
+        // Leak both objects: destroying them under a running worker would be undefined behaviour.
+        return false;
+    }
+    // The worker set its exit flag as its last member access; let the thread leave its function.
+    Sleep(50);
+
+    const bool wasTerminating = g_isProcessTerminating.load();
+    g_isProcessTerminating.store(true);
+    delete pack;
+    delete dumper;
+    g_isProcessTerminating.store(wasTerminating);
+    return true;
 }
