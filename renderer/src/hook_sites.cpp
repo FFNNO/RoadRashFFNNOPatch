@@ -204,7 +204,7 @@ void RecordFrameAndLogFps(bool presentedByD3D) {
                      TextureDumpGetDumpedCount(),
                      TextureDumpGetQueuedCount());
         }
-        if (GetConfig().texturePackEnabled) {
+        if (GetConfig().gpuWorld && GetConfig().texturePackEnabled) {
             const TexturePackStats stats = TexturePackGetStats();
             LOG_INFO("TexturePack: %u loaded, %u pending, %u rejected (%.2f MiB)",
                      stats.loadedCount,

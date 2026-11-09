@@ -7,6 +7,7 @@
 #include "exe_identity.h"
 #include "hook_sites.h"
 #include "capture.h"
+#include "texture_pack.h"
 
 static HMODULE g_hModule = nullptr;
 static HMODULE g_systemDDraw = nullptr;
@@ -132,7 +133,9 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         g_hModule = hinstDLL;
     } else if (fdwReason == DLL_PROCESS_DETACH) {
         // Never call FreeLibrary or unpatch code under the loader lock.
-        if (lpvReserved == nullptr) {
+        if (lpvReserved != nullptr) {
+            TexturePackSetProcessTerminating();
+        } else {
             LogClose();
         }
     }

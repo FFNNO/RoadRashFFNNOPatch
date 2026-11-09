@@ -1076,9 +1076,12 @@ private:
 
     // Returns the SRV of the quad's texture; *outLevels receives its uploaded mip level count.
     ID3D11ShaderResourceView* GetOrCreateWorldTextureSRV(const CapturedQuad& q, const uint8_t* palette,
-                                                         int32_t* outLevels) {
+                                                         int32_t* outLevels, int32_t* outK = nullptr) {
         if (outLevels) {
             *outLevels = 1;
+        }
+        if (outK) {
+            *outK = 1;
         }
         if (q.pdatPtr == 0 || q.texWidth <= 0 || q.texHeight <= 0) {
             return m_srvWhite.Get();
@@ -1094,26 +1097,49 @@ private:
             if (outLevels) {
                 *outLevels = it->second.levels;
             }
+            if (outK) {
+                *outK = it->second.k;
+            }
             return it->second.srv.Get();
+        }
+
+        if (GetConfig().texturePackDump) {
+            TextureMipChainView chain;
+            if (CaptureLookupTextureMipChain(q.pdatPtr, q.level0Crc32, chain) && chain.levels > 0 &&
+                chain.width[0] > 0 && chain.height[0] > 0) {
+                TextureDumpInfo dumpInfo;
+                dumpInfo.id = FormatTextureId(q.texWidth, q.texHeight, q.level0Crc32);
+                dumpInfo.width = chain.width[0];
+                dumpInfo.height = chain.height[0];
+                dumpInfo.colorKey = colorKey;
+                dumpInfo.mipLevels = q.mipLevels;
+                dumpInfo.kind = ((q.pdatFlags & 0x2000u) != 0) ? "sprite" : "texture";
+                dumpInfo.spriteClut = q.spriteClut;
+                dumpInfo.frameNumber = CaptureGetFrameNumber();
+                TextureDumpQueue(dumpInfo, chain.pixels[0], palette);
+            }
+        }
+
+        if (GetConfig().texturePackEnabled) {
+            const std::string texPackId = FormatTextureId(q.texWidth, q.texHeight, q.level0Crc32);
+            ReplacementTexture* rep = TexturePackGetOrQueue(texPackId, q.texWidth, q.texHeight);
+            if (rep && rep->srv) {
+                if (outLevels) {
+                    *outLevels = rep->levels;
+                }
+                if (outK) {
+                    *outK = rep->k;
+                }
+                ID3D11ShaderResourceView* rawSrv = rep->srv.Get();
+                m_worldTexSrvCache.emplace(srvKey, CachedWorldTexture{rep->srv, rep->levels, rep->k});
+                return rawSrv;
+            }
         }
 
         TextureMipChainView chain;
         if (!CaptureLookupTextureMipChain(q.pdatPtr, q.level0Crc32, chain) || chain.levels <= 0 ||
             chain.width[0] <= 0 || chain.height[0] <= 0) {
             return m_srvWhite.Get();
-        }
-
-        if (GetConfig().texturePackDump) {
-            TextureDumpInfo dumpInfo;
-            dumpInfo.id = FormatTextureId(q.texWidth, q.texHeight, q.level0Crc32);
-            dumpInfo.width = chain.width[0];
-            dumpInfo.height = chain.height[0];
-            dumpInfo.colorKey = colorKey;
-            dumpInfo.mipLevels = q.mipLevels;
-            dumpInfo.kind = ((q.pdatFlags & 0x2000u) != 0) ? "sprite" : "texture";
-            dumpInfo.spriteClut = q.spriteClut;
-            dumpInfo.frameNumber = CaptureGetFrameNumber();
-            TextureDumpQueue(dumpInfo, chain.pixels[0], palette);
         }
         // MipFilter=chosen keeps the B4 single level; trilinear uploads every engine level.
         const int32_t levels = (GetConfig().mipFilter == MipFilter::Trilinear) ? chain.levels : 1;
@@ -1173,7 +1199,7 @@ private:
             *outLevels = levels;
         }
         ID3D11ShaderResourceView* rawSrv = srv.Get();
-        m_worldTexSrvCache.emplace(srvKey, CachedWorldTexture{std::move(srv), levels});
+        m_worldTexSrvCache.emplace(srvKey, CachedWorldTexture{std::move(srv), levels, 1});
         return rawSrv;
     }
 
@@ -1258,10 +1284,13 @@ private:
         }
 
         const uint32_t curGen = CaptureGetCacheGeneration();
-        if (curGen != m_cachedWorldGen || std::memcmp(m_cachedPalette, palette, 1024) != 0) {
+        const uint64_t tpGen = TexturePackGetGeneration();
+        if (curGen != m_cachedWorldGen || tpGen != m_cachedTexPackGen ||
+            std::memcmp(m_cachedPalette, palette, 1024) != 0) {
             m_worldTexSrvCache.clear();
             std::memcpy(m_cachedPalette, palette, 1024);
             m_cachedWorldGen = curGen;
+            m_cachedTexPackGen = tpGen;
         }
 
         m_context->OMSetRenderTargets(1, m_rtvWorld.GetAddressOf(), nullptr);
@@ -1423,20 +1452,7 @@ private:
             } else {
                 int32_t texLevels = 1;
                 int32_t k = 1;
-                srv = nullptr;
-                const std::string texPackId = FormatTextureId(q.texWidth, q.texHeight, q.level0Crc32);
-                if (GetConfig().texturePackEnabled) {
-                    ReplacementTexture* rep = TexturePackGetOrQueue(texPackId, q.texWidth, q.texHeight);
-                    if (rep && rep->srv) {
-                        srv = rep->srv.Get();
-                        texLevels = rep->levels;
-                        k = rep->k;
-                    }
-                }
-                if (!srv) {
-                    srv = GetOrCreateWorldTextureSRV(q, palette, &texLevels);
-                    k = 1;
-                }
+                srv = GetOrCreateWorldTextureSRV(q, palette, &texLevels, &k);
                 const float texW = static_cast<float>(std::max(1, q.texWidth));
                 const float texH = static_cast<float>(std::max(1, q.texHeight));
 
@@ -1734,10 +1750,12 @@ private:
     struct CachedWorldTexture {
         ComPtr<ID3D11ShaderResourceView> srv;
         int32_t levels = 1;
+        int32_t k = 1;
     };
     std::unordered_map<uint64_t, CachedWorldTexture> m_worldTexSrvCache;
     uint8_t m_cachedPalette[1024] = {};
     uint64_t m_cachedWorldGen = 0;
+    uint64_t m_cachedTexPackGen = 0;
     std::vector<uint32_t> m_tempRgbaUpload;
     std::vector<WorldVertex> m_worldVerts;
     std::vector<WorldDrawBatch> m_worldBatches;

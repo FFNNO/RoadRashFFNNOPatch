@@ -1288,6 +1288,84 @@ int main() {
               "Normalized uv_box at level 2 of k=4 replacement exactly recovers original level 0 clamp range");
     }
 
+    // 10. Dump manifest round-trip and persistence test (B6 review Blocker 1).
+    {
+        wchar_t tempDir[MAX_PATH] = {};
+        GetTempPathW(MAX_PATH, tempDir);
+        const std::wstring testManPath = std::wstring(tempDir) + L"test_manifest_" +
+                                         std::to_wstring(GetCurrentProcessId()) + L".json";
+        DeleteFileW(testManPath.c_str());
+
+        std::unordered_map<std::string, TextureDumpInfo> entriesA;
+        TextureDumpInfo itemA;
+        itemA.id = "32x67_c1968fce";
+        itemA.width = 32;
+        itemA.height = 67;
+        itemA.colorKey = true;
+        itemA.mipLevels = 1;
+        itemA.kind = "texture";
+        itemA.spriteClut = 0;
+        itemA.frameNumber = 12;
+        entriesA.emplace(itemA.id, itemA);
+
+        const bool save1Ok = SaveDumpManifest(testManPath, entriesA);
+        Check(save1Ok, "SaveDumpManifest successfully writes initial manifest");
+
+        std::unordered_map<std::string, TextureDumpInfo> loadedEntries1;
+        std::unordered_set<std::string> loadedDumped1;
+        const bool load1Ok = LoadDumpManifest(testManPath, loadedEntries1, loadedDumped1);
+        Check(load1Ok, "LoadDumpManifest successfully parses manifest");
+        Check(loadedEntries1.size() == 1, "LoadDumpManifest parsed exactly 1 entry");
+        Check(loadedDumped1.find("32x67_c1968fce") != loadedDumped1.end(), "Entry A is in dumped set");
+        auto itA = loadedEntries1.find("32x67_c1968fce");
+        const bool matchA = (itA != loadedEntries1.end() &&
+                             itA->second.width == 32 &&
+                             itA->second.height == 67 &&
+                             itA->second.colorKey == true &&
+                             itA->second.mipLevels == 1 &&
+                             itA->second.kind == "texture" &&
+                             itA->second.spriteClut == 0 &&
+                             itA->second.frameNumber == 12);
+        Check(matchA, "Loaded entry A metadata fields exactly match saved fields");
+
+        // Add entry B and re-save
+        TextureDumpInfo itemB;
+        itemB.id = "256x32_e2819544";
+        itemB.width = 256;
+        itemB.height = 32;
+        itemB.colorKey = false;
+        itemB.mipLevels = 3;
+        itemB.kind = "sprite";
+        itemB.spriteClut = 5;
+        itemB.frameNumber = 42;
+        loadedEntries1.emplace(itemB.id, itemB);
+
+        const bool save2Ok = SaveDumpManifest(testManPath, loadedEntries1);
+        Check(save2Ok, "SaveDumpManifest successfully appends and writes updated manifest");
+
+        std::unordered_map<std::string, TextureDumpInfo> loadedEntries2;
+        std::unordered_set<std::string> loadedDumped2;
+        const bool load2Ok = LoadDumpManifest(testManPath, loadedEntries2, loadedDumped2);
+        Check(load2Ok, "LoadDumpManifest re-loads updated manifest");
+        Check(loadedEntries2.size() == 2, "LoadDumpManifest parsed exactly 2 entries");
+        Check(loadedDumped2.find("32x67_c1968fce") != loadedDumped2.end() &&
+              loadedDumped2.find("256x32_e2819544") != loadedDumped2.end(),
+              "Both entries A and B are present in dumped set");
+
+        auto itB = loadedEntries2.find("256x32_e2819544");
+        const bool matchB = (itB != loadedEntries2.end() &&
+                             itB->second.width == 256 &&
+                             itB->second.height == 32 &&
+                             itB->second.colorKey == false &&
+                             itB->second.mipLevels == 3 &&
+                             itB->second.kind == "sprite" &&
+                             itB->second.spriteClut == 5 &&
+                             itB->second.frameNumber == 42);
+        Check(matchB, "Loaded entry B metadata fields exactly match saved fields");
+
+        DeleteFileW(testManPath.c_str());
+    }
+
     // PNG and JSON writer unit tests (B3 item 5).
     RunCaptureWritersTest();
 

@@ -169,7 +169,9 @@ void ConfigInit(const std::wstring& iniFilePath) {
     g_config.texturePackPath = tpPathBuf;
 
     INT tpMaxMiB = static_cast<INT>(GetPrivateProfileIntW(L"TexturePack", L"MaxMiB", 512, iniFilePath.c_str()));
-    g_config.texturePackMaxMiB = (tpMaxMiB < 16) ? 16 : tpMaxMiB;
+    if (tpMaxMiB < 16) tpMaxMiB = 16;
+    if (tpMaxMiB > 2048) tpMaxMiB = 2048;
+    g_config.texturePackMaxMiB = tpMaxMiB;
 
     INT tpBudget = static_cast<INT>(GetPrivateProfileIntW(L"TexturePack", L"DecodeBudgetMs", 4, iniFilePath.c_str()));
     g_config.texturePackDecodeBudgetMs = (tpBudget < 1) ? 1 : tpBudget;

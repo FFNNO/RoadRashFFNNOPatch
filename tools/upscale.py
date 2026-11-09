@@ -84,27 +84,40 @@ def upscale_image(im: Image.Image, scale: int = 4, color_key: bool = True,
     arr = np.array(im)
 
     if external_cmd:
+        rgb = arr[..., :3] if arr.shape[-1] >= 3 else np.repeat(arr[..., :1], 3, axis=-1)
+        if color_key and arr.shape[-1] >= 4:
+            alpha = arr[..., 3]
+            mask = alpha > 0
+            if not np.all(mask) and np.any(mask):
+                rgb_to_save = bleed_colors(rgb, mask)
+            else:
+                rgb_to_save = rgb
+        else:
+            rgb_to_save = rgb
+
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_in = os.path.join(tmp_dir, "input.png")
             tmp_out = os.path.join(tmp_dir, "output.png")
-            im.save(tmp_in, format="PNG")
+            Image.fromarray(rgb_to_save, "RGB").save(tmp_in, format="PNG")
 
-            cmd = external_cmd.format(input=tmp_in, output=tmp_out, **{"in": tmp_in, "out": tmp_out})
+            quoted_in = f'"{tmp_in}"'
+            quoted_out = f'"{tmp_out}"'
+            cmd = external_cmd.replace("{in}", quoted_in).replace("{out}", quoted_out)\
+                              .replace("{input}", quoted_in).replace("{output}", quoted_out)
             subprocess.run(cmd, shell=True, check=True)
 
-            out_im = Image.open(tmp_out).convert("RGBA")
+            out_im = Image.open(tmp_out).convert("RGB")
             if out_im.size != (target_w, target_h):
                 out_im = out_im.resize((target_w, target_h), Image.Resampling.LANCZOS)
 
-            out_arr = np.array(out_im)
-            rgb_up = Image.fromarray(out_arr[..., :3], "RGB")
-            if not color_key:
+            if not color_key or arr.shape[-1] < 4:
                 alpha_up = Image.new("L", (target_w, target_h), 255)
             else:
-                alpha_raw = out_arr[..., 3]
-                alpha_thresh = np.where(alpha_raw >= 128, 255, 0).astype(np.uint8)
+                alpha_img = Image.fromarray(arr[..., 3], "L")
+                alpha_up_raw = np.array(alpha_img.resize((target_w, target_h), Image.Resampling.LANCZOS))
+                alpha_thresh = np.where(alpha_up_raw >= 128, 255, 0).astype(np.uint8)
                 alpha_up = Image.fromarray(alpha_thresh, "L")
-            return Image.merge("RGBA", (*rgb_up.split(), alpha_up))
+            return Image.merge("RGBA", (*out_im.split(), alpha_up))
 
     if not color_key or arr.shape[-1] < 4:
         rgb = arr[..., :3] if arr.shape[-1] >= 3 else np.repeat(arr[..., :1], 3, axis=-1)
@@ -174,6 +187,14 @@ def run_self_test():
     opaque_strip = arr_strip[arr_strip[..., 3] == 255]
     min_strip_out = opaque_strip[:, :3].min(axis=0)
     assert (min_strip_out >= [180 - 5, 120 - 5, 60 - 5]).all(), f"Strip fringe: {min_strip_out}"
+
+    # 4. External mock tool: verifies argument replacement, quoting, and binary alpha preservation
+    py_exec = sys.executable.replace("\\", "/")
+    mock_cmd = f'"{py_exec}" -c "import sys; from PIL import Image; Image.open(sys.argv[1]).resize((64, 64)).save(sys.argv[2])" {{in}} {{out}}'
+    up_ext = upscale_image(im_hole, scale=scale, color_key=True, external_cmd=mock_cmd)
+    arr_ext = np.array(up_ext)
+    assert arr_ext.shape == (64, 64, 4), f"Expected (64, 64, 4), got {arr_ext.shape}"
+    assert set(np.unique(arr_ext[..., 3])).issubset({0, 255}), "External alpha must be binary"
 
     print("upscale self-test: OK")
 

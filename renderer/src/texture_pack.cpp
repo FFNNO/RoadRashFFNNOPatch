@@ -6,6 +6,7 @@
 #include <cstring>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -13,10 +14,32 @@
 #include <unordered_map>
 #include <unordered_set>
 
+static std::atomic<bool> g_isProcessTerminating{false};
+
+void TexturePackSetProcessTerminating() {
+    g_isProcessTerminating.store(true, std::memory_order_relaxed);
+}
+
 std::string FormatTextureId(int32_t width, int32_t height, uint32_t level0Crc32) {
     char buf[64];
     std::snprintf(buf, sizeof(buf), "%dx%d_%08x", width, height, level0Crc32);
     return std::string(buf);
+}
+
+static void CreateDirectoryRecursive(const std::wstring& path) {
+    if (path.empty()) {
+        return;
+    }
+    wchar_t buf[MAX_PATH];
+    wcsncpy_s(buf, path.c_str(), _TRUNCATE);
+    for (wchar_t* p = buf + 1; *p; ++p) {
+        if (*p == L'\\' || *p == L'/') {
+            *p = 0;
+            CreateDirectoryW(buf, nullptr);
+            *p = L'\\';
+        }
+    }
+    CreateDirectoryW(buf, nullptr);
 }
 
 bool ValidateMipLevelPointer(const void* ptr, int32_t width, int32_t height, int32_t level) {
@@ -37,7 +60,12 @@ bool ValidateMipLevelPointer(const void* ptr, int32_t width, int32_t height, int
     if (mbi.State != MEM_COMMIT) {
         return false;
     }
-    if ((mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) == 0) {
+    if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) {
+        return false;
+    }
+    const DWORD readableMask = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                               PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if ((mbi.Protect & readableMask) == 0) {
         return false;
     }
     const uintptr_t start = reinterpret_cast<uintptr_t>(ptr);
@@ -85,8 +113,25 @@ bool SaveRgbaPngWithWic(const std::wstring& path, int32_t width, int32_t height,
                                         if (SUCCEEDED(hr)) {
                                             const UINT stride = static_cast<UINT>(width * 4);
                                             const UINT bufSize = static_cast<UINT>(width * height * 4);
-                                            hr = frame->WritePixels(static_cast<UINT>(height), stride, bufSize,
-                                                                    reinterpret_cast<BYTE*>(const_cast<uint32_t*>(rgbaPixels)));
+                                            if (IsEqualGUID(format, GUID_WICPixelFormat32bppRGBA)) {
+                                                hr = frame->WritePixels(static_cast<UINT>(height), stride, bufSize,
+                                                                        reinterpret_cast<BYTE*>(const_cast<uint32_t*>(rgbaPixels)));
+                                            } else if (IsEqualGUID(format, GUID_WICPixelFormat32bppBGRA)) {
+                                                std::vector<uint32_t> bgraPixels(static_cast<size_t>(width) * height);
+                                                const size_t total = static_cast<size_t>(width) * height;
+                                                for (size_t i = 0; i < total; ++i) {
+                                                    const uint32_t px = rgbaPixels[i];
+                                                    const uint32_t r = px & 0xFFu;
+                                                    const uint32_t g = (px >> 8) & 0xFFu;
+                                                    const uint32_t b = (px >> 16) & 0xFFu;
+                                                    const uint32_t a = (px >> 24) & 0xFFu;
+                                                    bgraPixels[i] = b | (g << 8) | (r << 16) | (a << 24);
+                                                }
+                                                hr = frame->WritePixels(static_cast<UINT>(height), stride, bufSize,
+                                                                        reinterpret_cast<BYTE*>(bgraPixels.data()));
+                                            } else {
+                                                hr = E_FAIL;
+                                            }
                                             if (SUCCEEDED(hr)) {
                                                 hr = frame->Commit();
                                                 if (SUCCEEDED(hr)) {
@@ -139,9 +184,27 @@ void ConvertToPremultipliedRgba(const uint8_t* srcRgba, int32_t width, int32_t h
     }
 }
 
-bool LoadRgbaPngWithWic(const std::wstring& path, int32_t& outW, int32_t& outH, std::vector<uint32_t>& outPremulRgba) {
+bool ValidateReplacementDimensions(int32_t origW, int32_t origH, int32_t replW, int32_t replH, int32_t& outK) {
+    outK = 1;
+    if (origW <= 0 || origH <= 0 || replW <= 0 || replH <= 0) {
+        return false;
+    }
+    const int32_t candidateK[4] = {1, 2, 4, 8};
+    for (int32_t k : candidateK) {
+        if (replW == origW * k && replH == origH * k) {
+            outK = k;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool LoadRgbaPngWithWic(const std::wstring& path, int32_t origW, int32_t origH,
+                        int32_t& outW, int32_t& outH, int32_t& outK,
+                        std::vector<uint32_t>& outPremulRgba) {
     outW = 0;
     outH = 0;
+    outK = 1;
     outPremulRgba.clear();
 
     HRESULT hrCom = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -163,22 +226,35 @@ bool LoadRgbaPngWithWic(const std::wstring& path, int32_t& outW, int32_t& outH, 
                     UINT w = 0, h = 0;
                     hr = frame->GetSize(&w, &h);
                     if (SUCCEEDED(hr) && w > 0 && h > 0) {
-                        ComPtr<IWICFormatConverter> converter;
-                        hr = factory->CreateFormatConverter(&converter);
-                        if (SUCCEEDED(hr)) {
-                            hr = converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppRGBA,
-                                                       WICBitmapDitherTypeNone, nullptr, 0.0,
-                                                       WICBitmapPaletteTypeCustom);
+                        const int32_t imgW = static_cast<int32_t>(w);
+                        const int32_t imgH = static_cast<int32_t>(h);
+                        int32_t matchedK = 1;
+                        bool sizeValid = true;
+                        if (origW > 0 && origH > 0) {
+                            sizeValid = ValidateReplacementDimensions(origW, origH, imgW, imgH, matchedK);
+                        } else if (imgW > 8192 || imgH > 8192) {
+                            sizeValid = false;
+                        }
+
+                        if (sizeValid) {
+                            outK = matchedK;
+                            ComPtr<IWICFormatConverter> converter;
+                            hr = factory->CreateFormatConverter(&converter);
                             if (SUCCEEDED(hr)) {
-                                std::vector<uint8_t> rawPixels(static_cast<size_t>(w) * h * 4);
-                                const UINT stride = w * 4;
-                                hr = converter->CopyPixels(nullptr, stride, static_cast<UINT>(rawPixels.size()), rawPixels.data());
+                                hr = converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppRGBA,
+                                                           WICBitmapDitherTypeNone, nullptr, 0.0,
+                                                           WICBitmapPaletteTypeCustom);
                                 if (SUCCEEDED(hr)) {
-                                    outW = static_cast<int32_t>(w);
-                                    outH = static_cast<int32_t>(h);
-                                    outPremulRgba.resize(static_cast<size_t>(w) * h);
-                                    ConvertToPremultipliedRgba(rawPixels.data(), outW, outH, outPremulRgba.data());
-                                    success = true;
+                                    std::vector<uint8_t> rawPixels(static_cast<size_t>(w) * h * 4);
+                                    const UINT stride = w * 4;
+                                    hr = converter->CopyPixels(nullptr, stride, static_cast<UINT>(rawPixels.size()), rawPixels.data());
+                                    if (SUCCEEDED(hr)) {
+                                        outW = imgW;
+                                        outH = imgH;
+                                        outPremulRgba.resize(static_cast<size_t>(w) * h);
+                                        ConvertToPremultipliedRgba(rawPixels.data(), outW, outH, outPremulRgba.data());
+                                        success = true;
+                                    }
                                 }
                             }
                         }
@@ -192,21 +268,6 @@ bool LoadRgbaPngWithWic(const std::wstring& path, int32_t& outW, int32_t& outH, 
         CoUninitialize();
     }
     return success;
-}
-
-bool ValidateReplacementDimensions(int32_t origW, int32_t origH, int32_t replW, int32_t replH, int32_t& outK) {
-    outK = 1;
-    if (origW <= 0 || origH <= 0 || replW <= 0 || replH <= 0) {
-        return false;
-    }
-    const int32_t candidateK[4] = {1, 2, 4, 8};
-    for (int32_t k : candidateK) {
-        if (replW == origW * k && replH == origH * k) {
-            outK = k;
-            return true;
-        }
-    }
-    return false;
 }
 
 int32_t ComputeMipLevelCount(int32_t width, int32_t height) {
@@ -268,6 +329,138 @@ bool GeneratePremultipliedMipChain(int32_t baseW, int32_t baseH, const uint32_t*
 }
 
 // -----------------------------------------------------------------------------
+// Manifest file helpers
+// -----------------------------------------------------------------------------
+
+bool LoadDumpManifest(const std::wstring& manPath,
+                      std::unordered_map<std::string, TextureDumpInfo>& entries,
+                      std::unordered_set<std::string>& dumpedSet) {
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, manPath.c_str(), L"rt") != 0 || !fp) {
+        return false;
+    }
+    std::fseek(fp, 0, SEEK_END);
+    const long sz = std::ftell(fp);
+    std::fseek(fp, 0, SEEK_SET);
+    if (sz <= 0) {
+        std::fclose(fp);
+        return false;
+    }
+    std::vector<char> buf(static_cast<size_t>(sz) + 1, 0);
+    std::fread(buf.data(), 1, static_cast<size_t>(sz), fp);
+    std::fclose(fp);
+
+    const std::string content(buf.data());
+    size_t pos = 0;
+    while (pos < content.size()) {
+        size_t q1 = content.find('"', pos);
+        if (q1 == std::string::npos) break;
+        size_t q2 = content.find('"', q1 + 1);
+        if (q2 == std::string::npos) break;
+        std::string key = content.substr(q1 + 1, q2 - q1 - 1);
+
+        size_t colon = content.find(':', q2 + 1);
+        if (colon == std::string::npos) break;
+        size_t brace = content.find('{', colon + 1);
+        if (brace == std::string::npos) break;
+
+        bool isSection = true;
+        for (size_t i = q2 + 1; i < colon; ++i) {
+            if (!isspace(static_cast<unsigned char>(content[i]))) { isSection = false; break; }
+        }
+        for (size_t i = colon + 1; i < brace; ++i) {
+            if (!isspace(static_cast<unsigned char>(content[i]))) { isSection = false; break; }
+        }
+        if (!isSection) {
+            pos = q2 + 1;
+            continue;
+        }
+
+        size_t endBrace = content.find('}', brace + 1);
+        if (endBrace == std::string::npos) break;
+        std::string block = content.substr(brace, endBrace - brace + 1);
+
+        TextureDumpInfo info;
+        info.id = key;
+
+        auto parseField = [&](const char* fieldName) -> std::string {
+            std::string pat = std::string("\"") + fieldName + "\"";
+            size_t fpos = block.find(pat);
+            if (fpos == std::string::npos) return "";
+            size_t fcol = block.find(':', fpos + pat.size());
+            if (fcol == std::string::npos) return "";
+            size_t valStart = fcol + 1;
+            while (valStart < block.size() && isspace(static_cast<unsigned char>(block[valStart]))) ++valStart;
+            if (valStart >= block.size()) return "";
+            if (block[valStart] == '"') {
+                size_t valEnd = block.find('"', valStart + 1);
+                if (valEnd == std::string::npos) return "";
+                return block.substr(valStart + 1, valEnd - valStart - 1);
+            } else {
+                size_t valEnd = valStart;
+                while (valEnd < block.size() && block[valEnd] != ',' && block[valEnd] != '\n' && block[valEnd] != '}') ++valEnd;
+                std::string v = block.substr(valStart, valEnd - valStart);
+                while (!v.empty() && isspace(static_cast<unsigned char>(v.back()))) v.pop_back();
+                return v;
+            }
+        };
+
+        std::string sW = parseField("width");
+        std::string sH = parseField("height");
+        std::string sColorKey = parseField("color_key");
+        std::string sMips = parseField("mip_levels");
+        std::string sKind = parseField("kind");
+        std::string sClut = parseField("sprite_clut");
+        std::string sFrame = parseField("first_seen_frame");
+
+        if (!sW.empty()) info.width = std::atoi(sW.c_str());
+        if (!sH.empty()) info.height = std::atoi(sH.c_str());
+        info.colorKey = (sColorKey == "true");
+        if (!sMips.empty()) info.mipLevels = std::atoi(sMips.c_str());
+        if (!sKind.empty()) info.kind = sKind;
+        if (!sClut.empty()) info.spriteClut = static_cast<uint8_t>(std::atoi(sClut.c_str()));
+        if (!sFrame.empty()) info.frameNumber = static_cast<uint32_t>(std::strtoul(sFrame.c_str(), nullptr, 10));
+
+        entries[key] = info;
+        dumpedSet.insert(key);
+
+        pos = endBrace + 1;
+    }
+    return true;
+}
+
+bool SaveDumpManifest(const std::wstring& manPath,
+                      const std::unordered_map<std::string, TextureDumpInfo>& entries) {
+    const std::wstring tmpPath = manPath + L".tmp";
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, tmpPath.c_str(), L"wt") != 0 || !fp) {
+        return false;
+    }
+    std::fprintf(fp, "{\n");
+    bool first = true;
+    for (const auto& kv : entries) {
+        const TextureDumpInfo& e = kv.second;
+        if (!first) {
+            std::fprintf(fp, ",\n");
+        }
+        first = false;
+        std::fprintf(fp, "  \"%s\": {\n", kv.first.c_str());
+        std::fprintf(fp, "    \"width\": %d,\n", e.width);
+        std::fprintf(fp, "    \"height\": %d,\n", e.height);
+        std::fprintf(fp, "    \"color_key\": %s,\n", e.colorKey ? "true" : "false");
+        std::fprintf(fp, "    \"mip_levels\": %d,\n", e.mipLevels);
+        std::fprintf(fp, "    \"kind\": \"%s\",\n", e.kind.c_str());
+        std::fprintf(fp, "    \"sprite_clut\": %u,\n", e.spriteClut);
+        std::fprintf(fp, "    \"first_seen_frame\": %u\n", e.frameNumber);
+        std::fprintf(fp, "  }");
+    }
+    std::fprintf(fp, "\n}\n");
+    std::fclose(fp);
+    MoveFileExW(tmpPath.c_str(), manPath.c_str(), MOVEFILE_REPLACE_EXISTING);
+    return true;
+}
+
+// -----------------------------------------------------------------------------
 // Texture Dumper worker thread implementation
 // -----------------------------------------------------------------------------
 
@@ -279,7 +472,11 @@ struct QueuedDumpItem {
 class TextureDumper {
 public:
     TextureDumper() = default;
-    ~TextureDumper() { Shutdown(); }
+    ~TextureDumper() {
+        if (!g_isProcessTerminating.load(std::memory_order_relaxed)) {
+            Shutdown();
+        }
+    }
 
     void Init(const std::wstring& dumpDir) {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -287,8 +484,46 @@ public:
             return;
         }
         m_dumpDir = dumpDir;
-        CreateDirectoryW(dumpDir.c_str(), nullptr);
-        LoadManifest();
+        CreateDirectoryRecursive(dumpDir);
+        LoadDumpManifest(m_dumpDir + L"\\manifest.json", m_manifestEntries, m_dumpedSet);
+
+        // Scan existing PNGs on disk in dumpDir to avoid re-dumping:
+        const std::wstring search = m_dumpDir + L"\\*.png";
+        WIN32_FIND_DATAW fd = {};
+        HANDLE hFind = FindFirstFileW(search.c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                    const std::wstring fn = fd.cFileName;
+                    if (fn.size() > 4) {
+                        const std::wstring ext = fn.substr(fn.size() - 4);
+                        if (_wcsicmp(ext.c_str(), L".png") == 0) {
+                            const std::wstring stem = fn.substr(0, fn.size() - 4);
+                            std::string id;
+                            id.reserve(stem.size());
+                            for (wchar_t ch : stem) {
+                                id.push_back(static_cast<char>(ch));
+                            }
+                            m_dumpedSet.insert(id);
+                            if (m_manifestEntries.find(id) == m_manifestEntries.end()) {
+                                TextureDumpInfo info;
+                                info.id = id;
+                                int w = 0, h = 0;
+                                if (sscanf_s(id.c_str(), "%dx%d_", &w, &h) == 2) {
+                                    info.width = w;
+                                    info.height = h;
+                                }
+                                info.kind = (id.find("x") != std::string::npos && (id.find("_c") != std::string::npos || id.find("_") != std::string::npos)) ? "texture" : "sprite";
+                                m_manifestEntries.emplace(id, info);
+                            }
+                        }
+                    }
+                }
+            } while (FindNextFileW(hFind, &fd));
+            FindClose(hFind);
+        }
+
+        m_dumpedSessionCount.store(0, std::memory_order_relaxed);
         m_stop = false;
         m_running = true;
         m_worker = std::thread(&TextureDumper::WorkerLoop, this);
@@ -301,6 +536,7 @@ public:
                 return;
             }
             m_stop = true;
+            m_queue.clear();
         }
         m_cv.notify_all();
         if (m_worker.joinable()) {
@@ -347,7 +583,7 @@ public:
         m_cv.notify_one();
     }
 
-    uint32_t GetDumpedCount() const { return m_dumpedCount.load(std::memory_order_relaxed); }
+    uint32_t GetDumpedCount() const { return m_dumpedSessionCount.load(std::memory_order_relaxed); }
     uint32_t GetQueuedCount() {
         std::lock_guard<std::mutex> lock(m_mutex);
         return static_cast<uint32_t>(m_queue.size());
@@ -355,12 +591,15 @@ public:
 
 private:
     void WorkerLoop() {
+        uint32_t texturesSinceSave = 0;
+        auto lastSaveTime = std::chrono::steady_clock::now();
+
         while (true) {
             QueuedDumpItem item;
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
                 m_cv.wait(lock, [this] { return m_stop || !m_queue.empty(); });
-                if (m_stop && m_queue.empty()) {
+                if (m_stop) {
                     break;
                 }
                 item = std::move(m_queue.front());
@@ -370,76 +609,49 @@ private:
             const std::wstring outPng = m_dumpDir + L"\\" +
                                         std::wstring(item.info.id.begin(), item.info.id.end()) + L".png";
             DWORD attr = GetFileAttributesW(outPng.c_str());
+            bool saveOk = true;
             if (attr == INVALID_FILE_ATTRIBUTES) {
-                SaveRgbaPngWithWic(outPng, item.info.width, item.info.height, item.rgbaPixels.data());
+                saveOk = SaveRgbaPngWithWic(outPng, item.info.width, item.info.height, item.rgbaPixels.data());
+                if (!saveOk) {
+                    DeleteFileW(outPng.c_str());
+                }
             }
 
-            {
+            std::unordered_map<std::string, TextureDumpInfo> entriesCopy;
+            bool shouldSave = false;
+
+            if (saveOk) {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 m_dumpedSet.insert(item.info.id);
                 m_queuedSet.erase(item.info.id);
                 m_manifestEntries[item.info.id] = item.info;
-                m_dumpedCount.store(static_cast<uint32_t>(m_dumpedSet.size()), std::memory_order_relaxed);
-            }
-            WriteManifest();
-        }
-    }
+                m_dumpedSessionCount.fetch_add(1, std::memory_order_relaxed);
+                ++texturesSinceSave;
 
-    void LoadManifest() {
-        const std::wstring manPath = m_dumpDir + L"\\manifest.json";
-        FILE* fp = nullptr;
-        if (_wfopen_s(&fp, manPath.c_str(), L"rt") != 0 || !fp) {
-            return;
-        }
-        std::fseek(fp, 0, SEEK_END);
-        const long sz = std::ftell(fp);
-        std::fseek(fp, 0, SEEK_SET);
-        if (sz > 0) {
-            std::vector<char> buf(static_cast<size_t>(sz) + 1, 0);
-            std::fread(buf.data(), 1, static_cast<size_t>(sz), fp);
-            std::string content(buf.data());
-            size_t pos = 0;
-            while ((pos = content.find("\"id\": \"", pos)) != std::string::npos) {
-                pos += 7;
-                size_t endPos = content.find('"', pos);
-                if (endPos != std::string::npos) {
-                    std::string id = content.substr(pos, endPos - pos);
-                    m_dumpedSet.insert(id);
-                    pos = endPos;
+                const auto now = std::chrono::steady_clock::now();
+                const bool timePassed = (now - lastSaveTime) > std::chrono::seconds(2);
+                if (m_queue.empty() || texturesSinceSave >= 16 || timePassed) {
+                    entriesCopy = m_manifestEntries;
+                    shouldSave = true;
+                    texturesSinceSave = 0;
+                    lastSaveTime = now;
                 }
+            } else {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_queuedSet.erase(item.info.id);
             }
-        }
-        std::fclose(fp);
-        m_dumpedCount.store(static_cast<uint32_t>(m_dumpedSet.size()), std::memory_order_relaxed);
-    }
 
-    void WriteManifest() {
-        const std::wstring manPath = m_dumpDir + L"\\manifest.json";
-        FILE* fp = nullptr;
-        if (_wfopen_s(&fp, manPath.c_str(), L"wt") != 0 || !fp) {
-            return;
-        }
-        std::fprintf(fp, "{\n");
-        bool first = true;
-        std::lock_guard<std::mutex> lock(m_mutex);
-        for (const auto& kv : m_manifestEntries) {
-            const TextureDumpInfo& e = kv.second;
-            if (!first) {
-                std::fprintf(fp, ",\n");
+            if (shouldSave) {
+                SaveDumpManifest(m_dumpDir + L"\\manifest.json", entriesCopy);
             }
-            first = false;
-            std::fprintf(fp, "  \"%s\": {\n", kv.first.c_str());
-            std::fprintf(fp, "    \"width\": %d,\n", e.width);
-            std::fprintf(fp, "    \"height\": %d,\n", e.height);
-            std::fprintf(fp, "    \"color_key\": %s,\n", e.colorKey ? "true" : "false");
-            std::fprintf(fp, "    \"mip_levels\": %d,\n", e.mipLevels);
-            std::fprintf(fp, "    \"kind\": \"%s\",\n", e.kind.c_str());
-            std::fprintf(fp, "    \"sprite_clut\": %u,\n", e.spriteClut);
-            std::fprintf(fp, "    \"first_seen_frame\": %u\n", e.frameNumber);
-            std::fprintf(fp, "  }");
         }
-        std::fprintf(fp, "\n}\n");
-        std::fclose(fp);
+
+        std::unordered_map<std::string, TextureDumpInfo> finalEntries;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            finalEntries = m_manifestEntries;
+        }
+        SaveDumpManifest(m_dumpDir + L"\\manifest.json", finalEntries);
     }
 
     std::wstring m_dumpDir;
@@ -452,7 +664,7 @@ private:
     std::unordered_set<std::string> m_queuedSet;
     std::unordered_set<std::string> m_dumpedSet;
     std::unordered_map<std::string, TextureDumpInfo> m_manifestEntries;
-    std::atomic<uint32_t> m_dumpedCount{0};
+    std::atomic<uint32_t> m_dumpedSessionCount{0};
 };
 
 static TextureDumper g_textureDumper;
@@ -507,7 +719,11 @@ struct DecodedReplacement {
 class TexturePackManager {
 public:
     TexturePackManager() = default;
-    ~TexturePackManager() { Shutdown(); }
+    ~TexturePackManager() {
+        if (!g_isProcessTerminating.load(std::memory_order_relaxed)) {
+            Shutdown();
+        }
+    }
 
     void Init(const std::wstring& packDir, int32_t maxMiB, int32_t decodeBudgetMs) {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -515,7 +731,7 @@ public:
             return;
         }
         m_packDir = packDir;
-        m_maxMiB = maxMiB > 0 ? maxMiB : 512;
+        m_maxMiB = (maxMiB >= 16 && maxMiB <= 2048) ? maxMiB : 512;
         m_decodeBudgetMs = decodeBudgetMs > 0 ? decodeBudgetMs : 4;
         m_maxMibWarned = false;
         m_totalAllocatedBytes = 0;
@@ -526,7 +742,6 @@ public:
         m_loadQueue.clear();
         m_readyQueue.clear();
 
-        // Index all <Path>/*.png once
         const std::wstring search = packDir + L"\\*.png";
         WIN32_FIND_DATAW fd = {};
         HANDLE hFind = FindFirstFileW(search.c_str(), &fd);
@@ -535,15 +750,18 @@ public:
             do {
                 if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
                     const std::wstring fn = fd.cFileName;
-                    if (fn.size() > 4 && fn.substr(fn.size() - 4) == L".png") {
-                        const std::wstring stem = fn.substr(0, fn.size() - 4);
-                        std::string id;
-                        id.reserve(stem.size());
-                        for (wchar_t ch : stem) {
-                            id.push_back(static_cast<char>(ch));
+                    if (fn.size() > 4) {
+                        const std::wstring ext = fn.substr(fn.size() - 4);
+                        if (_wcsicmp(ext.c_str(), L".png") == 0) {
+                            const std::wstring stem = fn.substr(0, fn.size() - 4);
+                            std::string id;
+                            id.reserve(stem.size());
+                            for (wchar_t ch : stem) {
+                                id.push_back(static_cast<char>(ch));
+                            }
+                            m_indexedFiles.emplace(id, packDir + L"\\" + fn);
+                            ++count;
                         }
-                        m_indexedFiles.emplace(id, packDir + L"\\" + fn);
-                        ++count;
                     }
                 }
             } while (FindNextFileW(hFind, &fd));
@@ -563,6 +781,7 @@ public:
                 return;
             }
             m_stop = true;
+            m_loadQueue.clear();
         }
         m_cv.notify_all();
         if (m_worker.joinable()) {
@@ -584,6 +803,11 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         m_replacements.clear();
         m_totalAllocatedBytes = 0;
+        m_generation.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    uint64_t GetGeneration() const {
+        return m_generation.load(std::memory_order_relaxed);
     }
 
     bool HasIndexed(const std::string& id) {
@@ -602,13 +826,13 @@ public:
         }
         auto itFile = m_indexedFiles.find(id);
         if (itFile == m_indexedFiles.end()) {
-            return nullptr; // Not in pack, never touch disk
+            return nullptr;
         }
         if (m_pendingSet.find(id) != m_pendingSet.end()) {
-            return nullptr; // Already in flight
+            return nullptr;
         }
 
-        const size_t maxBytes = static_cast<size_t>(m_maxMiB) * 1024u * 1024u;
+        const uint64_t maxBytes = static_cast<uint64_t>(m_maxMiB) * 1024ULL * 1024ULL;
         if (m_totalAllocatedBytes >= maxBytes) {
             if (!m_maxMibWarned) {
                 m_maxMibWarned = true;
@@ -633,7 +857,8 @@ public:
         QueryPerformanceCounter(&start);
 
         const double budgetSec = static_cast<double>(m_decodeBudgetMs) / 1000.0;
-        const size_t maxBytes = static_cast<size_t>(m_maxMiB) * 1024u * 1024u;
+        const uint64_t maxBytes = static_cast<uint64_t>(m_maxMiB) * 1024ULL * 1024ULL;
+        bool loadedAny = false;
 
         while (true) {
             DecodedReplacement item;
@@ -651,6 +876,12 @@ public:
                 std::lock_guard<std::mutex> lock(m_mutex);
                 m_rejectedIds.insert(item.id);
                 LOG_WARN("TexturePack: %s rejected %s", item.id.c_str(), item.rejectReason.c_str());
+
+                QueryPerformanceCounter(&now);
+                const double elapsed = static_cast<double>(now.QuadPart - start.QuadPart) / static_cast<double>(freq.QuadPart);
+                if (elapsed >= budgetSec) {
+                    break;
+                }
                 continue;
             }
 
@@ -661,10 +892,15 @@ public:
                     LOG_WARN("TexturePack: MaxMiB (%d MiB) reached; skipping further replacements", m_maxMiB);
                 }
                 m_rejectedIds.insert(item.id);
+
+                QueryPerformanceCounter(&now);
+                const double elapsed = static_cast<double>(now.QuadPart - start.QuadPart) / static_cast<double>(freq.QuadPart);
+                if (elapsed >= budgetSec) {
+                    break;
+                }
                 continue;
             }
 
-            // Upload D3D11 Texture2D with full mip chain
             D3D11_TEXTURE2D_DESC td = {};
             td.Width = static_cast<UINT>(item.width);
             td.Height = static_cast<UINT>(item.height);
@@ -713,6 +949,7 @@ public:
                 rep.totalBytes = item.totalBytes;
                 m_replacements.emplace(item.id, std::move(rep));
                 m_totalAllocatedBytes += item.totalBytes;
+                loadedAny = true;
             }
             LOG_INFO("TexturePack: %s loaded %dx%d (k=%d, %zu bytes)",
                      item.id.c_str(), item.width, item.height, item.k, item.totalBytes);
@@ -722,6 +959,9 @@ public:
             if (elapsed >= budgetSec) {
                 break;
             }
+        }
+        if (loadedAny) {
+            m_generation.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -745,7 +985,7 @@ private:
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
                 m_cv.wait(lock, [this] { return m_stop || !m_loadQueue.empty(); });
-                if (m_stop && m_loadQueue.empty()) {
+                if (m_stop) {
                     break;
                 }
                 req = std::move(m_loadQueue.front());
@@ -757,18 +997,14 @@ private:
             item.origW = req.origW;
             item.origH = req.origH;
 
-            std::vector<uint32_t> premulRgba;
-            int32_t w = 0, h = 0;
-            if (!LoadRgbaPngWithWic(req.filePath, w, h, premulRgba)) {
-                item.rejected = true;
-                item.rejectReason = "failed to decode PNG";
-            } else {
-                int32_t k = 1;
-                if (!ValidateReplacementDimensions(req.origW, req.origH, w, h, k)) {
+            try {
+                std::vector<uint32_t> premulRgba;
+                int32_t w = 0, h = 0, k = 1;
+                if (!LoadRgbaPngWithWic(req.filePath, req.origW, req.origH, w, h, k, premulRgba)) {
                     item.rejected = true;
                     char buf[128];
-                    std::snprintf(buf, sizeof(buf), "(%dx%d is not a power-of-two multiple of %dx%d)",
-                                  w, h, req.origW, req.origH);
+                    std::snprintf(buf, sizeof(buf), "(replacement is not a power-of-two multiple of %dx%d or invalid)",
+                                  req.origW, req.origH);
                     item.rejectReason = buf;
                 } else {
                     item.width = w;
@@ -782,6 +1018,14 @@ private:
                     }
                     item.totalBytes = bytes;
                 }
+            } catch (const std::bad_alloc&) {
+                item.rejected = true;
+                item.rejectReason = "out of memory (bad_alloc)";
+                LOG_ERROR("TexturePack: bad_alloc loading %s", req.id.c_str());
+            } catch (const std::exception& e) {
+                item.rejected = true;
+                item.rejectReason = e.what();
+                LOG_ERROR("TexturePack: exception loading %s: %s", req.id.c_str(), e.what());
             }
 
             {
@@ -811,6 +1055,7 @@ private:
     std::unordered_map<std::string, ReplacementTexture> m_replacements;
     std::unordered_set<std::string> m_pendingSet;
     std::unordered_set<std::string> m_rejectedIds;
+    std::atomic<uint64_t> m_generation{1};
     std::deque<PackLoadRequest> m_loadQueue;
     std::deque<DecodedReplacement> m_readyQueue;
 };
@@ -831,6 +1076,10 @@ void TexturePackClearD3DResources() {
 
 void TexturePackUpdate(ID3D11Device* device) {
     g_texturePackManager.Update(device);
+}
+
+uint64_t TexturePackGetGeneration() {
+    return g_texturePackManager.GetGeneration();
 }
 
 ReplacementTexture* TexturePackGetOrQueue(const std::string& id, int32_t origW, int32_t origH) {

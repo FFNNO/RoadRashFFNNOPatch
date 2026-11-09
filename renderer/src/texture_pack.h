@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <unordered_map>
+#include <unordered_set>
 
 using Microsoft::WRL::ComPtr;
 
@@ -19,7 +21,10 @@ bool ValidateMipLevelPointer(const void* ptr, int32_t width, int32_t height, int
 bool SaveRgbaPngWithWic(const std::wstring& path, int32_t width, int32_t height, const uint32_t* rgbaPixels);
 
 // Loads an RGBA8 PNG using WIC and returns premultiplied RGBA8 pixels.
-bool LoadRgbaPngWithWic(const std::wstring& path, int32_t& outW, int32_t& outH, std::vector<uint32_t>& outPremulRgba);
+// If origW > 0 and origH > 0, validates that image size is a power-of-two multiple (1,2,4,8) before allocating pixel buffers.
+bool LoadRgbaPngWithWic(const std::wstring& path, int32_t origW, int32_t origH,
+                        int32_t& outW, int32_t& outH, int32_t& outK,
+                        std::vector<uint32_t>& outPremulRgba);
 
 // Validates whether (replW, replH) is k * (origW, origH) with k in {1, 2, 4, 8}.
 bool ValidateReplacementDimensions(int32_t origW, int32_t origH, int32_t replW, int32_t replH, int32_t& outK);
@@ -42,6 +47,13 @@ struct TextureDumpInfo {
     uint8_t spriteClut = 0;
     uint32_t frameNumber = 0;
 };
+
+// Manifest file I/O helpers (exposed for testing)
+bool LoadDumpManifest(const std::wstring& manPath,
+                      std::unordered_map<std::string, TextureDumpInfo>& entries,
+                      std::unordered_set<std::string>& dumpedSet);
+bool SaveDumpManifest(const std::wstring& manPath,
+                      const std::unordered_map<std::string, TextureDumpInfo>& entries);
 
 void TextureDumpInit(const std::wstring& dumpDir);
 void TextureDumpShutdown();
@@ -73,6 +85,8 @@ void TexturePackInit(const std::wstring& packDir, int32_t maxMiB, int32_t decode
 void TexturePackShutdown();
 void TexturePackClearD3DResources();
 void TexturePackUpdate(ID3D11Device* device);
+uint64_t TexturePackGetGeneration();
 ReplacementTexture* TexturePackGetOrQueue(const std::string& id, int32_t origW, int32_t origH);
 TexturePackStats TexturePackGetStats();
 bool TexturePackHasIndexed(const std::string& id);
+void TexturePackSetProcessTerminating();

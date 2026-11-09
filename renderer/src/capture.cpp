@@ -1082,7 +1082,10 @@ int CaptureTexturedQuadBefore() {
             q.level0Crc32 = LookupOrComputeLevel0Crc32(
                 q.pdatPtr, keyB, level0Ptr, spriteW, spriteH, pdatPitch, clutDescriptor, clutLen);
             if (GetConfig().gpuWorld) {
-                CaptureCacheTexturePixels(q.pdatPtr, q.level0Crc32, level0Ptr, spriteW, spriteH, pdatPitch);
+                const uint64_t cacheKey = (static_cast<uint64_t>(q.pdatPtr) << 32) | q.level0Crc32;
+                if (g_texPixelCache.find(cacheKey) == g_texPixelCache.end()) {
+                    CaptureCacheTexturePixels(q.pdatPtr, q.level0Crc32, level0Ptr, spriteW, spriteH, pdatPitch);
+                }
             }
         } else {
             q.texWidth = pdatPitch;
@@ -1091,29 +1094,32 @@ int CaptureTexturedQuadBefore() {
             q.level0Crc32 = LookupOrComputeLevel0Crc32(
                 q.pdatPtr, keyB, level0Ptr, pdatPitch, pdatHeight, pdatPitch, nullptr, 0);
             if (GetConfig().gpuWorld) {
-                // Engine mip chain (T6): PDAT +0x28 holds the level count and +0x38 + 12 * i the
-                // level-i texel pointer FUN_0042e850 reads; level i is (w >> i) x (h >> i).
-                const uint8_t* extraLevels[kMaxTextureMipLevels - 1] = {};
-                int32_t extraCount = 0;
-                if (GetConfig().mipFilter == MipFilter::Trilinear) {
-                    const int32_t levels = ClampMipLevelCount(pdatPitch, pdatHeight, q.mipLevels);
-                    for (int32_t level = 1; level < levels; ++level) {
-                        const uint8_t* lvlPtr =
-                            *reinterpret_cast<const uint8_t* const*>(pdat + 0x38 + level * 0x0c);
-                        if (!ValidateMipLevelPointer(lvlPtr, pdatPitch, pdatHeight, level)) {
-                            static std::unordered_set<uint32_t> s_warnedPdats;
-                            if (s_warnedPdats.insert(q.pdatPtr).second) {
-                                LOG_WARN("PDAT 0x%08X level %d pointer %p is invalid; truncating mip chain to %d levels",
-                                         q.pdatPtr, level, lvlPtr, level);
+                const uint64_t cacheKey = (static_cast<uint64_t>(q.pdatPtr) << 32) | q.level0Crc32;
+                if (g_texPixelCache.find(cacheKey) == g_texPixelCache.end()) {
+                    // Engine mip chain (T6): PDAT +0x28 holds the level count and +0x38 + 12 * i the
+                    // level-i texel pointer FUN_0042e850 reads; level i is (w >> i) x (h >> i).
+                    const uint8_t* extraLevels[kMaxTextureMipLevels - 1] = {};
+                    int32_t extraCount = 0;
+                    if (GetConfig().mipFilter == MipFilter::Trilinear) {
+                        const int32_t levels = ClampMipLevelCount(pdatPitch, pdatHeight, q.mipLevels);
+                        for (int32_t level = 1; level < levels; ++level) {
+                            const uint8_t* lvlPtr =
+                                *reinterpret_cast<const uint8_t* const*>(pdat + 0x38 + level * 0x0c);
+                            if (!ValidateMipLevelPointer(lvlPtr, pdatPitch, pdatHeight, level)) {
+                                static std::unordered_set<uint32_t> s_warnedPdats;
+                                if (s_warnedPdats.insert(q.pdatPtr).second) {
+                                    LOG_WARN("PDAT 0x%08X level %d pointer %p is invalid; truncating mip chain to %d levels",
+                                             q.pdatPtr, level, lvlPtr, level);
+                                }
+                                break;
                             }
-                            break;
+                            extraLevels[level - 1] = lvlPtr;
+                            ++extraCount;
                         }
-                        extraLevels[level - 1] = lvlPtr;
-                        ++extraCount;
                     }
+                    CaptureCacheTexturePixels(q.pdatPtr, q.level0Crc32, level0Ptr, pdatPitch, pdatHeight, pdatPitch,
+                                              extraLevels, extraCount);
                 }
-                CaptureCacheTexturePixels(q.pdatPtr, q.level0Crc32, level0Ptr, pdatPitch, pdatHeight, pdatPitch,
-                                          extraLevels, extraCount);
             }
         }
     }
