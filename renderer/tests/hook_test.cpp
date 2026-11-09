@@ -65,11 +65,28 @@ void WriteDummyFile(const std::wstring& path) {
     }
 }
 
-[[noreturn]] void ReportTerminateAndExit() {
-    std::printf("[FAIL] std::terminate called while destroying texture pack workers at process exit\n");
-    std::printf("FAILED (%d failure(s))\n", g_failures + 1);
-    std::fflush(stdout);
-    _exit(1);
+void WriteBytesFile(const std::wstring& path, const uint8_t* bytes, size_t size) {
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, path.c_str(), L"wb") == 0 && fp) {
+        std::fwrite(bytes, 1, size, fp);
+        std::fclose(fp);
+    }
+}
+
+// A 256-entry RGBx palette whose entries 1..255 are all non-zero.
+void FillTestBasePalette(uint8_t (&palette)[1024]) {
+    for (int i = 0; i < 256; ++i) {
+        palette[i * 4 + 0] = static_cast<uint8_t>(i);
+        palette[i * 4 + 1] = static_cast<uint8_t>(255 - i / 2);
+        palette[i * 4 + 2] = static_cast<uint8_t>(64 + i / 4);
+        palette[i * 4 + 3] = 0;
+    }
+}
+
+uint32_t PackRgba(const uint8_t* palette, int idx) {
+    return static_cast<uint32_t>(palette[idx * 4 + 0]) |
+           (static_cast<uint32_t>(palette[idx * 4 + 1]) << 8) |
+           (static_cast<uint32_t>(palette[idx * 4 + 2]) << 16) | 0xFF000000u;
 }
 
 void Check(bool condition, const char* what) {
@@ -1500,8 +1517,13 @@ int main() {
         for (const auto& f : files) {
             WriteDummyFile(f);
         }
-        TextureDumpInit(dir);
+        uint8_t basePalette[1024] = {};
+        FillTestBasePalette(basePalette);
+        const std::wstring palPath = dir + L"\\PALETTE.RAW";
+        WriteBytesFile(palPath, basePalette, sizeof(basePalette));
+        TextureDumpInit(dir, palPath);
         TextureDumpShutdown();
+        DeleteFileW(palPath.c_str());
         std::unordered_map<std::string, TextureDumpInfo> loaded;
         std::unordered_set<std::string> dumped;
         LoadDumpManifest(dir + L"\\manifest.json", loaded, dumped);
@@ -1571,19 +1593,120 @@ int main() {
     // PNG and JSON writer unit tests (B3 item 5).
     RunCaptureWritersTest();
 
-    // 17. DLL-detach destructor path: joinable workers must not reach std::terminate. Runs last,
-    // with a terminate handler, so a regression reports FAIL instead of a silent abort.
+    // 17. Dumps are converted with the base palette (DATA\PALETTE.RAW), never with the frame's
+    // palette, so a texture first seen during the fade-in from black is not dumped black.
     {
-        const std::wstring dir = MakeTestTempPath(L"rr95_exit_");
+        const std::wstring dir = MakeTestTempPath(L"rr95_dump_base_");
         CreateDirectoryW(dir.c_str(), nullptr);
-        const std::terminate_handler previous = std::set_terminate(ReportTerminateAndExit);
-        const bool destroyed = TexturePackTestDestroyAtProcessExit(dir);
-        std::set_terminate(previous);
-        Check(destroyed, "Texture pack workers are destroyed at process exit without std::terminate");
+        uint8_t basePalette[1024] = {};
+        FillTestBasePalette(basePalette);
+        const std::wstring palPath = dir + L"\\PALETTE.RAW";
+        WriteBytesFile(palPath, basePalette, sizeof(basePalette));
+        // The frame's palette at frame 1 of a race is all black (fade-in). The dumper has no
+        // access to it: it converts only with the base palette loaded at Init.
+        TextureDumpInit(dir, palPath);
+        TextureDumpInfo info;
+        info.id = "2x2_0000beef";
+        info.width = 2;
+        info.height = 2;
+        info.colorKey = true;
+        const uint8_t indices[4] = {0, 5, 200, 255};
+        TextureDumpQueue(info, indices);
+        for (int i = 0; i < 500 && TextureDumpGetDumpedCount() == 0; ++i) {
+            Sleep(10);
+        }
+        TextureDumpShutdown();
+
+        const std::wstring png = dir + L"\\2x2_0000beef.png";
+        int32_t w = 0, h = 0, k = 0;
+        std::vector<uint32_t> pixels;
+        const bool loaded = LoadRgbaPngWithWic(png, 2, 2, w, h, k, pixels);
+        Check(loaded && pixels.size() == 4 && pixels[1] == PackRgba(basePalette, 5) &&
+                  pixels[2] == PackRgba(basePalette, 200) && pixels[3] == PackRgba(basePalette, 255),
+              "Dump conversion uses the base palette and ignores a faded frame palette");
+        Check(loaded && pixels.size() == 4 && pixels[0] == 0u,
+              "Dump conversion keeps index 0 of colour-keyed textures transparent");
+        DeleteFileW(png.c_str());
         DeleteFileW((dir + L"\\manifest.json").c_str());
-        DeleteFileW((dir + L"\\manifest.json.tmp").c_str());
+
+        // A missing or wrongly sized palette disables dumping: nothing is queued or written.
+        const std::wstring badPal = dir + L"\\SHORT.RAW";
+        WriteBytesFile(badPal, basePalette, 1023);
+        const std::wstring missingPal = dir + L"\\MISSING.RAW";
+        const std::wstring palCases[2] = {missingPal, badPal};
+        for (const std::wstring& pal : palCases) {
+            TextureDumpInit(dir, pal);
+            TextureDumpQueue(info, indices);
+            Sleep(50);
+            const uint32_t queued = TextureDumpGetQueuedCount();
+            const uint32_t dumped = TextureDumpGetDumpedCount();
+            TextureDumpShutdown();
+            Check(queued == 0 && dumped == 0 &&
+                      GetFileAttributesW(png.c_str()) == INVALID_FILE_ATTRIBUTES &&
+                      GetFileAttributesW((dir + L"\\manifest.json").c_str()) == INVALID_FILE_ATTRIBUTES,
+                  pal == missingPal ? "A missing PALETTE.RAW disables dumping"
+                                    : "A PALETTE.RAW that is not 1024 bytes disables dumping");
+            DeleteFileW(png.c_str());
+            DeleteFileW((dir + L"\\manifest.json").c_str());
+        }
+        DeleteFileW(badPal.c_str());
+        DeleteFileW(palPath.c_str());
         RemoveDirectoryW(dir.c_str());
     }
+
+    // 18. Replacement fade factor: per channel sum(current[1..255]) / sum(base[1..255]), in [0, 1].
+    {
+        uint8_t base[1024] = {};
+        FillTestBasePalette(base);
+        float f[3] = {};
+
+        ComputePaletteFadeFactor(base, base, f);
+        Check(f[0] == 1.0f && f[1] == 1.0f && f[2] == 1.0f, "Fade factor of the base palette itself is 1");
+
+        const uint8_t black[1024] = {};
+        ComputePaletteFadeFactor(base, black, f);
+        Check(f[0] == 0.0f && f[1] == 0.0f && f[2] == 0.0f, "Fade factor of an all-zero palette is 0");
+
+        uint8_t half[1024] = {};
+        for (int i = 0; i < 1024; ++i) {
+            half[i] = static_cast<uint8_t>(base[i] / 2);
+        }
+        ComputePaletteFadeFactor(base, half, f);
+        Check(std::fabs(f[0] - 0.5f) < 0.01f && std::fabs(f[1] - 0.5f) < 0.01f && std::fabs(f[2] - 0.5f) < 0.01f,
+              "Fade factor of a half-brightness palette is about 0.5");
+        Check(PaletteIsUniformScale(base, half, f), "A half-brightness palette is a uniform scale of the base");
+
+        ComputePaletteFadeFactor(black, half, f);
+        Check(f[0] == 1.0f && f[1] == 1.0f && f[2] == 1.0f, "Fade factor with an empty base palette is 1");
+        ComputePaletteFadeFactor(nullptr, half, f);
+        Check(f[0] == 1.0f && f[1] == 1.0f && f[2] == 1.0f, "Fade factor without a base palette is 1");
+
+        uint8_t bright[1024] = {};
+        for (int i = 0; i < 1024; ++i) {
+            bright[i] = static_cast<uint8_t>(std::min(255, base[i] * 2));
+        }
+        ComputePaletteFadeFactor(base, bright, f);
+        Check(f[0] == 1.0f && f[1] == 1.0f && f[2] == 1.0f, "Fade factor is clamped to 1");
+
+        // Index 0 is excluded from the sums: a non-black index 0 does not change the factor.
+        uint8_t blackWithIdx0[1024] = {};
+        blackWithIdx0[0] = 255;
+        blackWithIdx0[1] = 255;
+        blackWithIdx0[2] = 255;
+        ComputePaletteFadeFactor(base, blackWithIdx0, f);
+        Check(f[0] == 0.0f && f[1] == 0.0f && f[2] == 0.0f, "Fade factor ignores palette index 0");
+
+        // A remapped palette (red kept, green darkened, blue inverted) is not a uniform scale.
+        uint8_t tinted[1024] = {};
+        for (int i = 0; i < 256; ++i) {
+            tinted[i * 4 + 0] = base[i * 4 + 0];
+            tinted[i * 4 + 1] = static_cast<uint8_t>(base[i * 4 + 1] / 4);
+            tinted[i * 4 + 2] = static_cast<uint8_t>(255 - base[i * 4 + 2]);
+        }
+        ComputePaletteFadeFactor(base, tinted, f);
+        Check(!PaletteIsUniformScale(base, tinted, f), "A remapped palette is not a uniform scale of the base");
+    }
+
 
     std::printf("%s (%d failure(s))\n", g_failures == 0 ? "OK" : "FAILED", g_failures);
     return g_failures == 0 ? 0 : 1;

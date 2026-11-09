@@ -151,6 +151,8 @@ struct alignas(16) PresentConstants {
     uint32_t filterMode;
     uint32_t useBgra;
     float pad[2];
+    // World pass only: per-channel palette fade applied to texture pack replacements (rgb, w unused).
+    float replacementFade[4];
 };
 
 const char* kLayerVertexShaderSrc = R"(
@@ -234,6 +236,7 @@ cbuffer WorldCB : register(b0) {
     uint filterMode;
     uint useBgra;
     float2 pad;
+    float4 replacementFade;
 };
 
 struct PSIn {
@@ -277,6 +280,8 @@ float4 SampleAtlas(float2 uv, float2 gx, float2 gy, float4 texInfo, float4 box) 
 // flags.x: 1 = flat colour quad.
 // flags.y: 0 = B4 path (point sampler, level chosen+log2(k)); 1 = SampleGrad on the mip chain with the
 //          trilinear/anisotropic sampler; 2 = atlas cell, per-level clamped trilinear.
+// flags.z: 1 = texture pack replacement. Originals are converted through the current palette and
+//          already fade; replacements are fixed full-brightness RGBA, so they get replacementFade.
 float4 main(PSIn p) : SV_Target {
     if (p.flags.x > 0.5) {
         return p.color;
@@ -314,6 +319,9 @@ float4 main(PSIn p) : SV_Target {
     }
     if (texel.a < 0.5) {
         discard;
+    }
+    if (p.flags.z > 0.5) {
+        texel.rgb *= replacementFade.rgb;
     }
     return texel * p.color;
 }
@@ -479,6 +487,7 @@ public:
         }
         TexturePackClearD3DResources();
         m_worldTexSrvCache.clear();
+        m_fadePaletteValid = false;
         m_srvWorld.Reset();
         m_rtvWorld.Reset();
         m_texWorld.Reset();
@@ -1074,14 +1083,19 @@ private:
         return true;
     }
 
-    // Returns the SRV of the quad's texture; *outLevels receives its uploaded mip level count.
+    // Returns the SRV of the quad's texture; *outLevels receives its uploaded mip level count and
+    // *outReplacement whether the SRV is a texture pack replacement.
     ID3D11ShaderResourceView* GetOrCreateWorldTextureSRV(const CapturedQuad& q, const uint8_t* palette,
-                                                         int32_t* outLevels, int32_t* outK = nullptr) {
+                                                         int32_t* outLevels, int32_t* outK = nullptr,
+                                                         bool* outReplacement = nullptr) {
         if (outLevels) {
             *outLevels = 1;
         }
         if (outK) {
             *outK = 1;
+        }
+        if (outReplacement) {
+            *outReplacement = false;
         }
         if (q.pdatPtr == 0 || q.texWidth <= 0 || q.texHeight <= 0) {
             return m_srvWhite.Get();
@@ -1100,6 +1114,9 @@ private:
             if (outK) {
                 *outK = it->second.k;
             }
+            if (outReplacement) {
+                *outReplacement = it->second.replacement;
+            }
             return it->second.srv.Get();
         }
 
@@ -1116,7 +1133,8 @@ private:
                 dumpInfo.kind = ((q.pdatFlags & 0x2000u) != 0) ? "sprite" : "texture";
                 dumpInfo.spriteClut = q.spriteClut;
                 dumpInfo.frameNumber = CaptureGetFrameNumber();
-                TextureDumpQueue(dumpInfo, chain.pixels[0], palette);
+                // Converted with the base palette, not this frame's (possibly faded) palette.
+                TextureDumpQueue(dumpInfo, chain.pixels[0]);
             }
         }
 
@@ -1138,8 +1156,12 @@ private:
                 if (outK) {
                     *outK = rep->k;
                 }
+                if (outReplacement) {
+                    *outReplacement = true;
+                }
                 ID3D11ShaderResourceView* rawSrv = rep->srv.Get();
-                m_worldTexSrvCache.emplace(srvKey, CachedWorldTexture{rep->srv, rep->levels, rep->k});
+                m_worldTexSrvCache.emplace(srvKey, CachedWorldTexture{rep->srv, rep->levels, rep->k,
+                                                                      std::string(), true});
                 return rawSrv;
             }
         }
@@ -1269,6 +1291,41 @@ private:
         return true;
     }
 
+    // Texture pack replacements are fixed full-brightness RGBA, while originals are converted through
+    // the current palette and fade with it. The world shader scales replacements by the per-channel
+    // fade f = sum(current[1..255]) / sum(base[1..255]) against DATA\PALETTE.RAW. It is computed only
+    // when the pack is enabled and has at least one replacement indexed, and only when the palette
+    // changes; otherwise f stays 1 and no per-frame work is added.
+    void UpdateReplacementFade(const uint8_t* palette) {
+        if (!GetConfig().texturePackEnabled || TexturePackGetIndexedCount() == 0) {
+            m_replacementFade[0] = m_replacementFade[1] = m_replacementFade[2] = 1.0f;
+            return;
+        }
+        if (!m_basePaletteTried) {
+            m_basePaletteTried = true;
+            const std::wstring path = ResolveGamePath(kBasePaletteRelPath);
+            m_basePaletteValid = LoadBasePaletteFile(path, m_basePalette);
+            if (!m_basePaletteValid) {
+                LOG_WARN("TexturePack: base palette %ls is missing or not %u bytes; replacements ignore palette fades",
+                         path.c_str(), static_cast<unsigned>(kBasePaletteBytes));
+            }
+        }
+        if (!m_basePaletteValid) {
+            m_replacementFade[0] = m_replacementFade[1] = m_replacementFade[2] = 1.0f;
+            return;
+        }
+        if (m_fadePaletteValid && std::memcmp(m_fadePalette, palette, kBasePaletteBytes) == 0) {
+            return;
+        }
+        std::memcpy(m_fadePalette, palette, kBasePaletteBytes);
+        m_fadePaletteValid = true;
+        ComputePaletteFadeFactor(m_basePalette, palette, m_replacementFade);
+        if (!m_nonUniformFadeWarned && !PaletteIsUniformScale(m_basePalette, palette, m_replacementFade)) {
+            m_nonUniformFadeWarned = true;
+            LOG_WARN("TexturePack: non-uniform palette effect, replacements may not match");
+        }
+    }
+
     bool PresentWorldFrame(const uint8_t* surface, int pitch, const uint8_t* palette,
                            int srcW, int srcH, int clientW, int clientH, uint64_t nowMs) {
         const int worldW = GetConfig().internalWidth;
@@ -1278,7 +1335,8 @@ private:
         }
 
         if (GetConfig().texturePackDump && !m_textureDumpInitialized) {
-            TextureDumpInit(ResolveGamePath(GetConfig().texturePackDumpPath));
+            TextureDumpInit(ResolveGamePath(GetConfig().texturePackDumpPath),
+                            ResolveGamePath(kBasePaletteRelPath));
             m_textureDumpInitialized = true;
         }
 
@@ -1291,6 +1349,7 @@ private:
         if (GetConfig().texturePackEnabled) {
             TexturePackUpdate(m_device.Get());
         }
+        UpdateReplacementFade(palette);
 
         const uint32_t curGen = CaptureGetCacheGeneration();
         const uint64_t tpGen = TexturePackGetGeneration();
@@ -1363,6 +1422,10 @@ private:
             cb->useBgra = 0;
             cb->pad[0] = 0.0f;
             cb->pad[1] = 0.0f;
+            cb->replacementFade[0] = m_replacementFade[0];
+            cb->replacementFade[1] = m_replacementFade[1];
+            cb->replacementFade[2] = m_replacementFade[2];
+            cb->replacementFade[3] = 1.0f;
             m_context->Unmap(m_constantBuffer.Get(), 0);
         }
 
@@ -1466,7 +1529,9 @@ private:
             } else {
                 int32_t texLevels = 1;
                 int32_t k = 1;
-                srv = GetOrCreateWorldTextureSRV(q, palette, &texLevels, &k);
+                bool replacement = false;
+                srv = GetOrCreateWorldTextureSRV(q, palette, &texLevels, &k, &replacement);
+                flags[2] = replacement ? 1.0f : 0.0f;
                 const float texW = static_cast<float>(std::max(1, q.texWidth));
                 const float texH = static_cast<float>(std::max(1, q.texHeight));
 
@@ -1665,6 +1730,10 @@ private:
         cb->useBgra = useBgra ? 1u : 0u;
         cb->pad[0] = 0.0f;
         cb->pad[1] = 0.0f;
+        cb->replacementFade[0] = 1.0f;
+        cb->replacementFade[1] = 1.0f;
+        cb->replacementFade[2] = 1.0f;
+        cb->replacementFade[3] = 1.0f;
         m_context->Unmap(m_constantBuffer.Get(), 0);
 
         const float clearBlack[4] = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -1766,6 +1835,7 @@ private:
         int32_t levels = 1;
         int32_t k = 1;
         std::string pendingReplacementId;  // replacement ID while it is pending, else empty
+        bool replacement = false;          // srv is a texture pack replacement
     };
     std::unordered_map<uint64_t, CachedWorldTexture> m_worldTexSrvCache;
     uint8_t m_cachedPalette[1024] = {};
@@ -1776,9 +1846,22 @@ private:
     std::vector<WorldDrawBatch> m_worldBatches;
     bool m_textureDumpInitialized = false;
     bool m_texturePackInitialized = false;
+
+    // Replacement fade (see UpdateReplacementFade). The base palette is read once per process.
+    uint8_t m_basePalette[kBasePaletteBytes] = {};
+    bool m_basePaletteTried = false;
+    bool m_basePaletteValid = false;
+    uint8_t m_fadePalette[kBasePaletteBytes] = {};
+    bool m_fadePaletteValid = false;
+    bool m_nonUniformFadeWarned = false;
+    float m_replacementFade[3] = {1.0f, 1.0f, 1.0f};
 };
 
-D3D11Presenter g_presenter;
+// Intentionally leaked singleton: it is never destroyed. Its destructor would release D3D11/DXGI
+// objects and stop the texture pack workers during DLL_PROCESS_DETACH at process exit, under the
+// loader lock and after the OS killed every other thread, which can hang the exit forever.
+// Explicit Shutdown() calls during a session (device loss, window change) are unaffected.
+D3D11Presenter& g_presenter = *new D3D11Presenter();
 
 }  // namespace
 

@@ -77,11 +77,29 @@ bool SaveDumpManifest(const std::wstring& manPath,
 // True when fileName matches ^[0-9]+x[0-9]+_[0-9a-f]{8}\.png$ (extension case-insensitive).
 bool IsTextureIdPngName(const std::wstring& fileName);
 
-void TextureDumpInit(const std::wstring& dumpDir);
+// The game's full-brightness palette, relative to the game folder: 256 entries x 4 bytes (RGBx).
+constexpr const wchar_t* kBasePaletteRelPath = L"DATA\\PALETTE.RAW";
+constexpr size_t kBasePaletteBytes = 1024;
+
+// Reads a PALETTE.RAW file into outPalette. False when the file is missing or is not exactly
+// kBasePaletteBytes long; outPalette is left untouched then.
+bool LoadBasePaletteFile(const std::wstring& path, uint8_t (&outPalette)[kBasePaletteBytes]);
+
+// Per-channel fade of the current palette against the base one:
+// outFade[c] = sum(current[1..255].c) / sum(base[1..255].c), clamped to [0, 1]. Index 0 is excluded.
+// A null base, or a channel whose base sum is 0, gives 1.
+void ComputePaletteFadeFactor(const uint8_t* basePalette, const uint8_t* currentPalette, float outFade[3]);
+
+// True when at least 95% of entries 1..255 of currentPalette are within 3 of round(base * fade) on
+// every channel, i.e. the current palette is about a uniform scale of the base one.
+bool PaletteIsUniformScale(const uint8_t* basePalette, const uint8_t* currentPalette, const float fade[3]);
+
+// Starts the dumper. basePalettePath is the game's PALETTE.RAW: dumps are converted with that
+// palette, never with the frame's palette. When it is missing or not 1024 bytes, dumping is disabled.
+void TextureDumpInit(const std::wstring& dumpDir, const std::wstring& basePalettePath);
 void TextureDumpShutdown();
-void TextureDumpQueue(const TextureDumpInfo& info,
-                      const uint8_t* level0Indices,
-                      const uint8_t* palette);
+// Queues level 0 of a texture; it is converted with the base palette loaded at TextureDumpInit.
+void TextureDumpQueue(const TextureDumpInfo& info, const uint8_t* level0Indices);
 uint32_t TextureDumpGetDumpedCount();
 uint32_t TextureDumpGetQueuedCount();
 
@@ -108,13 +126,11 @@ void TexturePackShutdown();
 void TexturePackClearD3DResources();
 void TexturePackUpdate(ID3D11Device* device);
 uint64_t TexturePackGetGeneration();
+// Number of PNG files indexed by the last TexturePackInit (0 when not initialized). Lock-free.
+uint32_t TexturePackGetIndexedCount();
 ReplacementTexture* TexturePackGetOrQueue(const std::string& id, int32_t origW, int32_t origH);
 TexturePackStats TexturePackGetStats();
 bool TexturePackHasIndexed(const std::string& id);
-
-// Marks DLL detach (process exit or FreeLibrary). From then on the worker destructors never join
-// and never block on a mutex: they set the stop flag and detach the worker thread.
-void TexturePackSetProcessTerminating();
 
 enum class ReplacementState {
     None,     // no replacement will arrive (not indexed, rejected or over MaxMiB)
@@ -153,8 +169,3 @@ size_t InvalidateReadyReplacementEntries(Cache& cache, StateFn&& stateOf) {
     }
     return erased;
 }
-
-// Test seam: starts a dumper and a pack worker in dir, lets both worker threads return while their
-// std::thread objects stay joinable (the state a thread killed at process exit leaves), simulates
-// process termination and destroys both objects. Returns false if a worker did not exit in time.
-bool TexturePackTestDestroyAtProcessExit(const std::wstring& dir);

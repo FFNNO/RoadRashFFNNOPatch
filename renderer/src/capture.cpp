@@ -57,7 +57,9 @@ constexpr uint32_t kVaActiveMipPtr      = 0x006185a4;
 constexpr uint32_t kVaCurrentPoly       = 0x006185e0;
 
 HMODULE g_hostModule = nullptr;
-std::wstring g_dumpDir;
+// Heap-owning globals in this file are leaked on purpose (never destroyed), like the presenter and
+// texture pack singletons: nothing should run at DLL_PROCESS_DETACH during process exit.
+std::wstring& g_dumpDir = *new std::wstring();
 
 CapturedQuad g_capturedQuads[kMaxCapturedQuads];
 uint32_t g_capturedCount = 0;
@@ -95,7 +97,10 @@ struct CachedTexturePixels {
     std::vector<uint8_t> pixels;
 };
 
-std::unordered_map<uint64_t, CachedTexturePixels> g_texPixelCache;
+// Leaked on purpose: freeing up to the cache cap of pixel buffers at process exit is pointless work
+// under the loader lock.
+std::unordered_map<uint64_t, CachedTexturePixels>& g_texPixelCache =
+    *new std::unordered_map<uint64_t, CachedTexturePixels>();
 uint32_t g_cacheGeneration = 1;
 size_t g_texPixelCacheBytes = 0;
 size_t g_texPixelCacheCapBytes = kDefaultTexturePixelCacheCapBytes;
@@ -1106,7 +1111,7 @@ int CaptureTexturedQuadBefore() {
                             const uint8_t* lvlPtr =
                                 *reinterpret_cast<const uint8_t* const*>(pdat + 0x38 + level * 0x0c);
                             if (!ValidateMipLevelPointer(lvlPtr, pdatPitch, pdatHeight, level)) {
-                                static std::unordered_set<uint32_t> s_warnedPdats;
+                                static std::unordered_set<uint32_t>& s_warnedPdats = *new std::unordered_set<uint32_t>();
                                 if (s_warnedPdats.insert(q.pdatPtr).second) {
                                     LOG_WARN("PDAT 0x%08X level %d pointer %p is invalid; truncating mip chain to %d levels",
                                              q.pdatPtr, level, lvlPtr, level);

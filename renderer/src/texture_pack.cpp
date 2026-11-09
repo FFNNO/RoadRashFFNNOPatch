@@ -7,18 +7,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
-
-static std::atomic<bool> g_isProcessTerminating{false};
-
-void TexturePackSetProcessTerminating() {
-    g_isProcessTerminating.store(true, std::memory_order_relaxed);
-}
 
 std::string FormatTextureId(int32_t width, int32_t height, uint32_t level0Crc32) {
     char buf[64];
@@ -534,6 +529,63 @@ bool SaveDumpManifest(const std::wstring& manPath,
 }
 
 // -----------------------------------------------------------------------------
+// Base palette (DATA\PALETTE.RAW) and texture pack replacement fade
+// -----------------------------------------------------------------------------
+
+bool LoadBasePaletteFile(const std::wstring& path, uint8_t (&outPalette)[kBasePaletteBytes]) {
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, path.c_str(), L"rb") != 0 || !fp) {
+        return false;
+    }
+    uint8_t buf[kBasePaletteBytes + 1] = {};
+    const size_t n = std::fread(buf, 1, sizeof(buf), fp);
+    std::fclose(fp);
+    if (n != kBasePaletteBytes) {
+        return false;
+    }
+    std::memcpy(outPalette, buf, kBasePaletteBytes);
+    return true;
+}
+
+void ComputePaletteFadeFactor(const uint8_t* basePalette, const uint8_t* currentPalette, float outFade[3]) {
+    outFade[0] = outFade[1] = outFade[2] = 1.0f;
+    if (!basePalette || !currentPalette) {
+        return;
+    }
+    for (int c = 0; c < 3; ++c) {
+        uint32_t baseSum = 0;
+        uint32_t curSum = 0;
+        for (int i = 1; i < 256; ++i) {
+            baseSum += basePalette[i * 4 + c];
+            curSum += currentPalette[i * 4 + c];
+        }
+        if (baseSum == 0) {
+            continue;
+        }
+        const float f = static_cast<float>(curSum) / static_cast<float>(baseSum);
+        outFade[c] = std::min(1.0f, std::max(0.0f, f));
+    }
+}
+
+bool PaletteIsUniformScale(const uint8_t* basePalette, const uint8_t* currentPalette, const float fade[3]) {
+    if (!basePalette || !currentPalette) {
+        return true;
+    }
+    int matching = 0;
+    for (int i = 1; i < 256; ++i) {
+        bool ok = true;
+        for (int c = 0; c < 3 && ok; ++c) {
+            const int expected = static_cast<int>(std::lround(basePalette[i * 4 + c] * fade[c]));
+            ok = std::abs(static_cast<int>(currentPalette[i * 4 + c]) - expected) <= 3;
+        }
+        if (ok) {
+            ++matching;
+        }
+    }
+    return matching * 100 >= 255 * 95;
+}
+
+// -----------------------------------------------------------------------------
 // Texture Dumper worker thread implementation
 // -----------------------------------------------------------------------------
 
@@ -545,20 +597,24 @@ struct QueuedDumpItem {
 class TextureDumper {
 public:
     TextureDumper() = default;
-    ~TextureDumper() {
-        // The global instance is destroyed at DLL detach, under the loader lock. At that point the
-        // worker may already be killed (process exit) and may hold m_mutex, so never join and never
-        // block: a joinable std::thread left in its destructor would call std::terminate.
-        if (g_isProcessTerminating.load()) {
-            StopWithoutBlocking();
-        } else {
-            Shutdown();
-        }
-    }
+    // The global instance is leaked on purpose and never reaches this destructor (see
+    // g_textureDumper), so process exit runs no teardown under the loader lock.
+    ~TextureDumper() { Shutdown(); }
 
-    void Init(const std::wstring& dumpDir) {
+    void Init(const std::wstring& dumpDir, const std::wstring& basePalettePath) {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_running) {
+            return;
+        }
+        m_dumpedSessionCount.store(0, std::memory_order_relaxed);
+        // Dumps use the full-brightness base palette, never the frame's palette: textures first
+        // seen during a palette fade would otherwise be dumped dark or black.
+        if (!LoadBasePaletteFile(basePalettePath, m_basePalette)) {
+            if (!m_paletteWarned) {
+                m_paletteWarned = true;
+                LOG_WARN("TexturePack: base palette %ls is missing or not %u bytes; texture dump disabled",
+                         basePalettePath.c_str(), static_cast<unsigned>(kBasePaletteBytes));
+            }
             return;
         }
         m_dumpDir = dumpDir;
@@ -600,9 +656,7 @@ public:
             FindClose(hFind);
         }
 
-        m_dumpedSessionCount.store(0, std::memory_order_relaxed);
         m_stop = false;
-        m_workerExited = false;
         m_running = true;
         m_worker = std::thread(&TextureDumper::WorkerLoop, this);
     }
@@ -625,27 +679,8 @@ public:
         m_running = false;
     }
 
-    // DLL-detach path: stop without joining or blocking. Flush the manifest once if m_mutex is
-    // free; a worker killed at process exit may own it, in which case the flush is skipped.
-    void StopWithoutBlocking() {
-        m_stop.store(true);
-        m_cv.notify_all();
-        if (m_running) {
-            std::unique_lock<std::mutex> lock(m_mutex, std::try_to_lock);
-            if (lock.owns_lock()) {
-                const std::unordered_map<std::string, TextureDumpInfo> entries = m_manifestEntries;
-                const std::wstring manPath = m_dumpDir + L"\\manifest.json";
-                lock.unlock();
-                SaveDumpManifest(manPath, entries);
-            }
-        }
-        if (m_worker.joinable()) {
-            m_worker.detach();
-        }
-    }
-
-    void Queue(const TextureDumpInfo& info, const uint8_t* level0Indices, const uint8_t* palette) {
-        if (!m_running || !level0Indices || !palette || info.width <= 0 || info.height <= 0) {
+    void Queue(const TextureDumpInfo& info, const uint8_t* level0Indices) {
+        if (!m_running || !level0Indices || info.width <= 0 || info.height <= 0) {
             return;
         }
 
@@ -663,6 +698,7 @@ public:
         const size_t total = static_cast<size_t>(info.width) * static_cast<size_t>(info.height);
         item.rgbaPixels.resize(total);
 
+        const uint8_t* palette = m_basePalette;
         for (size_t i = 0; i < total; ++i) {
             const uint8_t idx = level0Indices[i];
             if (info.colorKey && idx == 0) {
@@ -681,16 +717,6 @@ public:
         }
         m_cv.notify_one();
     }
-
-    // Test seam: asks the worker to return without joining it, so m_worker stays joinable.
-    void RequestStopForTest() {
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_stop = true;
-        }
-        m_cv.notify_all();
-    }
-    bool WorkerExitedForTest() const { return m_workerExited.load(); }
 
     uint32_t GetDumpedCount() const { return m_dumpedSessionCount.load(std::memory_order_relaxed); }
     uint32_t GetQueuedCount() {
@@ -761,13 +787,13 @@ private:
             finalEntries = m_manifestEntries;
         }
         SaveDumpManifest(m_dumpDir + L"\\manifest.json", finalEntries);
-        m_workerExited.store(true);
     }
 
     std::wstring m_dumpDir;
+    uint8_t m_basePalette[kBasePaletteBytes] = {};
+    bool m_paletteWarned = false;
     bool m_running = false;
     std::atomic<bool> m_stop{false};
-    std::atomic<bool> m_workerExited{false};
     std::thread m_worker;
     mutable std::mutex m_mutex;
     std::condition_variable m_cv;
@@ -778,20 +804,22 @@ private:
     std::atomic<uint32_t> m_dumpedSessionCount{0};
 };
 
-static TextureDumper g_textureDumper;
+// Intentionally leaked singleton: it is never destroyed, so DLL_PROCESS_DETACH at process exit
+// runs no destructor under the loader lock. By then the OS has killed the worker, possibly while it
+// held m_mutex, and joining, locking, allocating or flushing the manifest there can hang the exit.
+// The periodic manifest flush and the disk scan at the next Init already cover a killed worker.
+static TextureDumper& g_textureDumper = *new TextureDumper();
 
-void TextureDumpInit(const std::wstring& dumpDir) {
-    g_textureDumper.Init(dumpDir);
+void TextureDumpInit(const std::wstring& dumpDir, const std::wstring& basePalettePath) {
+    g_textureDumper.Init(dumpDir, basePalettePath);
 }
 
 void TextureDumpShutdown() {
     g_textureDumper.Shutdown();
 }
 
-void TextureDumpQueue(const TextureDumpInfo& info,
-                      const uint8_t* level0Indices,
-                      const uint8_t* palette) {
-    g_textureDumper.Queue(info, level0Indices, palette);
+void TextureDumpQueue(const TextureDumpInfo& info, const uint8_t* level0Indices) {
+    g_textureDumper.Queue(info, level0Indices);
 }
 
 uint32_t TextureDumpGetDumpedCount() {
@@ -832,14 +860,8 @@ struct DecodedReplacement {
 class TexturePackManager {
 public:
     TexturePackManager() = default;
-    ~TexturePackManager() {
-        // Same rule as ~TextureDumper: at DLL detach never join and never take m_mutex.
-        if (g_isProcessTerminating.load()) {
-            StopWithoutBlocking();
-        } else {
-            Shutdown();
-        }
-    }
+    // Never reached by the leaked global instance (see g_texturePackManager).
+    ~TexturePackManager() { Shutdown(); }
 
     void Init(const std::wstring& packDir, int32_t maxMiB, int32_t decodeBudgetMs) {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -884,9 +906,9 @@ public:
             FindClose(hFind);
         }
         LOG_INFO("TexturePack: %u files indexed", count);
+        m_indexedCount.store(count, std::memory_order_relaxed);
 
         m_stop = false;
-        m_workerExited = false;
         m_running = true;
         m_worker = std::thread(&TexturePackManager::WorkerLoop, this);
     }
@@ -908,21 +930,13 @@ public:
         m_running = false;
         m_replacements.clear();
         m_indexedFiles.clear();
+        m_indexedCount.store(0, std::memory_order_relaxed);
         m_pendingSet.clear();
         m_rejectedIds.clear();
         m_loadQueue.clear();
         m_readyQueue.clear();
         m_totalAllocatedBytes = 0;
         m_maxMibWarned = false;
-    }
-
-    // DLL-detach path: set the stop flag and detach the worker without joining or locking.
-    void StopWithoutBlocking() {
-        m_stop.store(true);
-        m_cv.notify_all();
-        if (m_worker.joinable()) {
-            m_worker.detach();
-        }
     }
 
     void ClearD3DResources() {
@@ -934,6 +948,11 @@ public:
 
     uint64_t GetGeneration() const {
         return m_generation.load(std::memory_order_relaxed);
+    }
+
+    // Lock-free, so the presenter can test it every frame.
+    uint32_t GetIndexedCount() const {
+        return m_indexedCount.load(std::memory_order_relaxed);
     }
 
     bool HasIndexed(const std::string& id) {
@@ -1130,16 +1149,6 @@ public:
         }
     }
 
-    // Test seam: asks the worker to return without joining it, so m_worker stays joinable.
-    void RequestStopForTest() {
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_stop = true;
-        }
-        m_cv.notify_all();
-    }
-    bool WorkerExitedForTest() const { return m_workerExited.load(); }
-
     TexturePackStats GetStats() {
         std::lock_guard<std::mutex> lock(m_mutex);
         TexturePackStats s;
@@ -1213,7 +1222,6 @@ private:
         if (needUninit) {
             CoUninitialize();
         }
-        m_workerExited.store(true);
     }
 
     std::wstring m_packDir;
@@ -1221,7 +1229,7 @@ private:
     int32_t m_decodeBudgetMs = 4;
     bool m_running = false;
     std::atomic<bool> m_stop{false};
-    std::atomic<bool> m_workerExited{false};
+    std::atomic<uint32_t> m_indexedCount{0};
     bool m_maxMibWarned = false;
     size_t m_totalAllocatedBytes = 0;
 
@@ -1238,7 +1246,9 @@ private:
     std::deque<DecodedReplacement> m_readyQueue;
 };
 
-static TexturePackManager g_texturePackManager;
+// Intentionally leaked singleton, for the same reason as g_textureDumper: at process exit its
+// destructor would join a killed worker and release D3D11 SRVs under the loader lock.
+static TexturePackManager& g_texturePackManager = *new TexturePackManager();
 
 void TexturePackInit(const std::wstring& packDir, int32_t maxMiB, int32_t decodeBudgetMs) {
     g_texturePackManager.Init(packDir, maxMiB, decodeBudgetMs);
@@ -1260,6 +1270,10 @@ uint64_t TexturePackGetGeneration() {
     return g_texturePackManager.GetGeneration();
 }
 
+uint32_t TexturePackGetIndexedCount() {
+    return g_texturePackManager.GetIndexedCount();
+}
+
 ReplacementTexture* TexturePackGetOrQueue(const std::string& id, int32_t origW, int32_t origH) {
     return g_texturePackManager.GetOrQueue(id, origW, origH, nullptr);
 }
@@ -1279,41 +1293,4 @@ TexturePackStats TexturePackGetStats() {
 
 bool TexturePackHasIndexed(const std::string& id) {
     return g_texturePackManager.HasIndexed(id);
-}
-
-// -----------------------------------------------------------------------------
-// Test seam for the DLL-detach destructor path
-// -----------------------------------------------------------------------------
-
-bool TexturePackTestDestroyAtProcessExit(const std::wstring& dir) {
-    TextureDumper* dumper = new TextureDumper();
-    TexturePackManager* pack = new TexturePackManager();
-    dumper->Init(dir);
-    pack->Init(dir, 16, 4);
-
-    // A thread killed by the OS at process exit leaves its std::thread joinable. Reproduce that
-    // state in-process: let both workers return on their own, but never join them.
-    dumper->RequestStopForTest();
-    pack->RequestStopForTest();
-    bool exited = false;
-    for (int i = 0; i < 500; ++i) {
-        if (dumper->WorkerExitedForTest() && pack->WorkerExitedForTest()) {
-            exited = true;
-            break;
-        }
-        Sleep(10);
-    }
-    if (!exited) {
-        // Leak both objects: destroying them under a running worker would be undefined behaviour.
-        return false;
-    }
-    // The worker set its exit flag as its last member access; let the thread leave its function.
-    Sleep(50);
-
-    const bool wasTerminating = g_isProcessTerminating.load();
-    g_isProcessTerminating.store(true);
-    delete pack;
-    delete dumper;
-    g_isProcessTerminating.store(wasTerminating);
-    return true;
 }

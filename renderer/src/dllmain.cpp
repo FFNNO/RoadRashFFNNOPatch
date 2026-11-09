@@ -7,7 +7,6 @@
 #include "exe_identity.h"
 #include "hook_sites.h"
 #include "capture.h"
-#include "texture_pack.h"
 
 static HMODULE g_hModule = nullptr;
 static HMODULE g_systemDDraw = nullptr;
@@ -132,10 +131,12 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         DisableThreadLibraryCalls(hinstDLL);
         g_hModule = hinstDLL;
     } else if (fdwReason == DLL_PROCESS_DETACH) {
-        // Never call FreeLibrary or unpatch code under the loader lock.
-        // Both paths run the static destructors under the loader lock, so the texture pack
-        // workers must be stopped without joining: mark the detach before they run.
-        TexturePackSetProcessTerminating();
+        // Never call FreeLibrary or unpatch code under the loader lock, and do no cleanup here.
+        // At process exit (lpvReserved != nullptr) the OS has already killed every other thread,
+        // possibly while they held locks, and the static destructors run under the loader lock.
+        // The objects that own D3D11/DXGI resources, worker threads or mutexes (presenter,
+        // texture dumper, texture pack, capture caches) are leaked singletons for that reason:
+        // their teardown there could block forever. The OS reclaims everything at exit.
         if (lpvReserved == nullptr) {
             LogClose();
         }
