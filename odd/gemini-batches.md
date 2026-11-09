@@ -77,6 +77,8 @@ Status: completed; verified with forward_test, hook_test, check_hook_sites, veri
 
 ## B6: High-resolution texture pack (task T7)
 
+Status: brief ready in `out/gemini/B6/brief.md` (local). Finding: none of the 118 runtime texture IDs in the B4 dumps exists in the `texdump.py` manifest (sprite IDs also hash the CLUT, and track textures differ), so B6 adds a runtime texture dump (`[TexturePack] Dump=1`) as the ID source for `upscale.py`.
+
 - **Goal:** at texture creation, compute the texture ID; if `texture-pack/<id>.png` exists (any power-of-two multiple of the original size, RGBA), load it with WIC and use it instead. Keep the original UV box in normalized coordinates. Add a Python tool `tools/upscale.py` that reads `dumps/textures/manifest.json` and produces 4x upscales (Pillow Lanczos baseline; optional external upscaler command configurable on the command line), preserving alpha edges from index 0.
 - **Attach:** B5 output; `tools/texdump.py`; one sample of the manifest.
 - **Review checks:** a pack with 3 replaced textures loads (log lines with IDs); missing textures fall back; memory stays reasonable with the full pack (report VRAM estimate); no load-time stutter at track start beyond 1 s.
