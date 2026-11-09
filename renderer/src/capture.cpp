@@ -65,6 +65,9 @@ CapturedQuad g_capturedQuads[kMaxCapturedQuads];
 uint32_t g_capturedCount = 0;
 uint32_t g_overflowCount = 0;
 uint32_t g_batchIndex = 0;
+// Set when the level state changed after the first batch of a frame; the texel cache is cleared
+// before the first batch of the next frame (see DecideCacheInvalidation).
+bool g_texelClearPending = false;
 uint32_t g_raceFrameNumber = 0;
 bool g_f11WasDown = false;
 bool g_dumpThisFrame = false;
@@ -188,8 +191,25 @@ void CheckAndInvalidateCacheOnLevelChange() {
     const uint32_t* families = GlobalPtr<const uint32_t>(kVaFamilySlots);
     const uint32_t raceTick = *GlobalPtr<const uint32_t>(kVaRaceTick);
 
-    if (UpdateLevelStateSnapshot(g_levelSnapshot, globalRsc, trackRsc, spritePdat, bikerBuf, families, raceTick)) {
+    if (g_texelClearPending && g_batchIndex == 0) {
         CaptureInvalidateCache();
+    }
+    const bool changed =
+        UpdateLevelStateSnapshot(g_levelSnapshot, globalRsc, trackRsc, spritePdat, bikerBuf, families, raceTick);
+    switch (DecideCacheInvalidation(changed, g_batchIndex)) {
+    case CacheInvalidation::Full:
+        CaptureInvalidateCache();
+        break;
+    case CacheInvalidation::CrcNowTexelsNextFrame:
+        std::memset(g_crcCache, 0, sizeof(g_crcCache));
+        if (!g_texelClearPending) {
+            LOG_INFO("Level state changed in batch %u of frame %u; texel cache clear deferred to the next frame",
+                     g_batchIndex, g_raceFrameNumber);
+        }
+        g_texelClearPending = true;
+        break;
+    case CacheInvalidation::None:
+        break;
     }
 }
 
@@ -272,6 +292,13 @@ bool WriteFrameJson(const std::wstring& path, uint32_t frameNum, int width, int 
 }
 
 }  // namespace
+
+CacheInvalidation DecideCacheInvalidation(bool levelChanged, uint32_t batchIndex) {
+    if (!levelChanged) {
+        return CacheInvalidation::None;
+    }
+    return (batchIndex == 0) ? CacheInvalidation::Full : CacheInvalidation::CrcNowTexelsNextFrame;
+}
 
 uint32_t ComputeTextureRectCrc32(const uint8_t* level0Ptr,
                                  int32_t width,
@@ -796,6 +823,7 @@ void CaptureInit(HMODULE hostModule, const std::wstring& dumpDir) {
 
 void CaptureInvalidateCache() {
     std::memset(g_crcCache, 0, sizeof(g_crcCache));
+    g_texelClearPending = false;
     g_texPixelCache.clear();
     g_texPixelCacheBytes = 0;
     ++g_cacheGeneration;

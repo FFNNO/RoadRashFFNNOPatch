@@ -123,6 +123,12 @@ bool UpdateLevelStateSnapshot(LevelStateSnapshot& snap,
                               uint32_t bikerBuf,
                               const uint32_t familySlots[4],
                               uint32_t raceTick);
+// What a level-state change does to the capture caches. The CRC cache is cleared at once so new
+// captures hash fresh texels. The texel cache, and the generation bump that makes the presenter drop
+// its SRVs, is cleared only before the first batch of a frame: quads already captured this frame
+// still need their texels when the presenter draws the frame, or they are drawn white.
+enum class CacheInvalidation { None, Full, CrcNowTexelsNextFrame };
+CacheInvalidation DecideCacheInvalidation(bool levelChanged, uint32_t batchIndex);
 bool ShouldCullTexturedQuad(const CapturedVertex verts[4],
                             const int32_t clipRect[4],
                             uint32_t pdatPtr);

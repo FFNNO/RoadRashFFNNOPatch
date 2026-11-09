@@ -16,6 +16,7 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -1199,6 +1200,19 @@ private:
         return true;
     }
 
+    // A textured quad that falls back to the 1x1 white texture is drawn as a solid white
+    // rectangle. Logs the first fallback per texture key and reason so it can be traced.
+    void LogWhiteTextureFallback(const CapturedQuad& q, const char* reason) {
+        const uint64_t key = (static_cast<uint64_t>(q.pdatPtr) << 32) | static_cast<uint64_t>(q.level0Crc32);
+        if (!m_whiteFallbackLogged.insert(key).second) {
+            return;
+        }
+        LOG_WARN("World texture drawn white (%s): pdat=0x%08X crc=%08X size=%dx%d pdat_flags=0x%08X "
+                 "clut=%u sprite=%d frame=%u",
+                 reason, q.pdatPtr, q.level0Crc32, q.texWidth, q.texHeight, q.pdatFlags,
+                 static_cast<unsigned>(q.spriteClut), static_cast<int>(q.spriteIndex), CaptureGetFrameNumber());
+    }
+
     // Returns the SRV of the quad's texture; *outLevels receives its uploaded mip level count and
     // *outReplacement whether the SRV is a texture pack replacement.
     ID3D11ShaderResourceView* GetOrCreateWorldTextureSRV(const CapturedQuad& q, const uint8_t* palette,
@@ -1214,6 +1228,7 @@ private:
             *outReplacement = false;
         }
         if (q.pdatPtr == 0 || q.texWidth <= 0 || q.texHeight <= 0) {
+            LogWhiteTextureFallback(q, "no texture pointer or size");
             return m_srvWhite.Get();
         }
         const bool colorKey = (q.pdatFlags & 0x02u) != 0;
@@ -1285,6 +1300,7 @@ private:
         TextureMipChainView chain;
         if (!CaptureLookupTextureMipChain(q.pdatPtr, q.level0Crc32, chain) || chain.levels <= 0 ||
             chain.width[0] <= 0 || chain.height[0] <= 0) {
+            LogWhiteTextureFallback(q, "texels not in the capture pixel cache");
             return m_srvWhite.Get();
         }
         // MipFilter=chosen keeps the B4 single level; trilinear uploads every engine level.
@@ -1334,11 +1350,13 @@ private:
         ComPtr<ID3D11Texture2D> tex;
         HRESULT hr = m_device->CreateTexture2D(&td, initData, &tex);
         if (FAILED(hr)) {
+            LogWhiteTextureFallback(q, "CreateTexture2D failed");
             return m_srvWhite.Get();
         }
         ComPtr<ID3D11ShaderResourceView> srv;
         hr = m_device->CreateShaderResourceView(tex.Get(), nullptr, &srv);
         if (FAILED(hr)) {
+            LogWhiteTextureFallback(q, "CreateShaderResourceView failed");
             return m_srvWhite.Get();
         }
         if (outLevels) {
@@ -2206,6 +2224,7 @@ private:
     ComPtr<ID3D11SamplerState> m_samplerFilteredWrap;
     ComPtr<ID3D11SamplerState> m_samplerFilteredClamp;
     ComPtr<ID3D11SamplerState> m_samplerAtlas;
+    std::unordered_set<uint64_t> m_whiteFallbackLogged;
     ComPtr<ID3D11Texture2D> m_texWhite;
     ComPtr<ID3D11ShaderResourceView> m_srvWhite;
     ComPtr<ID3D11Texture2D> m_texLayerRgba;

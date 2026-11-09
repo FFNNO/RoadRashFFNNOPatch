@@ -774,6 +774,19 @@ int main() {
               "decreased raceTick (new race) triggers cache invalidation");
     }
 
+    // 4b. A level change after the first batch must not drop texels of quads already captured
+    // this frame (they would be drawn white); the texel cache waits for the next frame.
+    {
+        Check(DecideCacheInvalidation(false, 0) == CacheInvalidation::None &&
+                  DecideCacheInvalidation(false, 7) == CacheInvalidation::None,
+              "no level change leaves the capture caches alone");
+        Check(DecideCacheInvalidation(true, 0) == CacheInvalidation::Full,
+              "a level change before the first batch clears every capture cache at once");
+        Check(DecideCacheInvalidation(true, 1) == CacheInvalidation::CrcNowTexelsNextFrame &&
+                  DecideCacheInvalidation(true, 12) == CacheInvalidation::CrcNowTexelsNextFrame,
+              "a level change mid-frame clears only the CRC cache and defers the texel cache");
+    }
+
     // 5. ShouldCullTexturedQuad & ShouldCullFlatQuad
     {
         const int32_t clip[4] = {0, 0, 640, 479};
