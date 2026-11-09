@@ -130,8 +130,10 @@ def collect_items(dump_dir: str, manifest: dict, selected_ids):
     return items
 
 
-def edge_band_px(scale: int) -> int:
-    """Width of the recoloured outer band: about 1.5 source texels at the output size."""
+def edge_band_px(scale: int, band_px: int = None) -> int:
+    """Width of the recoloured outer band. If band_px is given, returns that; otherwise 1.5 source texels."""
+    if band_px is not None:
+        return max(0, band_px)
     return max(1, round(1.5 * scale))
 
 
@@ -187,7 +189,8 @@ def prepare_external(arr: np.ndarray, color_key: bool) -> dict:
     return prep
 
 
-def finish_external(prep: dict, out_im: Image.Image, mask_out: Image.Image, scale: int) -> Image.Image:
+def finish_external(prep: dict, out_im: Image.Image, mask_out: Image.Image, scale: int,
+                    band_px: int = None) -> Image.Image:
     """Combines the --external outputs for one texture into the final RGBA replacement."""
     arr = prep["arr"]
     target_w, target_h = arr.shape[1] * scale, arr.shape[0] * scale
@@ -206,7 +209,7 @@ def finish_external(prep: dict, out_im: Image.Image, mask_out: Image.Image, scal
         # The tool erased a tiny sprite (or gave no mask): keep the plain thresholded alpha.
         alpha_img = Image.fromarray(arr[..., 3], "L")
         mask_up = np.array(alpha_img.resize((target_w, target_h), Image.Resampling.LANCZOS)) >= 128
-    rgb_up = recolor_edge_band(np.array(out_im), mask_up, edge_band_px(scale))
+    rgb_up = recolor_edge_band(np.array(out_im), mask_up, edge_band_px(scale, band_px))
     alpha_up = Image.fromarray(np.where(mask_up, 255, 0).astype(np.uint8), "L")
     return Image.merge("RGBA", (*Image.fromarray(rgb_up, "RGB").split(), alpha_up))
 
@@ -238,7 +241,7 @@ def parse_id_size(tid: str):
     return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
 
-def upscale_batch_external(jobs, external_cmd: str, scale: int):
+def upscale_batch_external(jobs, external_cmd: str, scale: int, band_px: int = None):
     """Upscales [(tid, im, color_key)] with one --external call on directories.
 
     {in} and {out} are directories here. Returns {tid: RGBA image}; a texture whose output is
@@ -267,7 +270,7 @@ def upscale_batch_external(jobs, external_cmd: str, scale: int):
             with Image.open(out_path) as out_im:
                 mask_out = Image.open(mask_path) if os.path.exists(mask_path) else None
                 try:
-                    results[tid] = finish_external(prep, out_im, mask_out, scale)
+                    results[tid] = finish_external(prep, out_im, mask_out, scale, band_px)
                 finally:
                     if mask_out is not None:
                         mask_out.close()
@@ -275,7 +278,7 @@ def upscale_batch_external(jobs, external_cmd: str, scale: int):
 
 
 def upscale_image(im: Image.Image, scale: int = 4, color_key: bool = True,
-                  external_cmd: str = None) -> Image.Image:
+                  external_cmd: str = None, band_px: int = None) -> Image.Image:
     """Upscales an image by scale factor (2, 4, or 8) preserving alpha edges."""
     orig_w, orig_h = im.size
     target_w, target_h = orig_w * scale, orig_h * scale
@@ -287,7 +290,7 @@ def upscale_image(im: Image.Image, scale: int = 4, color_key: bool = True,
         mask_out = None
         if prep["mask"] is not None:
             mask_out = run_external(prep["mask"], external_cmd, target_w, target_h)
-        return finish_external(prep, out_im, mask_out, scale)
+        return finish_external(prep, out_im, mask_out, scale, band_px)
 
     if not color_key or arr.shape[-1] < 4:
         rgb = arr[..., :3] if arr.shape[-1] >= 3 else np.repeat(arr[..., :1], 3, axis=-1)
@@ -412,6 +415,7 @@ def run_self_test():
     assert (fixed[0:40, 38:40] == [90, 90, 90]).all(), "A part thinner than the band must keep its colour"
     assert (fixed[~ring_mask] == 0).all(), "Texels outside the mask must not change"
     assert edge_band_px(4) == 6 and edge_band_px(2) == 3, "Band is 1.5 source texels"
+    assert edge_band_px(4, 1) == 1 and edge_band_px(4, 0) == 0, "Custom band must be respected"
 
     # 8. External path: the silhouette comes from the tool output, not from a resized alpha
     ext_sq = np.array(upscale_image(im_hole, scale=scale, color_key=True, external_cmd=mock_cmd))
@@ -456,6 +460,8 @@ def main():
     parser.add_argument("--external", help="External upscaler command template with {in} and {out}")
     parser.add_argument("--external-batch", type=int, default=0,
                         help="With --external: {in}/{out} are directories and up to N textures go in one call")
+    parser.add_argument("--edge-band", type=int, default=1,
+                        help="Recoloured outer band in pixels (default: 1 for Remacri, 6 for legacy v2)")
     parser.add_argument("--self-test", action="store_true", help="Run synthetic self-test suite")
 
     args = parser.parse_args()
@@ -505,7 +511,7 @@ def main():
                     im = im.convert("RGBA")
                     jobs.append((tid, im, resolve_color_key(color_key, im)))
             try:
-                results = upscale_batch_external(jobs, args.external, args.scale)
+                results = upscale_batch_external(jobs, args.external, args.scale, args.edge_band)
             except Exception as e:
                 print(f"Error upscaling batch at {start}: {e}", file=sys.stderr)
                 continue
@@ -524,7 +530,7 @@ def main():
             with Image.open(in_png) as im:
                 im = im.convert("RGBA")
                 color_key = resolve_color_key(color_key, im)
-                up = upscale_image(im, scale=args.scale, color_key=color_key, external_cmd=args.external)
+                up = upscale_image(im, scale=args.scale, color_key=color_key, external_cmd=args.external, band_px=args.edge_band)
                 up.save(out_png, format="PNG")
                 processed += 1
                 print(f"  [{processed}/{len(items)}] {tid}: {im.size[0]}x{im.size[1]} -> {up.size[0]}x{up.size[1]}")
