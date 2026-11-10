@@ -25,6 +25,7 @@
 #include "../src/save_redirect.h"
 #include "../src/overlay_text.h"
 #include "../src/widescreen.h"
+#include "../src/options_menu.h"
 
 namespace {
 
@@ -2718,6 +2719,164 @@ int main() {
         Check(CaptureGetWideHorizonLayer(wideW) == nullptr && wideW == 0,
               "CaptureGetWideHorizonLayer: nothing after end of frame even with widescreen applied");
         WidescreenSetAppliedWidth(kEngineProjectionWidth);
+    }
+
+    // Graphics options menu item (rr95-widescreen W3). The reference bytes are slots 4..6 of menu 19
+    // dumped from both exe builds (0x005a0988..0x005a0a2f, identical in original and patched).
+    {
+        static const uint8_t kSlot4[kMenuItemSize] = {
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xde, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x46, 0x01, 0x00, 0x00, 0xb4, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x04, 0x04, 0x03, 0x06,
+            0x06, 0x03, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xb0, 0xb4, 0x45, 0x00,
+            0xdf, 0x03, 0x00, 0x00, 0x52, 0x48, 0x00, 0x00};
+        static const uint8_t kSlot5[kMenuItemSize] = {
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x76, 0x01, 0x00, 0x00, 0xb4, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x05, 0x05, 0x04, 0x06,
+            0x06, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+        static const uint8_t kSlot6[kMenuItemSize] = {
+            0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x56, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xa6, 0x01, 0x00, 0x00, 0xb4, 0x00, 0x00, 0x00, 0x3a, 0x00, 0x00, 0x00, 0x06, 0x06, 0x05, 0x00,
+            0x00, 0x05, 0x00, 0x00, 0x0c, 0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x57, 0x00, 0x00, 0x00, 0x52, 0x48, 0x00, 0x00};
+        auto dumpAt = [&](intptr_t delta) {
+            std::vector<uint8_t> v(kGraphicsMenuSlotsSize);
+            std::memcpy(v.data(), kSlot4, kMenuItemSize);
+            std::memcpy(v.data() + kMenuItemSize, kSlot5, kMenuItemSize);
+            std::memcpy(v.data() + 2 * kMenuItemSize, kSlot6, kMenuItemSize);
+            uint32_t handler = 0;
+            std::memcpy(&handler, v.data() + 0x2c, 4);
+            handler = static_cast<uint32_t>(static_cast<intptr_t>(handler) + delta);
+            std::memcpy(v.data() + 0x2c, &handler, 4);
+            return v;
+        };
+        Check(kVaGraphicsMenuSlots == 0x005a0988 && kVaWidescreenMenuItem == 0x005a09c0 &&
+                  kGraphicsMenuSlotsSize == 0xa8,
+              "menu W3: slots 4..6 span 0x5a0988..0x5a0a30, slot 5 at 0x5a09c0");
+
+        // Slot verification.
+        std::vector<uint8_t> dump = dumpAt(0);
+        Check(GraphicsMenuSlotsAreShipped(dump.data(), 0), "menu W3: shipped slots verify at the preferred base");
+        const intptr_t delta = 0x00230000;
+        std::vector<uint8_t> rebased = dumpAt(delta);
+        Check(GraphicsMenuSlotsAreShipped(rebased.data(), delta), "menu W3: shipped slots verify when rebased");
+        Check(!GraphicsMenuSlotsAreShipped(dump.data(), delta),
+              "menu W3: an unrelocated handler does not verify against a rebased module");
+        std::vector<uint8_t> withHwnd = rebased;
+        for (int s = 0; s < 3; ++s) {
+            const uint32_t hwnd = 0x000a0b0cu + static_cast<uint32_t>(s);
+            std::memcpy(withHwnd.data() + s * kMenuItemSize, &hwnd, 4);
+        }
+        Check(GraphicsMenuSlotsAreShipped(withHwnd.data(), delta),
+              "menu W3: the HWND dwords the engine writes at +0x00 are ignored");
+        bool everyByteChecked = true;
+        for (size_t i = 0; i < kGraphicsMenuSlotsSize; ++i) {
+            if ((i % kMenuItemSize) < 4) {
+                continue;
+            }
+            std::vector<uint8_t> changed = rebased;
+            changed[i] ^= 0x01;
+            everyByteChecked = everyByteChecked && !GraphicsMenuSlotsAreShipped(changed.data(), delta);
+        }
+        Check(everyByteChecked, "menu W3: any other changed byte in slots 4..6 fails the verification");
+        std::vector<uint8_t> slot5Used = rebased;
+        slot5Used[kMenuItemSize + 0x08] = 0x56;
+        slot5Used[kMenuItemSize + 0x28] = 1;
+        Check(!GraphicsMenuSlotsAreShipped(slot5Used.data(), delta), "menu W3: a non-empty slot 5 fails the verification");
+        std::vector<uint8_t> model(kGraphicsMenuSlotsSize, 0xCD);
+        ShippedGraphicsMenuSlots(delta, model.data());
+        Check(model == rebased, "menu W3: ShippedGraphicsMenuSlots matches the exe dump (rebased)");
+
+        // Navigation and item rewrite.
+        const uint32_t handler = 0x10203040;
+        std::vector<uint8_t> out(kGraphicsMenuSlotsSize, 0xCD);
+        BuildWidescreenMenuSlots(withHwnd.data(), handler, out.data());
+        std::vector<uint8_t> expected = withHwnd;
+        expected[0x1f] = 5;  // slot 4 down
+        expected[0x20] = 5;  // slot 4 Tab
+        uint8_t* s5 = expected.data() + kMenuItemSize;
+        const uint32_t label = 0x3da, flags = 0x0010000c, enabled = 1, help = 0, extra = 0x4852;
+        std::memcpy(s5 + 0x08, &label, 4);
+        std::memcpy(s5 + 0x24, &flags, 4);
+        std::memcpy(s5 + 0x28, &enabled, 4);
+        std::memcpy(s5 + 0x2c, &handler, 4);
+        std::memcpy(s5 + 0x30, &help, 4);
+        std::memcpy(s5 + 0x34, &extra, 4);
+        Check(out == expected, "menu W3: slot 5 becomes an enabled on/off item, slot 4 down/Tab -> 5, rest unchanged");
+        const uint8_t* o4 = out.data();
+        const uint8_t* o5 = out.data() + kMenuItemSize;
+        const uint8_t* o6 = out.data() + 2 * kMenuItemSize;
+        Check(o4[0x1e] == 3 && o4[0x21] == 3 && o5[0x1e] == 4 && o5[0x21] == 4 && o5[0x1f] == 6 &&
+                  o5[0x20] == 6 && o6[0x1e] == 5 && o6[0x21] == 5 && o5[0x1c] == 5 && o5[0x1d] == 5,
+              "menu W3: chain 4 <-> 5 <-> 6 (up/Shift+Tab, down/Tab), left/right stay on slot 5");
+        int32_t rect[4] = {};
+        std::memcpy(rect, o5 + 0x0c, sizeof(rect));
+        Check(rect[0] == 0 && rect[1] == 374 && rect[2] == 180 && rect[3] == 48 && o5[0x00] == 0x0d,
+              "menu W3: slot 5 keeps its rect (0, 374, 180, 48) and the engine's HWND dword");
+        Check(!GraphicsMenuSlotsAreShipped(out.data(), delta), "menu W3: rewritten slots no longer verify as shipped");
+
+        // Label encoding (CP-1252 like the engine's ANSI strings).
+        const std::string labelBytes = WidescreenMenuLabel();
+        Check(labelBytes == std::string("Pantalla panor\xE1mica"), "menu W3: label is 'Pantalla panor\\xE1mica' in CP-1252");
+        Check(EncodeCp1252(L"Resolución") == std::string("Resoluci\xF3n"),
+              "menu W3: CP-1252 encodes o acute as 0xF3 like the game's 'Resolucion'");
+        Check(EncodeCp1252(L"Sí") == std::string("S\xED"), "menu W3: CP-1252 encodes i acute as 0xED");
+        Check(EncodeCp1252(L"中").empty(), "menu W3: a character outside CP-1252 gives an empty string");
+        Check(WidescreenMenuText(true, "On", "Off") == std::string("Pantalla panor\xE1mica: On") &&
+                  WidescreenMenuText(false, "On", "Off") == std::string("Pantalla panor\xE1mica: Off"),
+              "menu W3: item text is '<label>: On|Off' with no \\x01 value part");
+        Check(kShippedOnOffStrings[0] == 'O' && kShippedOnOffStrings[4] == 'O' && kVaOnOffStrings == 0x005064a8,
+              "menu W3: the game's On/Off strings are expected at 0x5064a8/0x5064ac");
+
+        // Registry value parsing.
+        const uint8_t one = 1, zero = 0, two = 2;
+        const uint32_t dwOne = 1, dwZero = 0, dwTwo = 2;
+        Check(ParseWidescreenRegistryValue(REG_BINARY, &one, 1) == 1 &&
+                  ParseWidescreenRegistryValue(REG_BINARY, &zero, 1) == 0,
+              "menu W3: REG_BINARY 1 byte 1/0 -> 1/0");
+        Check(ParseWidescreenRegistryValue(REG_DWORD, reinterpret_cast<const uint8_t*>(&dwOne), 4) == 1 &&
+                  ParseWidescreenRegistryValue(REG_DWORD, reinterpret_cast<const uint8_t*>(&dwZero), 4) == 0,
+              "menu W3: REG_DWORD 1/0 -> 1/0");
+        Check(ParseWidescreenRegistryValue(REG_BINARY, &two, 1) == kWidescreenRegistryInvalid &&
+                  ParseWidescreenRegistryValue(REG_DWORD, reinterpret_cast<const uint8_t*>(&dwTwo), 4) ==
+                      kWidescreenRegistryInvalid &&
+                  ParseWidescreenRegistryValue(REG_BINARY, &one, 0) == kWidescreenRegistryInvalid &&
+                  ParseWidescreenRegistryValue(REG_DWORD, &one, 1) == kWidescreenRegistryInvalid &&
+                  ParseWidescreenRegistryValue(REG_SZ, &one, 1) == kWidescreenRegistryInvalid &&
+                  ParseWidescreenRegistryValue(REG_BINARY, nullptr, 1) == kWidescreenRegistryInvalid,
+              "menu W3: other values, sizes, types or no data -> invalid");
+
+        // Effective setting: registry present/absent x ini values.
+        WidescreenSetting iniOff;
+        WidescreenSetting iniAuto;
+        iniAuto.mode = WidescreenMode::Auto;
+        WidescreenSetting iniFixed;
+        iniFixed.mode = WidescreenMode::Fixed;
+        iniFixed.fixedWidth = 480;
+        const WidescreenSetting inis[3] = {iniOff, iniAuto, iniFixed};
+        bool regOn = true, regOff = true, absent = true, invalid = true;
+        for (const WidescreenSetting& ini : inis) {
+            EffectiveWidescreenSetting e = ResolveEffectiveWidescreen(ini, 1);
+            regOn = regOn && e.setting.mode == WidescreenMode::Auto && e.source == WidescreenSettingSource::Registry;
+            e = ResolveEffectiveWidescreen(ini, 0);
+            regOff = regOff && e.setting.mode == WidescreenMode::Off && e.source == WidescreenSettingSource::Registry;
+            e = ResolveEffectiveWidescreen(ini, kWidescreenRegistryAbsent);
+            absent = absent && e.setting.mode == ini.mode && e.setting.fixedWidth == ini.fixedWidth &&
+                     e.source == WidescreenSettingSource::Ini;
+            e = ResolveEffectiveWidescreen(ini, kWidescreenRegistryInvalid);
+            invalid = invalid && e.setting.mode == ini.mode && e.setting.fixedWidth == ini.fixedWidth &&
+                      e.source == WidescreenSettingSource::Ini;
+        }
+        Check(regOn, "menu W3: registry 1 -> auto for ini off/auto/480 (source registry)");
+        Check(regOff, "menu W3: registry 0 -> off for ini off/auto/480 (source registry)");
+        Check(absent, "menu W3: no registry value -> the ini setting (source ini)");
+        Check(invalid, "menu W3: an invalid registry value -> the ini setting (source ini)");
+        Check(DescribeWidescreenSetting(iniOff) == "off" && DescribeWidescreenSetting(iniAuto) == "auto" &&
+                  DescribeWidescreenSetting(iniFixed) == "480",
+              "menu W3: DescribeWidescreenSetting names off/auto/width");
+        Check(std::strcmp(WidescreenSettingSourceToString(WidescreenSettingSource::Registry), "registry") == 0 &&
+                  std::strcmp(WidescreenSettingSourceToString(WidescreenSettingSource::Ini), "ini") == 0,
+              "menu W3: WidescreenSettingSourceToString names the sources");
     }
 
     std::printf("%s (%d failure(s))\n", g_failures == 0 ? "OK" : "FAILED", g_failures);

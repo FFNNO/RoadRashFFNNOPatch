@@ -8,6 +8,7 @@
 #include "save_redirect.h"
 #include "overlay_text.h"
 #include "widescreen.h"
+#include "options_menu.h"
 #include <windows.h>
 #include <commdlg.h>
 #include <atomic>
@@ -59,6 +60,7 @@ using FUN_004688e0_Fn = uint32_t(__cdecl*)();
 using FUN_0042e850_Fn = void(__cdecl*)();
 using FUN_00467cb0_Fn = void(__fastcall*)(int* polyVerts, int edxArg);
 using FUN_00457ef0_Fn = void(__cdecl*)();
+using FUN_0045b930_Fn = const char*(__fastcall*)(void* item);
 
 FUN_0046e630_Fn g_orig_FUN_0046e630 = nullptr;
 FUN_0046ded0_Fn g_orig_FUN_0046ded0 = nullptr;
@@ -67,6 +69,7 @@ FUN_004688e0_Fn g_orig_FUN_004688e0 = nullptr;
 FUN_0042e850_Fn g_orig_FUN_0042e850 = nullptr;
 FUN_00467cb0_Fn g_orig_FUN_00467cb0 = nullptr;
 FUN_00457ef0_Fn g_orig_FUN_00457ef0 = nullptr;
+FUN_0045b930_Fn g_orig_FUN_0045b930 = nullptr;
 
 // FUN_004688e0, FUN_0042e850 and FUN_00467cb0 are all hooked; widescreen depends on it, because
 // those detours are what keep the software world rasterizers from running.
@@ -536,6 +539,23 @@ constexpr uint32_t kVaViewportWidth   = 0x00591c04;
 constexpr uint32_t kVaHiResFlag       = 0x005a292a;
 constexpr uint32_t kVaInsetFlag       = 0x005cd47c;
 
+// Graphics options menu item (W3): the state it shows, last read from the registry or the ini.
+// Read by the menu (window procedure thread) and written there and by race init (game thread).
+std::atomic<bool> g_menuWidescreenOn{false};
+bool g_registryInvalidWarned = false;
+
+// [World] Widescreen from the ini, overridden by HKCU\SOFTWARE\Electronic Arts\RoadRash 95\Widescreen
+// (REG_BINARY 1 byte: 1 = auto, 0 = off) when that value exists.
+EffectiveWidescreenSetting CurrentWidescreenSetting() {
+    const int registryValue = ReadWidescreenRegistryValue();
+    if (registryValue == kWidescreenRegistryInvalid && !g_registryInvalidWarned) {
+        g_registryInvalidWarned = true;
+        LOG_WARN("Registry value %s\\%s is not a 1-byte REG_BINARY or a REG_DWORD holding 0 or 1; using the ini",
+                 kGameRegistryKey, kWidescreenRegistryValueName);
+    }
+    return ResolveEffectiveWidescreen(GetConfig().widescreen, registryValue);
+}
+
 bool g_engineWidthsRecorded = false;
 int g_engineProjectionWidth = kEngineProjectionWidth;
 int g_engineViewportWidth = kEngineProjectionWidth;
@@ -559,6 +579,10 @@ void ApplyRaceProjectionWidth() {
     }
 
     const Config& cfg = GetConfig();
+    const EffectiveWidescreenSetting effective = CurrentWidescreenSetting();
+    g_menuWidescreenOn = effective.setting.mode != WidescreenMode::Off;
+    const std::string settingName = DescribeWidescreenSetting(effective.setting);
+    const char* settingSource = WidescreenSettingSourceToString(effective.source);
     const bool hiRes = *GlobalPtr<const uint8_t>(kVaHiResFlag) != 0;
     const bool inset = *GlobalPtr<const uint8_t>(kVaInsetFlag) != 0;
     const bool gpuWorldEffective = cfg.gpuWorld && cfg.presenterEnabled && g_worldHooksInstalled &&
@@ -573,7 +597,7 @@ void ApplyRaceProjectionWidth() {
     }
 
     WidescreenResolution res =
-        ResolveRaceProjectionWidth(cfg.widescreen, gpuWorldEffective, hiRes, inset, clientW, clientH);
+        ResolveRaceProjectionWidth(effective.setting, gpuWorldEffective, hiRes, inset, clientW, clientH);
     const bool engineDefaults = g_engineProjectionWidth == kEngineProjectionWidth &&
                                 g_engineViewportWidth == kEngineProjectionWidth;
     if (res.reason == WidescreenReason::Applied && !engineDefaults) {
@@ -603,14 +627,17 @@ void ApplyRaceProjectionWidth() {
     CaptureInvalidateHorizonPanorama();
 
     if (widen) {
-        LOG_INFO("Widescreen: race start with projection width %d (world source %dx%d, window %dx%d)",
-                 res.width, res.width << 1, kSoftwareSurfaceHeight, clientW, clientH);
-    } else if (cfg.widescreen.mode != WidescreenMode::Off) {
-        LOG_INFO("Widescreen: race start with projection width %d (%s; HiRes=%d, Inset=%d, GpuWorld=%d, window %dx%d)",
+        LOG_INFO("Widescreen: race start with projection width %d (world source %dx%d, window %dx%d; setting %s from %s)",
+                 res.width, res.width << 1, kSoftwareSurfaceHeight, clientW, clientH, settingName.c_str(),
+                 settingSource);
+    } else if (effective.setting.mode != WidescreenMode::Off) {
+        LOG_INFO("Widescreen: race start with projection width %d (%s; HiRes=%d, Inset=%d, GpuWorld=%d, window %dx%d; "
+                 "setting %s from %s)",
                  projectionWidth, WidescreenReasonToString(res.reason), hiRes ? 1 : 0, inset ? 1 : 0,
-                 gpuWorldEffective ? 1 : 0, clientW, clientH);
+                 gpuWorldEffective ? 1 : 0, clientW, clientH, settingName.c_str(), settingSource);
     } else {
-        LOG_INFO("Widescreen: race start with projection width %d (off)", projectionWidth);
+        LOG_INFO("Widescreen: race start with projection width %d (off; setting from %s)", projectionWidth,
+                 settingSource);
     }
 }
 
@@ -619,6 +646,57 @@ void __cdecl Detour_FUN_00457ef0() {
     if (g_orig_FUN_00457ef0) {
         g_orig_FUN_00457ef0();
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// "Pantalla panoramica" item in graphics options menu 19, slot 5 (feature rr95-widescreen W3; item
+// layout and verification in options_menu.h).
+//
+// Engine code (preferred VAs, same bytes in both exe builds):
+// 0x0045b930: const char* __fastcall FUN_0045b930(item): text of a flag-0x100000 item; its only
+//             caller is FUN_00439160 at 0x439455 (mov ecx, esi). For labels other than 0xd0/0x3da
+//             it formats a volume slider from DAT_0058e010[item id * 6], so it is hooked and returns
+//             the widescreen item's own text.
+// 0x00439160: void __fastcall FUN_00439160(item, selected): draws one item; the on/off handlers
+//             0x45b540/0x45b590 call it with ECX = EDX = item after toggling.
+// 0x0043ce30: FUN_0043ce30 calls the select handler at item+0x2c with ECX = item (call eax) and
+//             opens the menu it returns when nonzero.
+constexpr uint32_t kVaItemRedraw = 0x00439160;
+constexpr uint8_t kItemRedrawPrologue[9] = {0x55, 0x8B, 0xEC, 0x81, 0xEC, 0x94, 0x00, 0x00, 0x00};
+using FUN_00439160_Fn = void(__fastcall*)(void* item, void* selected);
+
+bool g_widescreenMenuInstalled = false;
+uint8_t g_menuShippedSlots[kGraphicsMenuSlotsSize] = {};
+std::string g_menuOnText;
+std::string g_menuOffText;
+char g_widescreenMenuText[96] = {};
+
+const char* __fastcall Detour_FUN_0045b930(void* item) {
+    if (g_widescreenMenuInstalled && item == GlobalPtr<void>(kVaWidescreenMenuItem)) {
+        const std::string text = WidescreenMenuText(g_menuWidescreenOn.load(), g_menuOnText.c_str(),
+                                                    g_menuOffText.c_str());
+        strncpy_s(g_widescreenMenuText, text.c_str(), _TRUNCATE);
+        return g_widescreenMenuText;
+    }
+    return g_orig_FUN_0045b930(item);
+}
+
+// Select handler of the widescreen item: flips the registry value, redraws the item, stays in the
+// menu (returns 0). The width itself changes at the next race start (ApplyRaceProjectionWidth).
+int __fastcall WidescreenMenuSelect(void* item) {
+    const bool newOn = !g_menuWidescreenOn.load();
+    if (WriteWidescreenRegistryValue(newOn)) {
+        g_menuWidescreenOn = newOn;
+        LOG_INFO("Options menu: Pantalla panoramica set to %s (HKCU\\%s\\%s = %d, REG_BINARY); applied at the next "
+                 "race start",
+                 newOn ? "On" : "Off", kGameRegistryKey, kWidescreenRegistryValueName, newOn ? 1 : 0);
+    } else {
+        LOG_WARN("Options menu: could not write HKCU\\%s\\%s; Pantalla panoramica stays %s", kGameRegistryKey,
+                 kWidescreenRegistryValueName, newOn ? "Off" : "On");
+    }
+    auto fnRedraw = reinterpret_cast<FUN_00439160_Fn>(Rebase(kVaItemRedraw));
+    fnRedraw(item, item);
+    return 0;
 }
 
 }  // namespace
@@ -728,6 +806,87 @@ static rr95::HookSite g_site_FUN_00457ef0{
     false,
     {1}
 };
+
+// First 6 bytes at 0x0045b930 (menu item value text) in both original and patched exes:
+// 55                push ebp          (1 byte)
+// 8b ec             mov  ebp, esp     (2 bytes)
+// 83 ec 20          sub  esp, 0x20    (3 bytes)
+// The next instruction (a1 c0 58 5a 00, security cookie) stays outside the span.
+static rr95::HookSite g_site_FUN_0045b930{
+    "FUN_0045b930",
+    0x0045b930,
+    {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x20},
+    6,
+    {1, 2, 3},
+    reinterpret_cast<void*>(&Detour_FUN_0045b930),
+    reinterpret_cast<void**>(&g_orig_FUN_0045b930),
+    false
+};
+
+// Copies bytes [4, kMenuItemSize) of each slot (never the HWND dword the engine owns), slot 5 and 6
+// before slot 4 so slot 4 never leads to a half-written item.
+static void WriteGraphicsMenuSlots(uint8_t* slots, const uint8_t* bytes) {
+    for (int s = 2; s >= 0; --s) {
+        const size_t base = static_cast<size_t>(s) * kMenuItemSize;
+        std::memcpy(slots + base + 4, bytes + base + 4, kMenuItemSize - 4);
+    }
+}
+
+// Adds the item when GpuWorld is configured on and the world and race-init hooks are installed
+// (the caller checks the hooks). Any unexpected byte leaves the menu exactly as shipped.
+static void InstallWidescreenMenuItem() {
+    const Config& cfg = GetConfig();
+    if (!cfg.gpuWorld || !cfg.presenterEnabled) {
+        LOG_INFO("Options menu: GpuWorld is off; the Pantalla panoramica item is not added");
+        return;
+    }
+    const intptr_t delta = reinterpret_cast<intptr_t>(g_hostModule) - static_cast<intptr_t>(rr95::kPreferredImageBase);
+    const uint32_t count = *GlobalPtr<const uint32_t>(kVaGraphicsMenuCount);
+    uint8_t* slots = GlobalPtr<uint8_t>(kVaGraphicsMenuSlots);
+    const uint8_t* onOff = GlobalPtr<const uint8_t>(kVaOnOffStrings);
+    const uint8_t* redraw = GlobalPtr<const uint8_t>(kVaItemRedraw);
+    const bool countOk = count == kGraphicsMenuCount;
+    const bool slotsOk = GraphicsMenuSlotsAreShipped(slots, delta);
+    const bool stringsOk = std::memcmp(onOff, kShippedOnOffStrings, sizeof(kShippedOnOffStrings)) == 0;
+    const bool redrawOk = std::memcmp(redraw, kItemRedrawPrologue, sizeof(kItemRedrawPrologue)) == 0;
+    if (!countOk || !slotsOk || !stringsOk || !redrawOk) {
+        LOG_WARN("Options menu: unexpected engine bytes (item count %u ok=%d, slots 4..6 ok=%d, On/Off strings ok=%d, "
+                 "FUN_00439160 ok=%d); the graphics menu is left unchanged",
+                 count, countOk ? 1 : 0, slotsOk ? 1 : 0, stringsOk ? 1 : 0, redrawOk ? 1 : 0);
+        return;
+    }
+    g_menuOnText.assign(reinterpret_cast<const char*>(onOff));
+    g_menuOffText.assign(reinterpret_cast<const char*>(onOff + 4));
+    if (!rr95::InstallHook(g_site_FUN_0045b930, g_hostModule)) {
+        LOG_WARN("Options menu: failed to install the hook on FUN_0045b930; the graphics menu is left unchanged");
+        return;
+    }
+    const EffectiveWidescreenSetting effective = CurrentWidescreenSetting();
+    g_menuWidescreenOn = effective.setting.mode != WidescreenMode::Off;
+    std::memcpy(g_menuShippedSlots, slots, kGraphicsMenuSlotsSize);
+    uint8_t rewritten[kGraphicsMenuSlotsSize];
+    BuildWidescreenMenuSlots(slots, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&WidescreenMenuSelect)),
+                             rewritten);
+    g_widescreenMenuInstalled = true;
+    WriteGraphicsMenuSlots(slots, rewritten);
+    LOG_INFO("Options menu: Pantalla panoramica added to the graphics menu (slot 5 at 0x%08X), showing %s "
+             "(setting %s from %s)",
+             static_cast<unsigned>(reinterpret_cast<uintptr_t>(slots + kMenuItemSize)),
+             g_menuWidescreenOn.load() ? "On" : "Off", DescribeWidescreenSetting(effective.setting).c_str(),
+             WidescreenSettingSourceToString(effective.source));
+}
+
+static void RemoveWidescreenMenuItem(HMODULE hostModule) {
+    if (g_widescreenMenuInstalled) {
+        WriteGraphicsMenuSlots(
+            reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(hostModule) +
+                                       (kVaGraphicsMenuSlots - rr95::kPreferredImageBase)),
+            g_menuShippedSlots);
+        g_widescreenMenuInstalled = false;
+    }
+    rr95::RemoveHook(g_site_FUN_0045b930, hostModule);
+    g_orig_FUN_0045b930 = nullptr;
+}
 
 // First 6 bytes at 0x0043f580 in both original and patched exes:
 // 55                push ebp          (1 byte)
@@ -844,6 +1003,11 @@ bool InstallHooks(ExeBuild build) {
                 LOG_INFO("[World] Widescreen=%d (applied at each race start when GpuWorld is on)",
                          cfg.widescreen.fixedWidth);
             }
+            const EffectiveWidescreenSetting effective = CurrentWidescreenSetting();
+            LOG_INFO("Widescreen: effective setting %s (source: %s)",
+                     DescribeWidescreenSetting(effective.setting).c_str(),
+                     WidescreenSettingSourceToString(effective.source));
+            InstallWidescreenMenuItem();
         } else {
             LOG_WARN("Failed to install race init hook on FUN_00457ef0; widescreen unavailable");
         }
@@ -869,6 +1033,7 @@ void RemoveHooks() {
     rr95::RemoveIatHook(g_iatGetSaveFileNameA);
     rr95::RemoveHook(g_site_FUN_0043f580, hostModule);
     rr95::RemoveHook(g_site_FUN_0043f7c0, hostModule);
+    RemoveWidescreenMenuItem(hostModule);
     rr95::RemoveHook(g_site_FUN_00457ef0, hostModule);
     g_worldHooksInstalled = false;
     rr95::RemoveHook(g_site_FUN_00467cb0, hostModule);
