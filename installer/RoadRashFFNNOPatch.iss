@@ -1,4 +1,4 @@
-﻿; Road Rash 95 FFNNO Patch - Inno Setup 6 installer.
+; Road Rash 95 FFNNO Patch - Inno Setup 6 installer.
 ; Build with installer\build.bat (builds ddraw.dll first) or:
 ;   ISCC.exe [/DAppVersion=x.y.z] installer\RoadRashFFNNOPatch.iss
 ; Silent install example:
@@ -34,6 +34,10 @@ OutputBaseFilename=RoadRashFFNNOPatch-Setup-{#AppVersion}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+; Original artwork (no game art). 100% and 200% DPI variants; Inno picks the best fit.
+WizardImageFile=assets\wizard-large-164x314.bmp,assets\wizard-large-328x628.bmp
+WizardSmallImageFile=assets\wizard-small-55x55.bmp,assets\wizard-small-110x110.bmp
+SetupIconFile=assets\setup.ico
 UninstallDisplayName={#AppName}
 
 [Languages]
