@@ -11,6 +11,27 @@ Nothing in the game's data files is modified. Deleting the DLL restores the orig
 
 **No game files are included.** You need your own copy of Road Rash 95 on Steam. Game executables, decompilation, texture dumps and texture packs are kept out of this repository on purpose.
 
+## Install with the wizard
+
+1. Get `RoadRashFFNNOPatch-Setup-<version>.exe` from the [releases](https://github.com/FFNNO/RoadRashFFNNOPatch/releases), or build it yourself: install [Inno Setup 6](https://jrsoftware.org/isinfo.php) and the build tools from section 1, then run `cmd //c "installer\\build.bat"`. It builds `ddraw.dll` and writes the setup to `installer/Output/`. If ISCC is not found, set the `ISCC` variable to the full path of `ISCC.exe`.
+2. Close the game and run the setup. It finds the game folder from the registry or your Steam libraries, and it only continues when `RoadRash95.exe` is in the chosen folder. If it cannot write there, run it as administrator.
+3. Choose the options. `ddraw.dll` and `rr95gpu.ini` are always installed.
+
+| Option | Default | What it does |
+|---|---|---|
+| GPU world | on | `[World] GpuWorld=1`: the 3D world at 1440x1080 on the GPU (Scroll Lock toggles it in race) |
+| Fixed save file | on | `[Save] Enabled=1`: saving writes `Partida 1.RRS` in the game folder without a dialog (section 4). Back up your existing `.RRS` saves first. |
+| HD texture pack | off | Copies every `<w>x<h>_<crc32>.png` from a folder you choose to `texture-pack\` and sets `[TexturePack] Enabled=1`, `MaxMiB=1536` |
+| Texture dump | off | `[TexturePack] Dump=1`: saves each new texture to `texture-dump\` to grow a pack (section 5) |
+
+**The texture pack is not included in the setup.** It is derived from the game's art, so you build it yourself (section 5) or point the setup at a pack you already have.
+
+Existing `ddraw.dll`, `rr95gpu.ini` and `texture-pack\` are kept as `*.pre-ffnno` backups. **Uninstall** from Apps & features (Settings > Apps): it removes `ddraw.dll`, `rr95gpu.ini`, `rr95gpu.log` and the `texture-pack\` it created, and restores the backups. Your saves (`*.RRS`), `texture-dump\` and all game files are never touched.
+
+Some antivirus tools may flag the proxy `ddraw.dll`, because it patches the game's code in memory. It does not modify any game file.
+
+Silent install, for example: `RoadRashFFNNOPatch-Setup-0.1.0.exe /VERYSILENT /CURRENTUSER /DIR="<game folder>" /TASKS="gpuworld,save,texturepack" /PACKDIR="<pack folder>"`. To test the installer without touching your game, run `python -I installer/tests/test_installer.py`. It installs into temporary fake game folders and uninstalls again.
+
 ## 1. Requirements
 
 | Tool | Version used | Needed for |
@@ -22,6 +43,7 @@ Nothing in the game's data files is modified. Deleting the DLL restores the orig
 | A GPU with Direct3D 11 | RTX 3070, 8 GB | running; the full pack needs about 1 GB of VRAM |
 | Real-ESRGAN ncnn-vulkan + 4x_Remacri model | v0.2.5.0 | only to (re)build the texture pack |
 | Ghidra | 12.1.4 | only for reverse engineering |
+| Inno Setup | 6.7.4 | only to build the installer |
 
 ```bash
 python -m pip install pillow numpy
@@ -50,9 +72,9 @@ python renderer/tools/check_hook_sites.py  # needs original/ and patched/ exes, 
 python -I tools/upscale.py --self-test     # texture upscaler
 ```
 
-## 3. Install
+## 3. Install manually
 
-Game folder (default): `C:\Program Files (x86)\Steam\steamapps\common\RoadRash`
+The alternative to the wizard. Game folder (default): `C:\Program Files (x86)\Steam\steamapps\common\RoadRash`
 
 1. Close the game.
 2. Copy `renderer/build/Release/ddraw.dll` next to `RoadRash95.exe`.
