@@ -21,3 +21,29 @@ __pycache__/
 
 # Installer build output
 installer/Output/
+
+# Game data and derived art: never commit the game files or extracted textures
+texture-dump/
+*.RRS
+*.rrs
+rr95gpu.log
+
+# Local state, backups and tooling output
+backups/
+.atl/
+.agents/
+.claude/
+.env
+.env.*
+*.bundle
+*.orig
+*.bak
+*.pre-ffnno
+
+# Binaries and keys that must never reach the repo
+*.exe
+*.pem
+*.key
+*.pfx
+*.p12
+*.kdbx
