@@ -24,6 +24,7 @@
 #include "../src/texture_pack.h"
 #include "../src/save_redirect.h"
 #include "../src/overlay_text.h"
+#include "../src/widescreen.h"
 
 namespace {
 
@@ -112,6 +113,25 @@ extern "C" __declspec(naked) int __fastcall Target(int /*a: ECX*/, int /*b: EDX*
         pop ebp
         ret 4
     }
+}
+
+// Starts with mov al, byte ptr [g_relocByte] (A0 moffs32): an absolute operand the loader
+// relocates, like the prologue of race init FUN_00457ef0 (A0 59 80 61 00).
+uint8_t g_relocByte = 0x5A;
+
+extern "C" __declspec(naked) int __cdecl RelocTarget() {
+    __asm {
+        mov al, byte ptr [g_relocByte]
+        movzx eax, al
+        ret
+    }
+}
+
+using RelocFn = int(__cdecl*)();
+RelocFn g_relocOriginal = nullptr;
+
+int __cdecl RelocDetour() {
+    return g_relocOriginal() + 100;
 }
 
 using TargetFn = int(__fastcall*)(int, int, int);
@@ -648,6 +668,54 @@ int main() {
           "RemoveHook restores the original prologue bytes");
     Check(call(1, 2, 3) == 6, "unhooked call executes original directly");
     Check(g_detourCalls == 1, "detour is not called after RemoveHook");
+
+    // Absolute operands inside the span (dynamic base): compared, copied and restored relocated.
+    {
+        rr95::HookSite oob{"abs_oob", 0, {0xA0, 0, 0, 0, 0}, 5, {5}, nullptr, nullptr, false, {2}};
+        Check(rr95::ValidateHookDecoding(oob) != nullptr, "absolute operand past the span is refused");
+
+        const auto* code = reinterpret_cast<const uint8_t*>(&RelocTarget);
+        Check(code[0] == 0xA0, "RelocTarget starts with mov al, moffs32");
+        uint32_t liveOperand = 0;
+        std::memcpy(&liveOperand, code + 1, sizeof(liveOperand));
+        Check(liveOperand == static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&g_relocByte)),
+              "RelocTarget operand holds the relocated address of g_relocByte");
+        const uint32_t prefOperand = PreferredVa(&g_relocByte);
+        const uint8_t prefBytes[4] = {static_cast<uint8_t>(prefOperand), static_cast<uint8_t>(prefOperand >> 8),
+                                      static_cast<uint8_t>(prefOperand >> 16), static_cast<uint8_t>(prefOperand >> 24)};
+        uint8_t relocBefore[5];
+        std::memcpy(relocBefore, code, sizeof(relocBefore));
+
+        const intptr_t delta = static_cast<intptr_t>(reinterpret_cast<uintptr_t>(self)) -
+                               static_cast<intptr_t>(rr95::kPreferredImageBase);
+        rr95::HookSite reloc{"reloc", PreferredVa(code), {0xA0, prefBytes[0], prefBytes[1], prefBytes[2], prefBytes[3]},
+                             5, {5}, reinterpret_cast<void*>(&RelocDetour),
+                             reinterpret_cast<void**>(&g_relocOriginal), false, {1}};
+        Check(rr95::ValidateHookDecoding(reloc) == nullptr, "A0 moffs32 span with one absolute operand is valid");
+        uint8_t rebuilt[16] = {};
+        rr95::BuildRelocatedExpected(reloc, delta, rebuilt);
+        Check(std::memcmp(rebuilt, code, 5) == 0, "BuildRelocatedExpected rebases the operand to the live bytes");
+
+        if (delta != 0) {
+            rr95::HookSite plain{"reloc_plain", PreferredVa(code),
+                                 {0xA0, prefBytes[0], prefBytes[1], prefBytes[2], prefBytes[3]}, 5, {5},
+                                 reinterpret_cast<void*>(&RelocDetour), reinterpret_cast<void**>(&g_relocOriginal),
+                                 false};
+            Check(!rr95::InstallHook(plain, self), "without absoluteOperandOffsets a rebased operand mismatches");
+        } else {
+            std::printf("[INFO] hook_test loaded at the preferred base; rebased-mismatch case not exercised\n");
+        }
+
+        volatile RelocFn callReloc = &RelocTarget;
+        Check(rr95::InstallHook(reloc, self), "hook with an absolute operand installs on a rebased image");
+        Check(callReloc() == 0x5A + 100, "relocated hook goes through the detour");
+        Check(g_relocOriginal != nullptr && g_relocOriginal() == 0x5A,
+              "trampoline reads the variable through the relocated operand");
+        rr95::RemoveHook(reloc, self);
+        Check(std::memcmp(relocBefore, code, sizeof(relocBefore)) == 0,
+              "RemoveHook restores the relocated operand bytes");
+        Check(callReloc() == 0x5A, "unhooked relocated target runs directly");
+    }
 
     // Filter parsing unit tests (T3b hardening).
     FilterMode mode = FilterMode::Bilinear;
@@ -2185,6 +2253,123 @@ int main() {
             allWhite &= (px & 0x00FFFFFFu) == 0x00FFFFFFu;
         }
         Check(anyOpaque && anyClear && allWhite, "toast bitmap is white with alpha = glyph coverage");
+    }
+
+    // Widescreen (rr95-widescreen W1): width derivation, race resolution, skip rule, layout, config.
+    {
+        Check(DeriveAutoProjectionWidth(1920, 1080) == 426, "auto width 16:9 (1920x1080) -> 426");
+        Check(DeriveAutoProjectionWidth(2560, 1440) == 426, "auto width 16:9 (2560x1440) -> 426");
+        Check(DeriveAutoProjectionWidth(1440, 1080) == 320 && DeriveAutoProjectionWidth(640, 480) == 320,
+              "auto width 4:3 -> 320");
+        Check(DeriveAutoProjectionWidth(2100, 900) == 560, "auto width 21:9 (2100x900) -> 560");
+        Check(DeriveAutoProjectionWidth(2560, 1080) == 568, "auto width 64:27 (2560x1080) -> 568");
+        Check(DeriveAutoProjectionWidth(1680, 1050) == 384, "auto width 16:10 -> 384");
+        Check(DeriveAutoProjectionWidth(1281, 720) == 428, "auto width with round(240*aspect) odd (427) -> 428");
+        Check(DeriveAutoProjectionWidth(1366, 768) == 426, "auto width 1366x768 -> 426 (even)");
+        Check(DeriveAutoProjectionWidth(3840, 1080) == 640, "auto width 32:9 clamps to 640");
+        Check(DeriveAutoProjectionWidth(1280, 1024) == 320 && DeriveAutoProjectionWidth(1080, 1920) == 320,
+              "auto width 5:4 and portrait clamp to 320");
+        Check(DeriveAutoProjectionWidth(0, 1080) == 320 && DeriveAutoProjectionWidth(1920, 0) == 320 &&
+                  DeriveAutoProjectionWidth(-5, -5) == 320,
+              "auto width with an invalid size -> 320");
+
+        WidescreenSetting ws;
+        Check(ParseWidescreenSetting(L"off", ws) && ws.mode == WidescreenMode::Off, "Widescreen=off parses");
+        Check(ParseWidescreenSetting(L"  AUTO ", ws) && ws.mode == WidescreenMode::Auto,
+              "Widescreen=AUTO parses case-insensitively");
+        Check(ParseWidescreenSetting(L"426", ws) && ws.mode == WidescreenMode::Fixed && ws.fixedWidth == 426,
+              "Widescreen=426 parses as a fixed width");
+        Check(ParseWidescreenSetting(L"320", ws) && ws.mode == WidescreenMode::Fixed && ws.fixedWidth == 320 &&
+                  ParseWidescreenSetting(L"640", ws) && ws.fixedWidth == 640,
+              "Widescreen bounds 320 and 640 parse");
+        Check(!ParseWidescreenSetting(L"427", ws) && ws.mode == WidescreenMode::Off, "odd Widescreen width -> off");
+        Check(!ParseWidescreenSetting(L"318", ws) && ws.mode == WidescreenMode::Off &&
+                  !ParseWidescreenSetting(L"642", ws) && ws.mode == WidescreenMode::Off,
+              "out-of-range Widescreen width -> off");
+        Check(!ParseWidescreenSetting(L"426px", ws) && ws.mode == WidescreenMode::Off &&
+                  !ParseWidescreenSetting(L"", ws) && ws.mode == WidescreenMode::Off &&
+                  !ParseWidescreenSetting(nullptr, ws) && ws.mode == WidescreenMode::Off,
+              "garbage, empty, or null Widescreen value -> off");
+
+        WidescreenSetting autoSetting;
+        autoSetting.mode = WidescreenMode::Auto;
+        WidescreenResolution r = ResolveRaceProjectionWidth(autoSetting, true, true, false, 1920, 1080);
+        Check(r.width == 426 && r.reason == WidescreenReason::Applied, "auto + GpuWorld + HiRes at 16:9 -> 426");
+        r = ResolveRaceProjectionWidth(autoSetting, false, true, false, 1920, 1080);
+        Check(r.width == 320 && r.reason == WidescreenReason::GpuWorldOff, "GpuWorld off forces 320");
+        r = ResolveRaceProjectionWidth(autoSetting, true, false, false, 1920, 1080);
+        Check(r.width == 320 && r.reason == WidescreenReason::LowRes, "HiRes=0 keeps 320");
+        r = ResolveRaceProjectionWidth(autoSetting, true, true, true, 1920, 1080);
+        Check(r.width == 320 && r.reason == WidescreenReason::Inset, "Inset mode keeps 320");
+        r = ResolveRaceProjectionWidth(autoSetting, true, true, false, 0, 0);
+        Check(r.width == 320 && r.reason == WidescreenReason::NoWindowSize, "auto without a window size keeps 320");
+        r = ResolveRaceProjectionWidth(autoSetting, true, true, false, 1440, 1080);
+        Check(r.width == 320 && r.reason == WidescreenReason::SettingOff, "auto at 4:3 resolves to 320");
+        r = ResolveRaceProjectionWidth(WidescreenSetting{}, true, true, false, 1920, 1080);
+        Check(r.width == 320 && r.reason == WidescreenReason::SettingOff, "Widescreen=off keeps 320");
+        WidescreenSetting fixed;
+        fixed.mode = WidescreenMode::Fixed;
+        fixed.fixedWidth = 560;
+        r = ResolveRaceProjectionWidth(fixed, true, true, false, 1920, 1080);
+        Check(r.width == 560 && r.reason == WidescreenReason::Applied, "fixed 560 applies regardless of the window");
+        r = ResolveRaceProjectionWidth(fixed, false, true, false, 1920, 1080);
+        Check(r.width == 320 && r.reason == WidescreenReason::GpuWorldOff, "fixed width with GpuWorld off -> 320");
+        Check(std::strcmp(WidescreenReasonToString(WidescreenReason::Inset), "inset mode") == 0 &&
+                  std::strcmp(WidescreenReasonToString(WidescreenReason::Applied), "applied") == 0,
+              "WidescreenReasonToString names the reasons");
+
+        Check(!SoftwareWorldWritesForbidden(320, 640), "320 with a 640 clip allows software writes");
+        Check(SoftwareWorldWritesForbidden(426, 640), "an applied width > 320 forbids software writes");
+        Check(SoftwareWorldWritesForbidden(320, 852), "a clip rect wider than the surface forbids software writes");
+
+        Check(DecideSkipSoftwareRasterizer(true, false, false, false, true),
+              "forbidden skips even with GpuWorld off, presenter unhealthy, and a dump frame");
+        Check(DecideSkipSoftwareRasterizer(false, true, true, true, false), "T5 rule: healthy GpuWorld skips");
+        Check(!DecideSkipSoftwareRasterizer(false, true, true, true, true), "T5 rule: dump frame runs software");
+        Check(!DecideSkipSoftwareRasterizer(false, true, true, false, false),
+              "T5 rule: unhealthy presenter runs software");
+        Check(!DecideSkipSoftwareRasterizer(false, false, true, true, false), "T5 rule: GpuWorld off runs software");
+
+        WorldTargetLayout l = ComputeWorldTargetLayout(320, 1440, 1080, 1920, 1080);
+        Check(!l.widescreen && l.worldSrcW == 640 && l.worldSrcH == 480 && l.targetW == 1440 && l.targetH == 1080 &&
+                  l.layerLeft == 0 && l.layerRight == 1440,
+              "layout off: 640x480 into 1440x1080, layers over the whole target");
+        l = ComputeWorldTargetLayout(426, 1440, 1080, 1920, 1080);
+        Check(l.widescreen && l.worldSrcW == 852 && l.worldSrcH == 480 && l.targetW == 1920 && l.targetH == 1080,
+              "layout 426 at 1920x1080: source 852x480, target 1920x1080 (window width)");
+        Check(l.layerLeft == 239 && l.layerRight == 1681, "layout 426: centred 640 layer at [239, 1681)");
+        l = ComputeWorldTargetLayout(426, 960, 720, 1920, 1080);
+        Check(l.targetW == 1280 && l.targetH == 720, "layout 426 at InternalHeight 720 -> 1280x720");
+        l = ComputeWorldTargetLayout(560, 1440, 1080, 1920, 1080);
+        Check(l.worldSrcW == 1120 && l.targetW == 2520 && l.layerLeft == 540 && l.layerRight == 1980,
+              "layout 560 in a 16:9 window: natural width 2520 (even), centred layer [540, 1980)");
+        l = ComputeWorldTargetLayout(426, 1440, 1080, 0, 0);
+        Check(l.targetW == 1918 && (l.targetW % 2) == 0, "layout 426 without a window size: 1917 made even -> 1918");
+        const int centre2 = l.layerLeft + l.layerRight;
+        Check(centre2 >= l.targetW - 1 && centre2 <= l.targetW + 1, "widescreen layer rect is centred");
+
+        Check(Config{}.widescreen.mode == WidescreenMode::Off, "[World] Widescreen default is off");
+        const std::wstring ini = MakeTestTempPath(L"rr95_ws_cfg_") + L".ini";
+        WritePrivateProfileStringW(L"World", L"Widescreen", L"auto", ini.c_str());
+        Config parsed;
+        ParseConfigFile(ini, parsed);
+        Check(parsed.widescreen.mode == WidescreenMode::Auto && !parsed.invalidWidescreenValue,
+              "[World] Widescreen=auto is parsed from the ini");
+        WritePrivateProfileStringW(L"World", L"Widescreen", L"480", ini.c_str());
+        ParseConfigFile(ini, parsed);
+        Check(parsed.widescreen.mode == WidescreenMode::Fixed && parsed.widescreen.fixedWidth == 480,
+              "[World] Widescreen=480 is parsed as a fixed width");
+        WritePrivateProfileStringW(L"World", L"Widescreen", L"wide", ini.c_str());
+        Config bad;
+        ParseConfigFile(ini, bad);
+        Check(bad.widescreen.mode == WidescreenMode::Off && bad.invalidWidescreenValue &&
+                  bad.rawWidescreenString == L"wide",
+              "[World] Widescreen=wide is invalid and leaves widescreen off");
+        DeleteFileW(ini.c_str());
+        Config missingWs;
+        ParseConfigFile(MakeTestTempPath(L"rr95_no_such_ws_ini_") + L".ini", missingWs);
+        Check(missingWs.widescreen.mode == WidescreenMode::Off && !missingWs.invalidWidescreenValue,
+              "[World] Widescreen missing from the ini stays off");
     }
 
     std::printf("%s (%d failure(s))\n", g_failures == 0 ? "OK" : "FAILED", g_failures);

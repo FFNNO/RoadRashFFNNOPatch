@@ -4,6 +4,7 @@
 #include "log.h"
 #include "presenter.h"
 #include "texture_pack.h"
+#include "widescreen.h"
 
 #include <algorithm>
 #include <cmath>
@@ -938,12 +939,30 @@ void CaptureObserveHudLayer(const uint32_t hist[256]) {
     }
 }
 
+bool DecideSkipSoftwareRasterizer(bool forbidden, bool gpuWorld, bool presenterEnabled, bool presenterAllowsGpuWorld,
+                                  bool dumpThisFrame) {
+    if (forbidden) {
+        return true;
+    }
+    return gpuWorld && presenterEnabled && presenterAllowsGpuWorld && !dumpThisFrame;
+}
+
+bool CaptureSoftwareWorldWritesForbidden() {
+    // DAT_006036c8 is the half-open right edge of the clip rect FUN_0042e850 and FUN_00467cb0 clip
+    // their spans to; race init sets it to projection width << HiRes.
+    const int32_t clipRight = g_hostModule ? GlobalPtr<const int32_t>(kVaClipRect)[2] : 0;
+    return SoftwareWorldWritesForbidden(WidescreenGetAppliedWidth(), clipRight);
+}
+
 bool CaptureShouldSkipSoftwareRasterizer() {
     const Config& cfg = GetConfig();
     // PresenterGpuWorldAllowed() is false while latched off, after any failed present that has not
     // been followed by a successful one, and during the retry backoff: a GDI fallback frame must
-    // always contain the software world.
-    return cfg.gpuWorld && cfg.presenterEnabled && PresenterGpuWorldAllowed() && !g_dumpThisFrame;
+    // always contain the software world. That rule does not apply while software world writes are
+    // forbidden (widescreen): the rasterizers would write past the 640-wide surface, so they are
+    // skipped even on fallback and dump frames.
+    return DecideSkipSoftwareRasterizer(CaptureSoftwareWorldWritesForbidden(), cfg.gpuWorld, cfg.presenterEnabled,
+                                        PresenterGpuWorldAllowed(), g_dumpThisFrame);
 }
 
 bool CaptureHasWorldFrame() {

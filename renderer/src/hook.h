@@ -17,7 +17,15 @@ struct HookSite {
     void* detour;
     void** originalTrampoline;
     bool installed;
+    // Offsets inside expected[] of 4-byte absolute addresses (e.g. A0 moffs32), written as preferred
+    // VAs. The loader relocates them when the image is rebased (dynamic base), so InstallHook adds
+    // the rebase delta before comparing, the trampoline copies the relocated bytes, and RemoveHook
+    // restores them.
+    std::vector<size_t> absoluteOperandOffsets = {};
 };
+
+// expected[] of site with every absolute operand rebased by delta (module base - preferred base).
+void BuildRelocatedExpected(const HookSite& site, intptr_t delta, uint8_t out[16]);
 
 const char* ValidateHookDecoding(const HookSite& site);
 bool InstallHook(HookSite& site, HMODULE moduleBase = nullptr);

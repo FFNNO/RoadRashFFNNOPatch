@@ -7,6 +7,7 @@
 #include "texture_pack.h"
 #include "save_redirect.h"
 #include "overlay_text.h"
+#include "widescreen.h"
 #include <windows.h>
 #include <commdlg.h>
 #include <atomic>
@@ -57,6 +58,7 @@ using FUN_00460b00_Fn = void(__fastcall*)(char windowed);
 using FUN_004688e0_Fn = uint32_t(__cdecl*)();
 using FUN_0042e850_Fn = void(__cdecl*)();
 using FUN_00467cb0_Fn = void(__fastcall*)(int* polyVerts, int edxArg);
+using FUN_00457ef0_Fn = void(__cdecl*)();
 
 FUN_0046e630_Fn g_orig_FUN_0046e630 = nullptr;
 FUN_0046ded0_Fn g_orig_FUN_0046ded0 = nullptr;
@@ -64,6 +66,13 @@ FUN_00460b00_Fn g_orig_FUN_00460b00 = nullptr;
 FUN_004688e0_Fn g_orig_FUN_004688e0 = nullptr;
 FUN_0042e850_Fn g_orig_FUN_0042e850 = nullptr;
 FUN_00467cb0_Fn g_orig_FUN_00467cb0 = nullptr;
+FUN_00457ef0_Fn g_orig_FUN_00457ef0 = nullptr;
+
+// FUN_004688e0, FUN_0042e850 and FUN_00467cb0 are all hooked; widescreen depends on it, because
+// those detours are what keep the software world rasterizers from running.
+bool g_worldHooksInstalled = false;
+// GpuWorld toggle key pressed during a widescreen race; applied at the next race start.
+bool g_gpuWorldTogglePending = false;
 
 using StretchDIBits_Fn = int(WINAPI*)(HDC hdc, int xDest, int yDest, int DestWidth, int DestHeight,
                                       int xSrc, int ySrc, int SrcWidth, int SrcHeight,
@@ -324,7 +333,14 @@ void FinishRaceFrameAndPollHotkeys() {
     if (actions.endCaptureFrame) {
         CaptureEndFrame();
     }
-    if (actions.toggleGpuWorld) {
+    if (actions.toggleGpuWorld && WidescreenIsActive()) {
+        // Turning GpuWorld off mid-race would leave the world undrawn: the software rasterizers stay
+        // skipped while the widened projection width is applied. Defer to the next race start.
+        g_gpuWorldTogglePending = !g_gpuWorldTogglePending;
+        LOG_INFO("GpuWorld toggle via key 0x%02X %s: widescreen is active for this race (projection width %d); "
+                 "the toggle applies at the next race start",
+                 vk, g_gpuWorldTogglePending ? "deferred" : "cancelled", WidescreenGetAppliedWidth());
+    } else if (actions.toggleGpuWorld) {
         const bool newState = ToggleGpuWorld();
         CaptureInvalidateCache();
         LOG_INFO("GpuWorld toggled via key 0x%02X to %d (internal resolution %dx%d)",
@@ -457,7 +473,7 @@ void __fastcall Detour_FUN_00460b00(char windowed) {
 }
 
 uint32_t __cdecl Detour_FUN_004688e0() {
-    if (!GetConfig().captureEnabled && !GetConfig().gpuWorld) {
+    if (!GetConfig().captureEnabled && !GetConfig().gpuWorld && !CaptureSoftwareWorldWritesForbidden()) {
         if (g_orig_FUN_004688e0) {
             return g_orig_FUN_004688e0();
         }
@@ -473,7 +489,7 @@ uint32_t __cdecl Detour_FUN_004688e0() {
 }
 
 void __cdecl Detour_FUN_0042e850() {
-    if (!GetConfig().captureEnabled && !GetConfig().gpuWorld) {
+    if (!GetConfig().captureEnabled && !GetConfig().gpuWorld && !CaptureSoftwareWorldWritesForbidden()) {
         if (g_orig_FUN_0042e850) {
             g_orig_FUN_0042e850();
         }
@@ -488,7 +504,7 @@ void __cdecl Detour_FUN_0042e850() {
 }
 
 void __fastcall Detour_FUN_00467cb0(int* polyVerts, int edxArg) {
-    if (!GetConfig().captureEnabled && !GetConfig().gpuWorld) {
+    if (!GetConfig().captureEnabled && !GetConfig().gpuWorld && !CaptureSoftwareWorldWritesForbidden()) {
         if (g_orig_FUN_00467cb0) {
             g_orig_FUN_00467cb0(polyVerts, edxArg);
         }
@@ -500,6 +516,107 @@ void __fastcall Detour_FUN_00467cb0(int* polyVerts, int edxArg) {
         g_orig_FUN_00467cb0(polyVerts, edxArg);
     }
     CaptureFlatQuadAfter(slot, polyVerts, skip);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Widescreen ([World] Widescreen in rr95gpu.ini, feature rr95-widescreen W1).
+//
+// Engine globals (preferred VAs verified in RoadRash95.exe, out/decomp.c):
+// 0x00591c0c: int projection width (320): screen centre X = width / 2 (FUN_00433730, FUN_00459170),
+//             object and road screen-X culls test against width << 16, and race init FUN_00457ef0
+//             (0x457f4a..0x457f56) passes it with 0x00591c08 to FUN_0046de40, which sets the clip
+//             rect DAT_006036c0..cc to (0, 0, width << HiRes, (height << HiRes) - 1).
+// 0x00591c04: int viewport width (320) used only by the startup clip setup FUN_0046d620.
+// 0x005a292a: uint8_t HiRes flag (1 = 640x480 surface coordinates).
+// 0x005cd47c: uint8_t low-res inset mode flag (horizon FUN_00469770 takes a separate path).
+// The engine never writes 0x00591c0c or 0x00591c04 (no store in out/decomp.c), so both stay at
+// their shipped value unless this detour changes them.
+constexpr uint32_t kVaProjectionWidth = 0x00591c0c;
+constexpr uint32_t kVaViewportWidth   = 0x00591c04;
+constexpr uint32_t kVaHiResFlag       = 0x005a292a;
+constexpr uint32_t kVaInsetFlag       = 0x005cd47c;
+
+bool g_engineWidthsRecorded = false;
+int g_engineProjectionWidth = kEngineProjectionWidth;
+int g_engineViewportWidth = kEngineProjectionWidth;
+
+// Writes the projection width for the race FUN_00457ef0 is about to set up (before it reads
+// 0x00591c0c at 0x457f50). Every race start re-decides; nothing changes mid-race.
+void ApplyRaceProjectionWidth() {
+    int* projection = GlobalPtr<int>(kVaProjectionWidth);
+    int* viewport = GlobalPtr<int>(kVaViewportWidth);
+    if (!g_engineWidthsRecorded) {
+        g_engineProjectionWidth = *projection;
+        g_engineViewportWidth = *viewport;
+        g_engineWidthsRecorded = true;
+    }
+
+    if (g_gpuWorldTogglePending) {
+        g_gpuWorldTogglePending = false;
+        const bool newState = ToggleGpuWorld();
+        CaptureInvalidateCache();
+        LOG_INFO("Deferred GpuWorld toggle applied at race start: GpuWorld=%d", newState ? 1 : 0);
+    }
+
+    const Config& cfg = GetConfig();
+    const bool hiRes = *GlobalPtr<const uint8_t>(kVaHiResFlag) != 0;
+    const bool inset = *GlobalPtr<const uint8_t>(kVaInsetFlag) != 0;
+    const bool gpuWorldEffective = cfg.gpuWorld && cfg.presenterEnabled && g_worldHooksInstalled &&
+                                   !PresenterIsLatchedOff();
+    int clientW = 0;
+    int clientH = 0;
+    HWND hwnd = *GlobalPtr<HWND>(kVaGameHwnd);
+    RECT rc = {};
+    if (hwnd != nullptr && GetClientRect(hwnd, &rc)) {
+        clientW = rc.right - rc.left;
+        clientH = rc.bottom - rc.top;
+    }
+
+    WidescreenResolution res =
+        ResolveRaceProjectionWidth(cfg.widescreen, gpuWorldEffective, hiRes, inset, clientW, clientH);
+    const bool engineDefaults = g_engineProjectionWidth == kEngineProjectionWidth &&
+                                g_engineViewportWidth == kEngineProjectionWidth;
+    if (res.reason == WidescreenReason::Applied && !engineDefaults) {
+        LOG_WARN("Widescreen: engine widths are %d/%d, not %d; keeping them unchanged",
+                 g_engineProjectionWidth, g_engineViewportWidth, kEngineProjectionWidth);
+        res.width = kEngineProjectionWidth;
+    }
+
+    const bool widen = res.width > kEngineProjectionWidth;
+    const int projectionWidth = widen ? res.width : g_engineProjectionWidth;
+    const int viewportWidth = widen ? res.width : g_engineViewportWidth;
+    // Publish a wider width before the engine can use it (the world rasterizers are skipped from
+    // here on), and clear it only after the engine widths are back to their shipped values.
+    if (widen) {
+        WidescreenSetAppliedWidth(res.width);
+    }
+    if (*projection != projectionWidth) {
+        *projection = projectionWidth;
+    }
+    if (*viewport != viewportWidth) {
+        *viewport = viewportWidth;
+    }
+    if (!widen) {
+        WidescreenSetAppliedWidth(kEngineProjectionWidth);
+    }
+
+    if (widen) {
+        LOG_INFO("Widescreen: race start with projection width %d (world source %dx%d, window %dx%d)",
+                 res.width, res.width << 1, kSoftwareSurfaceHeight, clientW, clientH);
+    } else if (cfg.widescreen.mode != WidescreenMode::Off) {
+        LOG_INFO("Widescreen: race start with projection width %d (%s; HiRes=%d, Inset=%d, GpuWorld=%d, window %dx%d)",
+                 projectionWidth, WidescreenReasonToString(res.reason), hiRes ? 1 : 0, inset ? 1 : 0,
+                 gpuWorldEffective ? 1 : 0, clientW, clientH);
+    } else {
+        LOG_INFO("Widescreen: race start with projection width %d (off)", projectionWidth);
+    }
+}
+
+void __cdecl Detour_FUN_00457ef0() {
+    ApplyRaceProjectionWidth();
+    if (g_orig_FUN_00457ef0) {
+        g_orig_FUN_00457ef0();
+    }
 }
 
 }  // namespace
@@ -592,6 +709,22 @@ static rr95::HookSite g_site_FUN_00467cb0{
     reinterpret_cast<void*>(&Detour_FUN_00467cb0),
     reinterpret_cast<void**>(&g_orig_FUN_00467cb0),
     false
+};
+
+// First 5 bytes at 0x00457ef0 (race init) in both original and patched exes:
+// a0 59 80 61 00    mov  al, byte ptr ds:[0x00618059]   (5 bytes, absolute operand at offset 1)
+// The image is dynamic base, so the loader relocates the operand; InstallHook rebases it before
+// comparing. FUN_00457ef0 takes no register or stack arguments (it reads ESI only after push esi).
+static rr95::HookSite g_site_FUN_00457ef0{
+    "FUN_00457ef0",
+    0x00457ef0,
+    {0xA0, 0x59, 0x80, 0x61, 0x00},
+    5,
+    {5},
+    reinterpret_cast<void*>(&Detour_FUN_00457ef0),
+    reinterpret_cast<void**>(&g_orig_FUN_00457ef0),
+    false,
+    {1}
 };
 
 // First 6 bytes at 0x0043f580 in both original and patched exes:
@@ -691,8 +824,29 @@ bool InstallHooks(ExeBuild build) {
             rr95::RemoveHook(g_site_FUN_0042e850, g_hostModule);
             rr95::RemoveHook(g_site_FUN_004688e0, g_hostModule);
         } else {
+            g_worldHooksInstalled = true;
             LOG_INFO("Capture/world hooks on FUN_004688e0, FUN_0042e850, and FUN_00467cb0 installed");
         }
+    }
+
+    const Config& cfg = GetConfig();
+    if (cfg.invalidWidescreenValue) {
+        LOG_WARN("[World] Widescreen value '%ls' is not off, auto, or an even width 320..640; widescreen is off",
+                 cfg.rawWidescreenString.c_str());
+    }
+    if (g_worldHooksInstalled) {
+        if (rr95::InstallHook(g_site_FUN_00457ef0, g_hostModule)) {
+            if (cfg.widescreen.mode == WidescreenMode::Auto) {
+                LOG_INFO("[World] Widescreen=auto (applied at each race start when GpuWorld is on)");
+            } else if (cfg.widescreen.mode == WidescreenMode::Fixed) {
+                LOG_INFO("[World] Widescreen=%d (applied at each race start when GpuWorld is on)",
+                         cfg.widescreen.fixedWidth);
+            }
+        } else {
+            LOG_WARN("Failed to install race init hook on FUN_00457ef0; widescreen unavailable");
+        }
+    } else if (cfg.widescreen.mode != WidescreenMode::Off) {
+        LOG_WARN("[World] Widescreen needs the world hooks; widescreen unavailable");
     }
 
     if (GetConfig().saveRedirectEnabled) {
@@ -713,6 +867,8 @@ void RemoveHooks() {
     rr95::RemoveIatHook(g_iatGetSaveFileNameA);
     rr95::RemoveHook(g_site_FUN_0043f580, hostModule);
     rr95::RemoveHook(g_site_FUN_0043f7c0, hostModule);
+    rr95::RemoveHook(g_site_FUN_00457ef0, hostModule);
+    g_worldHooksInstalled = false;
     rr95::RemoveHook(g_site_FUN_00467cb0, hostModule);
     rr95::RemoveHook(g_site_FUN_0042e850, hostModule);
     rr95::RemoveHook(g_site_FUN_004688e0, hostModule);
@@ -721,6 +877,7 @@ void RemoveHooks() {
     rr95::RemoveHook(g_site_FUN_0046e630, hostModule);
     g_orig_FUN_0043f580 = nullptr;
     g_orig_FUN_0043f7c0 = nullptr;
+    g_orig_FUN_00457ef0 = nullptr;
     g_orig_FUN_00467cb0 = nullptr;
     g_orig_FUN_0042e850 = nullptr;
     g_orig_FUN_004688e0 = nullptr;

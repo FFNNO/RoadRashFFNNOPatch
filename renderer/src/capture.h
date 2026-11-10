@@ -205,7 +205,21 @@ bool CaptureLookupTextureMipChain(uint32_t pdatPtr, uint32_t level0Crc32, Textur
 uint8_t CaptureGetHudSentinel();
 void CaptureObserveHudLayer(const uint32_t hist[256]);
 
+// Whether the software world rasterizer FUN_0042e850 and the flat fill FUN_00467cb0 are skipped for
+// one call. forbidden (SoftwareWorldWritesForbidden: widescreen applied or clip rect wider than the
+// 640 surface) skips unconditionally, including dump frames and presenter failures, because the
+// software path would write past the surface pitch. Otherwise the T5 rule: GpuWorld and the
+// presenter are on, the presenter is healthy, and this is not a frame dump.
+bool DecideSkipSoftwareRasterizer(bool forbidden,
+                                  bool gpuWorld,
+                                  bool presenterEnabled,
+                                  bool presenterAllowsGpuWorld,
+                                  bool dumpThisFrame);
+
 // GPU World (Task T5) query API:
+// True while software world writes are forbidden for this race (see SoftwareWorldWritesForbidden),
+// reading the applied projection width and the live clip rect.
+bool CaptureSoftwareWorldWritesForbidden();
 bool CaptureShouldSkipSoftwareRasterizer();
 bool CaptureHasWorldFrame();
 const CapturedQuad* CaptureGetWorldQuads(uint32_t& outCount);

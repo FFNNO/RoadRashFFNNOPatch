@@ -161,6 +161,11 @@ void ParseConfigFile(const std::wstring& iniFilePath, Config& cfg) {
     const INT aniso = static_cast<INT>(GetPrivateProfileIntW(L"World", L"Anisotropy", 8, iniFilePath.c_str()));
     cfg.anisotropy = ClampAnisotropy(aniso);
 
+    wchar_t widescreenBuf[64] = {0};
+    GetPrivateProfileStringW(L"World", L"Widescreen", L"off", widescreenBuf, 64, iniFilePath.c_str());
+    cfg.invalidWidescreenValue = !ParseWidescreenSetting(widescreenBuf, cfg.widescreen);
+    cfg.rawWidescreenString = cfg.invalidWidescreenValue ? widescreenBuf : L"";
+
     UINT tpEnabled = GetPrivateProfileIntW(L"TexturePack", L"Enabled", 1, iniFilePath.c_str());
     cfg.texturePackEnabled = (tpEnabled != 0);
 

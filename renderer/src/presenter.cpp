@@ -4,6 +4,7 @@
 #include "log.h"
 #include "quad_mapping.h"
 #include "texture_pack.h"
+#include "widescreen.h"
 
 #include <d3d11.h>
 #include <dxgi.h>
@@ -170,6 +171,32 @@ VSOut main(uint id : SV_VertexID) {
     return o;
 }
 )";
+
+// Widescreen layers: same fullscreen triangle, uv = base * uvXform.xy + uvXform.zw, so a 640-wide
+// layer maps onto its centred target rect; with the clamp sampler, pixels outside it repeat the
+// layer's edge columns.
+const char* kLayerUvVertexShaderSrc = R"(
+cbuffer LayerUvCB : register(b0) {
+    float4 uvXform;
+};
+
+struct VSOut {
+    float4 pos : SV_Position;
+    float2 uv  : TEXCOORD0;
+};
+
+VSOut main(uint id : SV_VertexID) {
+    VSOut o;
+    float2 base = float2((id << 1) & 2, id & 2);
+    o.pos = float4(base * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    o.uv = base * uvXform.xy + uvXform.zw;
+    return o;
+}
+)";
+
+struct alignas(16) LayerUvConstants {
+    float uvXform[4];
+};
 
 const char* kLayerPixelShaderSrc = R"(
 Texture2D<float4> texLayer : register(t0);
@@ -620,6 +647,9 @@ public:
         m_worldInputLayout.Reset();
         m_layerPS.Reset();
         m_layerVS.Reset();
+        m_layerUvCB.Reset();
+        m_layerUvVS.Reset();
+        m_layerUvFailed = false;
         m_worldPS.Reset();
         m_worldVS.Reset();
         m_srvBgra.Reset();
@@ -1425,6 +1455,86 @@ private:
         return true;
     }
 
+    bool EnsureLayerUvResources() {
+        if (m_layerUvVS && m_layerUvCB) {
+            return true;
+        }
+        if (m_layerUvFailed) {
+            return false;
+        }
+        ComPtr<ID3DBlob> vsBlob;
+        ComPtr<ID3DBlob> errBlob;
+        HRESULT hr = D3DCompile(kLayerUvVertexShaderSrc, std::strlen(kLayerUvVertexShaderSrc), "layer_uv_vs",
+                                nullptr, nullptr, "main", "vs_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                                &vsBlob, &errBlob);
+        if (FAILED(hr) ||
+            FAILED(hr = m_device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr,
+                                                     &m_layerUvVS))) {
+            LOG_ERROR("Widescreen layer VS creation failed (0x%08lX): %s", static_cast<unsigned long>(hr),
+                      errBlob ? static_cast<const char*>(errBlob->GetBufferPointer()) : "");
+            m_layerUvFailed = true;
+            return false;
+        }
+        D3D11_BUFFER_DESC cbd = {};
+        cbd.ByteWidth = sizeof(LayerUvConstants);
+        cbd.Usage = D3D11_USAGE_DYNAMIC;
+        cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        hr = m_device->CreateBuffer(&cbd, nullptr, &m_layerUvCB);
+        if (FAILED(hr)) {
+            LOG_ERROR("CreateBuffer(layerUvCB) failed: 0x%08lX", static_cast<unsigned long>(hr));
+            m_layerUvVS.Reset();
+            m_layerUvFailed = true;
+            return false;
+        }
+        return true;
+    }
+
+    // Widescreen: draws a 640-wide software layer so that its columns cover [layerL, layerR) of the
+    // worldW x worldH target. extendEdges = repeat the edge columns over the rest of the width (the
+    // horizon snapshot, so the sky has no gap at the sides until W2 draws the full horizon);
+    // otherwise the layer is scissored to its rect (HUD and dashboard).
+    bool DrawLayerRectOnWorld(ID3D11ShaderResourceView* srv, int worldW, int worldH, int layerL, int layerR,
+                              bool alphaBlend, bool extendEdges) {
+        if (layerR <= layerL || !EnsureLayerUvResources()) {
+            return false;
+        }
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        HRESULT hr = m_context->Map(m_layerUvCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+        if (FAILED(hr)) {
+            LOG_ERROR("D3D11 Map(layerUvCB) failed: 0x%08lX", static_cast<unsigned long>(hr));
+            return false;
+        }
+        auto* cb = static_cast<LayerUvConstants*>(mapped.pData);
+        const float layerW = static_cast<float>(layerR - layerL);
+        cb->uvXform[0] = static_cast<float>(worldW) / layerW;
+        cb->uvXform[1] = 1.0f;
+        cb->uvXform[2] = -static_cast<float>(layerL) / layerW;
+        cb->uvXform[3] = 0.0f;
+        m_context->Unmap(m_layerUvCB.Get(), 0);
+
+        m_context->IASetInputLayout(nullptr);
+        m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        m_context->VSSetShader(m_layerUvVS.Get(), nullptr, 0);
+        m_context->VSSetConstantBuffers(0, 1, m_layerUvCB.GetAddressOf());
+        m_context->PSSetShader(m_layerPS.Get(), nullptr, 0);
+        m_context->PSSetShaderResources(0, 1, &srv);
+        m_context->PSSetSamplers(0, 1, m_samplerClamp.GetAddressOf());
+        m_context->RSSetState(m_rasterScissor.Get());
+
+        const D3D11_RECT scissor = extendEdges ? D3D11_RECT{0, 0, worldW, worldH}
+                                               : D3D11_RECT{layerL, 0, layerR, worldH};
+        m_context->RSSetScissorRects(1, &scissor);
+
+        const float blendFactor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        m_context->OMSetBlendState(alphaBlend ? m_blendAlpha.Get() : nullptr, blendFactor, 0xFFFFFFFFu);
+
+        m_context->Draw(3, 0);
+        ID3D11Buffer* nullCb = nullptr;
+        m_context->VSSetConstantBuffers(0, 1, &nullCb);
+        return true;
+    }
+
     // With GpuWorld on, the texture pack is indexed as soon as the device exists, in menus too, so
     // with [TexturePack] Preload=1 the replacements are loaded before the race starts instead of
     // on their first draw. The pack's decode worker creates the D3D textures on m_device itself, so
@@ -1484,8 +1594,19 @@ private:
 
     bool PresentWorldFrame(const uint8_t* surface, int pitch, const uint8_t* palette,
                            int srcW, int srcH, int clientW, int clientH, uint64_t nowMs) {
-        const int worldW = GetConfig().internalWidth;
-        const int worldH = GetConfig().internalHeight;
+        // srcW x srcH is the software surface (640x480): the horizon snapshot and HUD layers. The
+        // world quads live in worldSrcW x worldSrcH engine pixels: the same 640x480, or with
+        // widescreen (projection width << 1) x 480, drawn into a target as wide as the window aspect.
+        const bool widescreen = WidescreenIsActive() && srcW == kSoftwareSurfaceWidth && srcH == kSoftwareSurfaceHeight;
+        WorldTargetLayout layout;
+        if (widescreen) {
+            layout = ComputeWorldTargetLayout(WidescreenGetAppliedWidth(), GetConfig().internalWidth,
+                                              GetConfig().internalHeight, clientW, clientH);
+        }
+        const int worldW = widescreen ? layout.targetW : GetConfig().internalWidth;
+        const int worldH = widescreen ? layout.targetH : GetConfig().internalHeight;
+        const int worldSrcW = widescreen ? layout.worldSrcW : srcW;
+        const int worldSrcH = widescreen ? layout.worldSrcH : srcH;
         if (!EnsureWorldRenderTarget(worldW, worldH)) {
             return RecordFailure(nowMs);
         }
@@ -1538,7 +1659,11 @@ private:
             if (!UploadLayerToRgbaTexture(horizonSurf, 640, palette, srcW, srcH, false)) {
                 return RecordFailure(nowMs);
             }
-            if (!DrawFullscreenLayerOnWorld(m_srvLayerRgba.Get(), worldW, worldH, false)) {
+            const bool drawn = widescreen
+                                   ? DrawLayerRectOnWorld(m_srvLayerRgba.Get(), worldW, worldH, layout.layerLeft,
+                                                          layout.layerRight, false, true)
+                                   : DrawFullscreenLayerOnWorld(m_srvLayerRgba.Get(), worldW, worldH, false);
+            if (!drawn) {
                 return RecordFailure(nowMs);
             }
         }
@@ -1549,8 +1674,8 @@ private:
         m_worldVerts.clear();
         m_worldBatches.clear();
 
-        const float invSrcW = 1.0f / static_cast<float>(srcW);
-        const float invSrcH = 1.0f / static_cast<float>(srcH);
+        const float invSrcW = 1.0f / static_cast<float>(worldSrcW);
+        const float invSrcH = 1.0f / static_cast<float>(worldSrcH);
 
         // Upload constant buffer with srcSize and dstSize for PS coordinate mapping
         {
@@ -1561,8 +1686,8 @@ private:
                 return RecordFailure(nowMs);
             }
             auto* cb = static_cast<PresentConstants*>(mappedCB.pData);
-            cb->srcSize[0] = static_cast<float>(srcW);
-            cb->srcSize[1] = static_cast<float>(srcH);
+            cb->srcSize[0] = static_cast<float>(worldSrcW);
+            cb->srcSize[1] = static_cast<float>(worldSrcH);
             cb->dstSize[0] = static_cast<float>(worldW);
             cb->dstSize[1] = static_cast<float>(worldH);
             cb->filterMode = 0;
@@ -1589,25 +1714,26 @@ private:
                 break;
             }
 
-            // Convert 640x480 clipRect ([xmin, xmax) in X, [ymin, ymax] inclusive in Y) to worldW x worldH scissor
-            const int clipL = std::max(0, std::min(srcW, q.clipRect[0]));
-            const int clipT = std::max(0, std::min(srcH, q.clipRect[1]));
-            const int clipR = std::max(0, std::min(srcW, q.clipRect[2]));
-            const int clipB = std::max(0, std::min(srcH, q.clipRect[3] + 1));
+            // Convert the engine clipRect ([xmin, xmax) in X, [ymin, ymax] inclusive in Y; 640x480, or
+            // with widescreen (projection width << 1) x 480) to a worldW x worldH scissor
+            const int clipL = std::max(0, std::min(worldSrcW, q.clipRect[0]));
+            const int clipT = std::max(0, std::min(worldSrcH, q.clipRect[1]));
+            const int clipR = std::max(0, std::min(worldSrcW, q.clipRect[2]));
+            const int clipB = std::max(0, std::min(worldSrcH, q.clipRect[3] + 1));
             if (clipL >= clipR || clipT >= clipB) {
                 continue;
             }
 
             D3D11_RECT sc = {};
-            sc.left   = (clipL * worldW) / srcW;
-            sc.top    = (clipT * worldH) / srcH;
-            sc.right  = (clipR * worldW + srcW - 1) / srcW;
-            sc.bottom = (clipB * worldH + srcH - 1) / srcH;
+            sc.left   = (clipL * worldW) / worldSrcW;
+            sc.top    = (clipT * worldH) / worldSrcH;
+            sc.right  = (clipR * worldW + worldSrcW - 1) / worldSrcW;
+            sc.bottom = (clipB * worldH + worldSrcH - 1) / worldSrcH;
 
             ID3D11ShaderResourceView* srv = m_srvWhite.Get();
             ID3D11SamplerState* sampler = m_samplerClamp.Get();
 
-            // Vertex positions in 640x480 pixels: the engine's snapped int16 vertices, or with
+            // Vertex positions in engine pixels: the engine's snapped int16 vertices, or with
             // [World] SubPixel=1 the captured 16.16 corners they were snapped from (T6).
             float posX[4];
             float posY[4];
@@ -1844,7 +1970,11 @@ private:
         if (!UploadLayerToRgbaTexture(surface, pitch, palette, srcW, srcH, true)) {
             return RecordFailure(nowMs);
         }
-        if (!DrawFullscreenLayerOnWorld(m_srvLayerRgba.Get(), worldW, worldH, true)) {
+        const bool hudDrawn = widescreen
+                                  ? DrawLayerRectOnWorld(m_srvLayerRgba.Get(), worldW, worldH, layout.layerLeft,
+                                                         layout.layerRight, true, false)
+                                  : DrawFullscreenLayerOnWorld(m_srvLayerRgba.Get(), worldW, worldH, true);
+        if (!hudDrawn) {
             return RecordFailure(nowMs);
         }
 
@@ -2215,6 +2345,10 @@ private:
     ComPtr<ID3D11PixelShader> m_worldPS;
     ComPtr<ID3D11VertexShader> m_layerVS;
     ComPtr<ID3D11PixelShader> m_layerPS;
+    // Widescreen layer composite (created on first widescreen frame).
+    ComPtr<ID3D11VertexShader> m_layerUvVS;
+    ComPtr<ID3D11Buffer> m_layerUvCB;
+    bool m_layerUvFailed = false;
     ComPtr<ID3D11InputLayout> m_worldInputLayout;
     ComPtr<ID3D11Buffer> m_worldVB;
     ComPtr<ID3D11RasterizerState> m_rasterScissor;

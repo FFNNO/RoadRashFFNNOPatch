@@ -28,6 +28,7 @@ add_library(ddraw SHARED
   src/texture_pack.cpp
   src/save_redirect.cpp
   src/overlay_text.cpp
+  src/widescreen.cpp
   src/ddraw.def
 )
 set_target_properties(ddraw PROPERTIES OUTPUT_NAME "ddraw" PREFIX "")
@@ -53,6 +54,7 @@ add_executable(hook_test
   src/texture_pack.cpp
   src/save_redirect.cpp
   src/overlay_text.cpp
+  src/widescreen.cpp
 )
 target_compile_options(hook_test PRIVATE ${RR95_COMMON_OPTIONS})
 target_compile_definitions(hook_test PRIVATE ${RR95_COMMON_DEFINITIONS})

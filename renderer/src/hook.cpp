@@ -27,6 +27,31 @@ bool IsLegacyPrefix(uint8_t b) {
 
 }  // namespace
 
+void BuildRelocatedExpected(const HookSite& site, intptr_t delta, uint8_t out[16]) {
+    std::memcpy(out, site.expected, sizeof(site.expected));
+    for (size_t offset : site.absoluteOperandOffsets) {
+        if (offset + sizeof(uint32_t) > sizeof(site.expected)) {
+            continue;
+        }
+        uint32_t value = 0;
+        std::memcpy(&value, out + offset, sizeof(value));
+        value = static_cast<uint32_t>(static_cast<intptr_t>(value) + delta);
+        std::memcpy(out + offset, &value, sizeof(value));
+    }
+}
+
+namespace {
+
+intptr_t RebaseDelta(HMODULE moduleBase) {
+    if (moduleBase == nullptr) {
+        return 0;
+    }
+    return static_cast<intptr_t>(reinterpret_cast<uintptr_t>(moduleBase)) -
+           static_cast<intptr_t>(kPreferredImageBase);
+}
+
+}  // namespace
+
 const char* ValidateHookDecoding(const HookSite& site) {
     if (site.spanLength < 5) {
         return "span shorter than 5 bytes is refused";
@@ -44,6 +69,12 @@ const char* ValidateHookDecoding(const HookSite& site) {
     }
     if (totalLen != site.spanLength) {
         return "instruction lengths not adding up to the span are refused";
+    }
+
+    for (size_t offset : site.absoluteOperandOffsets) {
+        if (offset + sizeof(uint32_t) > site.spanLength) {
+            return "absolute operand outside the span is refused";
+        }
     }
 
     size_t offset = 0;
@@ -108,7 +139,9 @@ bool InstallHook(HookSite& site, HMODULE moduleBase) {
     }
 
     void* target = reinterpret_cast<void*>(targetAddr);
-    if (std::memcmp(target, site.expected, site.spanLength) != 0) {
+    uint8_t liveExpected[sizeof(site.expected)];
+    BuildRelocatedExpected(site, RebaseDelta(moduleBase), liveExpected);
+    if (std::memcmp(target, liveExpected, site.spanLength) != 0) {
         LOG_ERROR("Hook '%s' target %p byte mismatch: memory does not match expected bytes",
                   site.name ? site.name : "<unnamed>", target);
         return false;
@@ -178,8 +211,10 @@ void RemoveHook(HookSite& site, HMODULE moduleBase) {
 
     void* target = reinterpret_cast<void*>(targetAddr);
     DWORD oldProtect = 0;
+    uint8_t liveExpected[sizeof(site.expected)];
+    BuildRelocatedExpected(site, RebaseDelta(moduleBase), liveExpected);
     if (VirtualProtect(target, site.spanLength, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        std::memcpy(target, site.expected, site.spanLength);
+        std::memcpy(target, liveExpected, site.spanLength);
         VirtualProtect(target, site.spanLength, oldProtect, &oldProtect);
         FlushInstructionCache(GetCurrentProcess(), target, site.spanLength);
     }

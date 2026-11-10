@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include "log.h"
+#include "widescreen.h"
 
 enum class FilterMode {
     Nearest = 0,
@@ -32,6 +33,9 @@ struct Config {
     bool subPixel = true;       // [World] SubPixel: draw world quads at their 16.16 corners
     MipFilter mipFilter = MipFilter::Trilinear;
     int anisotropy = 8;         // [World] Anisotropy: 2..16 = anisotropic filtering, 0 or 1 = off
+    WidescreenSetting widescreen;          // [World] Widescreen: off (default) | auto | 320..640 even
+    bool invalidWidescreenValue = false;   // the ini value was not understood; widescreen is off
+    std::wstring rawWidescreenString;      // the ini value when invalidWidescreenValue
     bool texturePackEnabled = true;
     std::wstring texturePackPath = L"texture-pack";
     int texturePackMaxMiB = 512;
