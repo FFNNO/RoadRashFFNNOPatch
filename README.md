@@ -1,5 +1,10 @@
 # Road Rash 95 FFNNO Patch
 
+[![Download the installer](https://img.shields.io/github/v/release/FFNNO/RoadRashFFNNOPatch?label=Download%20installer&style=for-the-badge)](https://github.com/FFNNO/RoadRashFFNNOPatch/releases/latest)
+[![Build](https://img.shields.io/github/actions/workflow/status/FFNNO/RoadRashFFNNOPatch/release.yml?branch=main&style=for-the-badge)](https://github.com/FFNNO/RoadRashFFNNOPatch/actions/workflows/release.yml)
+
+**Players:** download `RoadRashFFNNOPatch-Setup-<version>.exe` from the [latest release](https://github.com/FFNNO/RoadRashFFNNOPatch/releases/latest). Every release is built by GitHub Actions from the tagged commit and lists the SHA-256 of the setup.
+
 A proxy `ddraw.dll` for **Road Rash 95** (Steam 30th Anniversary Edition, app 2448570) that replaces the game's 640x480 software renderer with Direct3D 11:
 
 - the 3D world is drawn on the GPU at 1440x1080 (4:3) at a locked 60 fps;
