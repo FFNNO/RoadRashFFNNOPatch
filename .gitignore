@@ -1,29 +1,28 @@
-# Copyrighted game binaries and derived analysis stay local only.
+# Game files and anything derived from the game's art (never published)
 original/
 patched/
+dumps/
+texture-dump/
+texture-pack/
+out/
+
+# Reverse engineering workspace
 ghidra/
 ghidra-home/
-out/
-dumps/
-texture-pack/
 
 # Build output
 build/
+installer/Output/
+*.exe
+*.dll
+*.lib
+*.exp
 *.obj
 *.pdb
 *.ilk
-*.exp
-*.lib
-*.dll
-
 __pycache__/
 *.pyc
 
-# Installer build output
-installer/Output/
-
-# Game data and derived art: never commit the game files or extracted textures
-texture-dump/
-*.RRS
-*.rrs
+# Files the game writes at runtime
+*.[Rr][Rr][Ss]
 rr95gpu.log
