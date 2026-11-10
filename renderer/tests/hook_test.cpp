@@ -617,6 +617,109 @@ void ReverseWinding(const engine_ref::Vtx in[4], engine_ref::Vtx out[4]) {
     out[3] = in[1];
 }
 
+// Independent model of the engine's horizon blit, transcribed from the decompilation and not from
+// renderer/src/widescreen.cpp, used to check the W2 horizon mapping.
+namespace engine_horizon {
+
+struct Rect {
+    int left;
+    int top;
+    int right;
+    int bottom;
+};
+
+// IDirectDrawSurface::BltFast(x, y, src, &rect, 0x10) on 8bpp surfaces.
+void BltFast(uint8_t* dst, int dstPitch, int x, int y, const uint8_t* src, int srcPitch, const Rect& rc) {
+    for (int row = rc.top; row < rc.bottom; ++row) {
+        for (int col = rc.left; col < rc.right; ++col) {
+            dst[(y + row - rc.top) * dstPitch + x + col - rc.left] = src[row * srcPitch + col];
+        }
+    }
+}
+
+struct Geometry {
+    int total;   // DAT_005ce340
+    int half;    // DAT_005ce344
+    int blitW;   // DAT_005a2934
+    int b4;      // DAT_005cd4b4
+    int b8;      // DAT_005cd4b8
+    int height;  // DAT_006036a4
+};
+
+// FUN_00469770 (decomp.c:58046-58115), DAT_005aa9cc != 0 and the inset branch aside. c4 and c8 are
+// DAT_005cd4c4 and DAT_005cd4c8 (half x height, pitch half).
+void Blit(int param_1, int param_2, const Geometry& g, const uint8_t* c4, const uint8_t* c8, uint8_t* dst,
+          int dstPitch) {
+    int iVar3 = g.blitW;
+    for (; g.total <= param_1; param_1 = param_1 - g.total) {
+    }
+    for (; param_1 < 0; param_1 = param_1 + g.total) {
+    }
+    const uint8_t* uVar5 = c4;
+    const uint8_t* uVar2 = c8;
+    if (g.half <= param_1) {
+        param_1 = param_1 - g.half;
+        uVar5 = c8;
+        uVar2 = c4;
+    }
+    if (param_1 != 0) {
+        BltFast(dst, dstPitch, g.b4, g.b8 + param_2, uVar2, g.half, Rect{g.half - param_1, param_2, g.half, g.height});
+        iVar3 = iVar3 - param_1;
+    }
+    int local_10 = iVar3;
+    if (g.half < iVar3) {
+        local_10 = g.half;
+    }
+    BltFast(dst, dstPitch, g.b4 + param_1, g.b8 + param_2, uVar5, g.half, Rect{0, param_2, local_10, g.height});
+    local_10 = iVar3 - local_10;
+    if (g.half < local_10) {
+        local_10 = g.half;
+    }
+    if (local_10 != 0) {
+        BltFast(dst, dstPitch, (g.b4 - local_10) + g.blitW, g.b8 + param_2, uVar2, g.half,
+                Rect{0, param_2, local_10, g.height});
+    }
+}
+
+// A deterministic panorama (total x height) and its split into the two surfaces the way
+// FUN_00468560 fills them from the file (decomp.c:57305-57313): row = c4 row, then c8 row.
+struct Panorama {
+    std::vector<uint8_t> pixels;
+    std::vector<uint8_t> c4;
+    std::vector<uint8_t> c8;
+};
+
+Panorama MakePanorama(const Geometry& g, uint32_t seed) {
+    Panorama p;
+    p.pixels.resize(static_cast<size_t>(g.total) * g.height);
+    uint32_t s = seed;
+    for (auto& px : p.pixels) {
+        s = s * 1664525u + 1013904223u;
+        px = static_cast<uint8_t>(s >> 24);
+    }
+    p.c4.resize(static_cast<size_t>(g.half) * g.height);
+    p.c8.resize(static_cast<size_t>(g.half) * g.height);
+    for (int y = 0; y < g.height; ++y) {
+        std::memcpy(&p.c4[static_cast<size_t>(y) * g.half], &p.pixels[static_cast<size_t>(y) * g.total], g.half);
+        std::memcpy(&p.c8[static_cast<size_t>(y) * g.half], &p.pixels[static_cast<size_t>(y) * g.total + g.half],
+                    g.half);
+    }
+    return p;
+}
+
+// The 640x480 horizon snapshot capture.cpp takes after the blit: surface rows [0, height), then
+// row height - 1 repeated (SnapshotHorizonAndClearSurfaceIfNeeded).
+std::vector<uint8_t> SnapshotAfterBlit(int param_1, const Geometry& g, const Panorama& p) {
+    std::vector<uint8_t> surf(640 * 480, 0xEE);
+    Blit(param_1, 0, g, p.c4.data(), p.c8.data(), surf.data(), 640);
+    for (int y = g.height; y < 480; ++y) {
+        std::memcpy(&surf[static_cast<size_t>(y) * 640], &surf[static_cast<size_t>(g.height - 1) * 640], 640);
+    }
+    return surf;
+}
+
+}  // namespace engine_horizon
+
 }  // namespace
 
 int main() {
@@ -2370,6 +2473,251 @@ int main() {
         ParseConfigFile(MakeTestTempPath(L"rr95_no_such_ws_ini_") + L".ini", missingWs);
         Check(missingWs.widescreen.mode == WidescreenMode::Off && !missingWs.invalidWidescreenValue,
               "[World] Widescreen missing from the ini stays off");
+    }
+
+    // Widescreen horizon (rr95-widescreen W2): mapping against the engine blit model, vertical
+    // placement, composition, and the 640-wide (off) path.
+    {
+        using namespace engine_horizon;
+
+        // Scroll from the camera value at 0x00612838, as FUN_0045ac50 computes ECX. The low-res
+        // operand is the int16 at 0x0061283a (the high word), read here through memory.
+        auto lowResScroll = [](int32_t camera) {
+            int16_t high = 0;
+            std::memcpy(&high, reinterpret_cast<const uint8_t*>(&camera) + 2, sizeof(high));
+            return -static_cast<int>(high);
+        };
+        bool scrollOk = true;
+        const int32_t cameras[] = {0, 0x00008000, 0x00010000, 0x00018000, 0x012C0000, -1, -0x8000, -0x00010000,
+                                   -0x00018001, 0x7FFFFFFF, static_cast<int32_t>(0x80000000u)};
+        for (int32_t c : cameras) {
+            const int expectedHi = -static_cast<int>(static_cast<int64_t>(c) / 32768 -
+                                                     ((static_cast<int64_t>(c) % 32768) < 0 ? 1 : 0));
+            scrollOk = scrollOk && HorizonScrollFromCamera(c, true) == expectedHi &&
+                       HorizonScrollFromCamera(c, false) == lowResScroll(c);
+        }
+        Check(scrollOk, "horizon scroll: HiRes -(camera sar 15), low-res -(int16 high word)");
+        Check(HorizonScrollFromCamera(0x00010000, true) == -2 && HorizonScrollFromCamera(0x00010000, false) == -1 &&
+                  HorizonScrollFromCamera(-1, true) == 1 && HorizonScrollFromCamera(-1, false) == 1,
+              "horizon scroll spot values");
+
+        // Horizontal mapping against the blit model: every blitted pixel is the panorama column
+        // HorizonPanoramaColumn predicts, for HiRes (720/360, 640 wide) and low-res (360/180, 320).
+        const Geometry hi{720, 360, 640, 0, 0, 297};
+        const Geometry lo{360, 180, 320, 0, 0, 160};
+        std::vector<int> scrolls;
+        for (int s = -1500; s <= 1500; s += 37) {
+            scrolls.push_back(s);
+        }
+        for (int s : {0, 1, 279, 280, 281, 359, 360, 361, 639, 640, 719, 720, 721, -1, -359, -360, -361, -719, -720,
+                      -721, 1439, 1440}) {
+            scrolls.push_back(s);
+        }
+        for (const Geometry* g : {&hi, &lo}) {
+            const Panorama p = MakePanorama(*g, 0x1234u + static_cast<uint32_t>(g->total));
+            bool mapOk = true;
+            for (int s : scrolls) {
+                std::vector<uint8_t> surf(640 * 480, 0xEE);
+                Blit(s, 0, *g, p.c4.data(), p.c8.data(), surf.data(), 640);
+                for (int y = 0; y < g->height && mapOk; ++y) {
+                    for (int d = 0; d < g->blitW; ++d) {
+                        const int col = HorizonPanoramaColumn(d, s, g->total);
+                        if (col < 0 || col >= g->total ||
+                            surf[static_cast<size_t>(y) * 640 + d] !=
+                                p.pixels[static_cast<size_t>(y) * g->total + col]) {
+                            mapOk = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            Check(mapOk, g == &hi ? "horizon mapping matches the FUN_00469770 blit (720 panorama, 640 wide)"
+                                  : "horizon mapping matches the FUN_00469770 blit (360 panorama, 320 wide)");
+        }
+        Check(HorizonPanoramaColumn(-1, 0, 720) == 719 && HorizonPanoramaColumn(0, 1, 720) == 719 &&
+                  HorizonPanoramaColumn(745, -106, 720) == 131 && HorizonPanoramaColumn(10, 0, 0) == -1,
+              "horizon column wraps at the panorama width");
+        Check(HorizonWideColumnToEngineX(0, 852) == -106 && HorizonWideColumnToEngineX(106, 852) == 0 &&
+                  HorizonWideColumnToEngineX(851, 852) == 745 && HorizonWideColumnToEngineX(0, 640) == 0 &&
+                  HorizonWideColumnToEngineX(639, 640) == 639,
+              "wide horizon column -> engine column (852: centre 640 starts at 106)");
+
+        // Vertical placement against the blit model: surface rows the blit wrote are panorama row
+        // HorizonPanoramaRow(y); rows it did not write keep their old contents (-1).
+        bool rowsOk = true;
+        const Geometry inset{360, 180, 320, 160, 120, 160};
+        for (int crop : {0, 10}) {
+            const Panorama p = MakePanorama(inset, 77u);
+            std::vector<uint8_t> surf(640 * 480, 0xEE);
+            Blit(5, crop, inset, p.c4.data(), p.c8.data(), surf.data(), 640);
+            for (int y = 0; y < 480; ++y) {
+                const int py = HorizonPanoramaRow(y, inset.b8, crop, inset.height);
+                const int d = 7;
+                const uint8_t got = surf[static_cast<size_t>(y) * 640 + inset.b4 + d];
+                if (py < 0) {
+                    rowsOk = rowsOk && got == 0xEE;
+                } else {
+                    rowsOk = rowsOk && py < inset.height &&
+                             got == p.pixels[static_cast<size_t>(py) * inset.total + HorizonPanoramaColumn(d, 5, 360)];
+                }
+            }
+        }
+        Check(rowsOk, "horizon vertical placement matches the blit (DAT_005cd4b8 offset, param_2 crop)");
+        Check(HorizonPanoramaRow(0, 0, 0, 297) == 0 && HorizonPanoramaRow(296, 0, 0, 297) == 296 &&
+                  HorizonPanoramaRow(297, 0, 0, 297) == -1 && HorizonPanoramaRow(-1, 0, 0, 297) == -1,
+              "HiRes horizon rows: surface rows [0, 297) are panorama rows");
+
+        // Composition at 852 (projection 426): the centre is the snapshot, the left side is what the
+        // engine shows after turning 106 columns one way, the right side 106 columns the other way.
+        const Panorama p = MakePanorama(hi, 99u);
+        constexpr int kWide = 852;
+        constexpr int kOff = (kWide - 640) / 2;
+        bool composeOk = true;
+        bool sidesOk = true;
+        for (int s : {0, 1, 105, 106, 107, 359, 360, 500, 614, 719, 720, -1, -106, -360, -800, 1300}) {
+            const std::vector<uint8_t> snap = SnapshotAfterBlit(s, hi, p);
+            const std::vector<uint8_t> turnedLeft = SnapshotAfterBlit(s + kOff, hi, p);
+            const std::vector<uint8_t> turnedRight = SnapshotAfterBlit(s - kOff, hi, p);
+            WideHorizonInput in;
+            in.snapshot = snap.data();
+            in.snapshotRows = hi.height;
+            in.panorama = HorizonPanoramaView{p.pixels.data(), hi.total, hi.height, hi.total};
+            in.scroll = s;
+            in.wideWidth = kWide;
+            std::vector<uint8_t> out(static_cast<size_t>(kWide) * 480, 0xCD);
+            composeOk = composeOk && ComposeWideHorizon(in, out.data()) == WideHorizonResult::Panorama;
+            for (int y = 0; y < 480; ++y) {
+                const uint8_t* o = &out[static_cast<size_t>(y) * kWide];
+                const size_t row = static_cast<size_t>(y) * 640;
+                composeOk = composeOk && std::memcmp(o + kOff, &snap[row], 640) == 0;
+                for (int x = 0; x < kOff; ++x) {
+                    sidesOk = sidesOk && o[x] == turnedLeft[row + x];
+                }
+                for (int x = kOff + 640; x < kWide; ++x) {
+                    sidesOk = sidesOk && o[x] == turnedRight[row + x - 2 * kOff];
+                }
+            }
+        }
+        Check(composeOk, "wide horizon 852: Panorama result, centre 640 columns are the snapshot byte for byte");
+        Check(sidesOk, "wide horizon 852: sides equal the engine's own blit after turning by 106 columns");
+
+        // 1280 (projection 640) is wider than the 720 panorama: columns 720 apart repeat.
+        {
+            const std::vector<uint8_t> snap = SnapshotAfterBlit(333, hi, p);
+            WideHorizonInput in;
+            in.snapshot = snap.data();
+            in.snapshotRows = hi.height;
+            in.panorama = HorizonPanoramaView{p.pixels.data(), hi.total, hi.height, hi.total};
+            in.scroll = 333;
+            in.wideWidth = 1280;
+            std::vector<uint8_t> out(1280 * 480, 0xCD);
+            bool wrapOk = ComposeWideHorizon(in, out.data()) == WideHorizonResult::Panorama;
+            for (int y = 0; y < 480 && wrapOk; y += 17) {
+                for (int x = 0; x + 720 < 1280; ++x) {
+                    wrapOk = wrapOk && out[static_cast<size_t>(y) * 1280 + x] == out[static_cast<size_t>(y) * 1280 + x + 720];
+                }
+            }
+            Check(wrapOk, "wide horizon 1280: panorama wraps every 720 columns");
+        }
+
+        // Rows past the horizon height repeat the last horizon row across the whole width.
+        {
+            const std::vector<uint8_t> snap = SnapshotAfterBlit(42, hi, p);
+            WideHorizonInput in;
+            in.snapshot = snap.data();
+            in.snapshotRows = hi.height;
+            in.panorama = HorizonPanoramaView{p.pixels.data(), hi.total, hi.height, hi.total};
+            in.scroll = 42;
+            in.wideWidth = kWide;
+            std::vector<uint8_t> out(static_cast<size_t>(kWide) * 480, 0xCD);
+            bool belowOk = ComposeWideHorizon(in, out.data()) == WideHorizonResult::Panorama;
+            for (int y = hi.height; y < 480; ++y) {
+                belowOk = belowOk && std::memcmp(&out[static_cast<size_t>(y) * kWide],
+                                                 &out[static_cast<size_t>(hi.height - 1) * kWide], kWide) == 0;
+            }
+            Check(belowOk, "wide horizon: rows below the horizon height repeat the last horizon row");
+
+            // A scroll that does not match what was drawn, a changed pixel, or no panorama: edge
+            // columns repeat (the W1 look) and the centre is still the snapshot.
+            auto edgeRepeatOk = [&](const WideHorizonInput& bad, const std::vector<uint8_t>& s) {
+                std::vector<uint8_t> o(static_cast<size_t>(kWide) * 480, 0xCD);
+                if (ComposeWideHorizon(bad, o.data()) != WideHorizonResult::EdgeRepeat) {
+                    return false;
+                }
+                for (int y = 0; y < 480; ++y) {
+                    const uint8_t* r = &o[static_cast<size_t>(y) * kWide];
+                    const uint8_t* sr = &s[static_cast<size_t>(y) * 640];
+                    if (std::memcmp(r + kOff, sr, 640) != 0) {
+                        return false;
+                    }
+                    for (int x = 0; x < kOff; ++x) {
+                        if (r[x] != sr[0] || r[kOff + 640 + x] != sr[639]) {
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            };
+            WideHorizonInput wrongScroll = in;
+            wrongScroll.scroll = 43;
+            Check(edgeRepeatOk(wrongScroll, snap), "wide horizon: scroll mismatch -> edge repeat");
+            std::vector<uint8_t> touched = snap;
+            touched[static_cast<size_t>(200) * 640 + 320] ^= 0x5A;
+            WideHorizonInput touchedIn = in;
+            touchedIn.snapshot = touched.data();
+            Check(edgeRepeatOk(touchedIn, touched), "wide horizon: one differing pixel -> edge repeat");
+            WideHorizonInput noPano = in;
+            noPano.panorama = HorizonPanoramaView{};
+            Check(edgeRepeatOk(noPano, snap), "wide horizon: no panorama -> edge repeat");
+            WideHorizonInput shortPano = in;
+            shortPano.panorama.height = 100;
+            Check(edgeRepeatOk(shortPano, snap), "wide horizon: panorama shorter than the horizon -> edge repeat");
+            WideHorizonInput narrowPano = in;
+            narrowPano.panorama.width = 0;
+            Check(edgeRepeatOk(narrowPano, snap), "wide horizon: zero-width panorama -> edge repeat");
+
+            // Off path: a 640-wide layer is the snapshot itself, with or without a panorama.
+            WideHorizonInput off = in;
+            off.wideWidth = 640;
+            std::vector<uint8_t> o640(640 * 480, 0xCD);
+            Check(ComposeWideHorizon(off, o640.data()) == WideHorizonResult::Copied && o640 == snap,
+                  "wide horizon at 640 (widescreen off): byte-for-byte snapshot");
+            off.panorama = HorizonPanoramaView{};
+            std::fill(o640.begin(), o640.end(), static_cast<uint8_t>(0xCD));
+            Check(ComposeWideHorizon(off, o640.data()) == WideHorizonResult::Copied && o640 == snap,
+                  "wide horizon at 640 without a panorama: byte-for-byte snapshot");
+
+            // Invalid widths and inputs leave the output untouched.
+            std::vector<uint8_t> untouched(static_cast<size_t>(kMaxWideHorizonWidth) * 480, 0xCD);
+            bool invalidOk = true;
+            for (int w : {0, 638, 641, 853, kMaxWideHorizonWidth + 2}) {
+                WideHorizonInput badW = in;
+                badW.wideWidth = w;
+                invalidOk = invalidOk && ComposeWideHorizon(badW, untouched.data()) == WideHorizonResult::Invalid;
+            }
+            WideHorizonInput noSnap = in;
+            noSnap.snapshot = nullptr;
+            invalidOk = invalidOk && ComposeWideHorizon(noSnap, untouched.data()) == WideHorizonResult::Invalid;
+            WideHorizonInput badRows = in;
+            badRows.snapshotRows = 0;
+            invalidOk = invalidOk && ComposeWideHorizon(badRows, untouched.data()) == WideHorizonResult::Invalid;
+            invalidOk = invalidOk && ComposeWideHorizon(in, nullptr) == WideHorizonResult::Invalid;
+            invalidOk = invalidOk && std::all_of(untouched.begin(), untouched.end(), [](uint8_t v) { return v == 0xCD; });
+            Check(invalidOk, "wide horizon: invalid width, snapshot, rows or output -> Invalid, output untouched");
+        }
+
+        // Capture API: without widescreen (and without a snapshot this frame) there is no wide
+        // layer, so the presenter keeps the 640 horizon path.
+        WidescreenSetAppliedWidth(kEngineProjectionWidth);
+        CaptureInvalidateHorizonPanorama();
+        int32_t wideW = -1;
+        Check(CaptureGetWideHorizonLayer(wideW) == nullptr && wideW == 0,
+              "CaptureGetWideHorizonLayer: nothing without widescreen and a snapshot this frame");
+        WidescreenSetAppliedWidth(426);
+        CaptureEndFrame();
+        Check(CaptureGetWideHorizonLayer(wideW) == nullptr && wideW == 0,
+              "CaptureGetWideHorizonLayer: nothing after end of frame even with widescreen applied");
+        WidescreenSetAppliedWidth(kEngineProjectionWidth);
     }
 
     std::printf("%s (%d failure(s))\n", g_failures == 0 ? "OK" : "FAILED", g_failures);

@@ -224,6 +224,13 @@ bool CaptureShouldSkipSoftwareRasterizer();
 bool CaptureHasWorldFrame();
 const CapturedQuad* CaptureGetWorldQuads(uint32_t& outCount);
 const uint8_t* CaptureGetHorizonLayer(int32_t& outHorizonHeight);
+// Widescreen (W2): the horizon layer (projection width << 1) x 480, 8bpp, pitch outWidth, whose
+// centre 640 columns are the horizon snapshot and whose sides continue the engine's sky panorama
+// (ComposeWideHorizon). nullptr unless widescreen is active and the snapshot was taken this frame.
+const uint8_t* CaptureGetWideHorizonLayer(int32_t& outWidth);
+// Drops the cached copy of the horizon surfaces DAT_005cd4c4/DAT_005cd4c8 so that the next
+// widescreen frame reads them again (race start, level change).
+void CaptureInvalidateHorizonPanorama();
 const uint8_t* CaptureLookupTexturePixels(uint32_t pdatPtr,
                                           uint32_t level0Crc32,
                                           int32_t& outWidth,

@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <cwctype>
 #include <string>
 
@@ -183,6 +184,108 @@ WorldTargetLayout ComputeWorldTargetLayout(int projectionWidth,
     l.layerLeft = RoundNearest((l.worldSrcW - kSoftwareSurfaceWidth) / 2.0 * scale);
     l.layerRight = RoundNearest((l.worldSrcW + kSoftwareSurfaceWidth) / 2.0 * scale);
     return l;
+}
+
+int HorizonScrollFromCamera(int32_t camera, bool hiRes) {
+    // 0x45acf2: mov ecx,[0x612838]; sar ecx,15 (HiRes) / 0x45acfd: movsx ecx,word [0x61283a];
+    // 0x45ad04: neg ecx. Both shifts floor, as an arithmetic shift of the 32-bit value does.
+    const int64_t shifted = hiRes ? (static_cast<int64_t>(camera) >> 15) : (static_cast<int64_t>(camera) >> 16);
+    return static_cast<int>(-shifted);
+}
+
+int HorizonPanoramaColumn(int engineX, int scroll, int panoramaWidth) {
+    if (panoramaWidth <= 0) {
+        return -1;
+    }
+    const int64_t m = (static_cast<int64_t>(engineX) - scroll) % panoramaWidth;
+    return static_cast<int>(m < 0 ? m + panoramaWidth : m);
+}
+
+int HorizonWideColumnToEngineX(int wideX, int wideWidth) {
+    return wideX - (wideWidth - kHorizonBlitWidth) / 2;
+}
+
+int HorizonPanoramaRow(int surfaceY, int blitY, int cropTop, int panoramaHeight) {
+    const int row = surfaceY - blitY;
+    if (row < cropTop || row < 0 || row >= panoramaHeight) {
+        return -1;
+    }
+    return row;
+}
+
+WideHorizonResult ComposeWideHorizon(const WideHorizonInput& in, uint8_t* out) {
+    constexpr int kW = kSoftwareSurfaceWidth;
+    constexpr int kH = kSoftwareSurfaceHeight;
+    const int wideW = in.wideWidth;
+    if (out == nullptr || in.snapshot == nullptr || in.snapshotRows <= 0 || in.snapshotRows > kH ||
+        wideW < kW || wideW > kMaxWideHorizonWidth || (wideW % 2) != 0) {
+        return WideHorizonResult::Invalid;
+    }
+    if (wideW == kW) {
+        std::memcpy(out, in.snapshot, static_cast<size_t>(kW) * kH);
+        return WideHorizonResult::Copied;
+    }
+    const int off = (wideW - kW) / 2;
+    const HorizonPanoramaView& pano = in.panorama;
+    const int lastRow = in.snapshotRows - 1;
+
+    // The panorama is used only when it covers every horizon row and reproduces every pixel the
+    // blit wrote into the snapshot at this scroll; a stale panorama or scroll falls back.
+    bool usePanorama = pano.pixels != nullptr && pano.width > 0 && pano.width <= kMaxHorizonPanoramaWidth &&
+                       pano.height >= in.snapshotRows && pano.pitch >= pano.width;
+    int verifiedRows = 0;
+    for (int sy = 0; usePanorama && sy < in.snapshotRows; ++sy) {
+        const int py = HorizonPanoramaRow(sy, in.blitY, in.cropTop, pano.height);
+        if (py < 0) {
+            continue;
+        }
+        const uint8_t* snapRow = in.snapshot + static_cast<size_t>(sy) * kW;
+        const uint8_t* panoRow = pano.pixels + static_cast<size_t>(py) * pano.pitch;
+        int col = HorizonPanoramaColumn(0, in.scroll, pano.width);
+        for (int d = 0; d < kW; ++d) {
+            if (snapRow[d] != panoRow[col]) {
+                usePanorama = false;
+                break;
+            }
+            if (++col == pano.width) {
+                col = 0;
+            }
+        }
+        ++verifiedRows;
+    }
+    if (verifiedRows == 0) {
+        usePanorama = false;
+    }
+
+    for (int y = 0; y < kH; ++y) {
+        // Snapshot rows past the horizon repeat its last row, so do the wide rows.
+        const int sy = y < lastRow ? y : lastRow;
+        const uint8_t* snapRow = in.snapshot + static_cast<size_t>(y) * kW;
+        uint8_t* dst = out + static_cast<size_t>(y) * wideW;
+        std::memcpy(dst + off, snapRow, kW);
+        const int py = usePanorama ? HorizonPanoramaRow(sy, in.blitY, in.cropTop, pano.height) : -1;
+        if (py >= 0) {
+            const uint8_t* panoRow = pano.pixels + static_cast<size_t>(py) * pano.pitch;
+            int col = HorizonPanoramaColumn(HorizonWideColumnToEngineX(0, wideW), in.scroll, pano.width);
+            for (int x = 0; x < off; ++x) {
+                dst[x] = panoRow[col];
+                if (++col == pano.width) {
+                    col = 0;
+                }
+            }
+            col = HorizonPanoramaColumn(HorizonWideColumnToEngineX(off + kW, wideW), in.scroll, pano.width);
+            for (int x = off + kW; x < wideW; ++x) {
+                dst[x] = panoRow[col];
+                if (++col == pano.width) {
+                    col = 0;
+                }
+            }
+        } else {
+            std::memset(dst, snapRow[0], static_cast<size_t>(off));
+            std::memset(dst + off + kW, snapRow[kW - 1], static_cast<size_t>(off));
+        }
+    }
+    return usePanorama ? WideHorizonResult::Panorama : WideHorizonResult::EdgeRepeat;
 }
 
 void WidescreenSetAppliedWidth(int width) {

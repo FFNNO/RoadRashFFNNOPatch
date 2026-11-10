@@ -650,6 +650,12 @@ public:
         m_layerUvCB.Reset();
         m_layerUvVS.Reset();
         m_layerUvFailed = false;
+        m_srvWideHorizon.Reset();
+        m_texWideHorizon.Reset();
+        m_wideHorizonTexW = 0;
+        m_wideHorizonTexH = 0;
+        m_wideHorizonFailedW = 0;
+        m_wideHorizonFailedH = 0;
         m_worldPS.Reset();
         m_worldVS.Reset();
         m_srvBgra.Reset();
@@ -1402,12 +1408,20 @@ private:
     // a histogram of the layer is handed to the capture module (HUD sentinel collision detection).
     bool UploadLayerToRgbaTexture(const uint8_t* srcSurf, int srcPitch, const uint8_t* palette,
                                   int width, int height, bool useHudSentinelKey) {
+        return UploadLayerToTexture(m_texLayerRgba.Get(), srcSurf, srcPitch, palette, width, height,
+                                    useHudSentinelKey);
+    }
+
+    // Same conversion into any dynamic RGBA texture at least width x height (the widescreen horizon).
+    bool UploadLayerToTexture(ID3D11Texture2D* tex, const uint8_t* srcSurf, int srcPitch, const uint8_t* palette,
+                              int width, int height, bool useHudSentinelKey) {
         const uint8_t sentinel = CaptureGetHudSentinel();
         uint32_t hist[256] = {};
         D3D11_MAPPED_SUBRESOURCE mapped = {};
-        HRESULT hr = m_context->Map(m_texLayerRgba.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+        HRESULT hr = m_context->Map(tex, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
         if (FAILED(hr)) {
-            LOG_ERROR("D3D11 Map(texLayerRgba) failed: 0x%08lX", static_cast<unsigned long>(hr));
+            LOG_ERROR("D3D11 Map(%s) failed: 0x%08lX", tex == m_texLayerRgba.Get() ? "texLayerRgba" : "texWideHorizon",
+                      static_cast<unsigned long>(hr));
             return false;
         }
         for (int y = 0; y < height; ++y) {
@@ -1429,7 +1443,7 @@ private:
                 }
             }
         }
-        m_context->Unmap(m_texLayerRgba.Get(), 0);
+        m_context->Unmap(tex, 0);
         if (useHudSentinelKey) {
             CaptureObserveHudLayer(hist);
         }
@@ -1452,6 +1466,47 @@ private:
         m_context->OMSetBlendState(alphaBlend ? m_blendAlpha.Get() : nullptr, blendFactor, 0xFFFFFFFFu);
 
         m_context->Draw(3, 0);
+        return true;
+    }
+
+    // Widescreen horizon texture, (re)created when the wide layer width changes. A failure is
+    // logged once per size and the caller falls back to the centred 640 horizon.
+    bool EnsureWideHorizonTexture(int width, int height) {
+        if (m_texWideHorizon && m_srvWideHorizon && m_wideHorizonTexW == width && m_wideHorizonTexH == height) {
+            return true;
+        }
+        if (m_wideHorizonFailedW == width && m_wideHorizonFailedH == height) {
+            return false;
+        }
+        m_srvWideHorizon.Reset();
+        m_texWideHorizon.Reset();
+        m_wideHorizonTexW = 0;
+        m_wideHorizonTexH = 0;
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = static_cast<UINT>(width);
+        td.Height = static_cast<UINT>(height);
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DYNAMIC;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        HRESULT hr = m_device->CreateTexture2D(&td, nullptr, &m_texWideHorizon);
+        if (SUCCEEDED(hr)) {
+            hr = m_device->CreateShaderResourceView(m_texWideHorizon.Get(), nullptr, &m_srvWideHorizon);
+        }
+        if (FAILED(hr)) {
+            LOG_ERROR("Widescreen horizon texture %dx%d creation failed: 0x%08lX", width, height,
+                      static_cast<unsigned long>(hr));
+            m_srvWideHorizon.Reset();
+            m_texWideHorizon.Reset();
+            m_wideHorizonFailedW = width;
+            m_wideHorizonFailedH = height;
+            return false;
+        }
+        m_wideHorizonTexW = width;
+        m_wideHorizonTexH = height;
         return true;
     }
 
@@ -1492,7 +1547,7 @@ private:
 
     // Widescreen: draws a 640-wide software layer so that its columns cover [layerL, layerR) of the
     // worldW x worldH target. extendEdges = repeat the edge columns over the rest of the width (the
-    // horizon snapshot, so the sky has no gap at the sides until W2 draws the full horizon);
+    // horizon snapshot when the wide horizon layer is unavailable, so the sky has no gap at the sides);
     // otherwise the layer is scissored to its rect (HUD and dashboard).
     bool DrawLayerRectOnWorld(ID3D11ShaderResourceView* srv, int worldW, int worldH, int layerL, int layerR,
                               bool alphaBlend, bool extendEdges) {
@@ -1655,7 +1710,21 @@ private:
         // Pass 1: Layer 1 (2D Horizon Backdrop, 640x480)
         int32_t horizonHeight = 0;
         const uint8_t* horizonSurf = CaptureGetHorizonLayer(horizonHeight);
-        if (horizonSurf != nullptr && srcW == 640 && srcH == 480) {
+        // Widescreen (W2): the horizon layer as wide as the world source, its sides continuing the
+        // sky panorama, covers the whole target like the world does. Without it (not composed this
+        // frame, or a width mismatch) the 640 snapshot is drawn centred with repeated edges (W1).
+        int32_t wideHorizonW = 0;
+        const uint8_t* wideHorizon = widescreen ? CaptureGetWideHorizonLayer(wideHorizonW) : nullptr;
+        if (horizonSurf != nullptr && srcW == 640 && srcH == 480 && wideHorizon != nullptr &&
+            wideHorizonW == worldSrcW && EnsureWideHorizonTexture(wideHorizonW, srcH)) {
+            if (!UploadLayerToTexture(m_texWideHorizon.Get(), wideHorizon, wideHorizonW, palette, wideHorizonW, srcH,
+                                      false)) {
+                return RecordFailure(nowMs);
+            }
+            if (!DrawFullscreenLayerOnWorld(m_srvWideHorizon.Get(), worldW, worldH, false)) {
+                return RecordFailure(nowMs);
+            }
+        } else if (horizonSurf != nullptr && srcW == 640 && srcH == 480) {
             if (!UploadLayerToRgbaTexture(horizonSurf, 640, palette, srcW, srcH, false)) {
                 return RecordFailure(nowMs);
             }
@@ -2349,6 +2418,13 @@ private:
     ComPtr<ID3D11VertexShader> m_layerUvVS;
     ComPtr<ID3D11Buffer> m_layerUvCB;
     bool m_layerUvFailed = false;
+    // Widescreen horizon layer (W2), (projection width << 1) x 480.
+    ComPtr<ID3D11Texture2D> m_texWideHorizon;
+    ComPtr<ID3D11ShaderResourceView> m_srvWideHorizon;
+    int m_wideHorizonTexW = 0;
+    int m_wideHorizonTexH = 0;
+    int m_wideHorizonFailedW = 0;
+    int m_wideHorizonFailedH = 0;
     ComPtr<ID3D11InputLayout> m_worldInputLayout;
     ComPtr<ID3D11Buffer> m_worldVB;
     ComPtr<ID3D11RasterizerState> m_rasterScissor;

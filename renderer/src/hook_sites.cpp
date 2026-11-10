@@ -599,6 +599,8 @@ void ApplyRaceProjectionWidth() {
     if (!widen) {
         WidescreenSetAppliedWidth(kEngineProjectionWidth);
     }
+    // The race may use another track's sky: the widescreen horizon reads the surfaces again.
+    CaptureInvalidateHorizonPanorama();
 
     if (widen) {
         LOG_INFO("Widescreen: race start with projection width %d (world source %dx%d, window %dx%d)",

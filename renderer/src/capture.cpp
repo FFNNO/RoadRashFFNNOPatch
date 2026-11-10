@@ -6,6 +6,8 @@
 #include "texture_pack.h"
 #include "widescreen.h"
 
+#include <ddraw.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -30,6 +32,14 @@ constexpr int32_t  kSurfaceHeight    = 480;
 // 0x005ca7a0: uint32_t track/level RSC file handle (DAT_005ca7a0)
 // 0x005cab48: uint32_t biker sprite resource buffer (DAT_005cab48)
 // 0x005ce34c: uint8_t  surface locked flag set by FUN_004688e0 (DAT_005ce34c)
+// 0x005a2934: int32_t  horizon blit width, 640 in HiRes (DAT_005a2934)
+// 0x005a292a: uint8_t  HiRes flag (DAT_005a292a)
+// 0x005cd4b4: int32_t  horizon blit origin X (DAT_005cd4b4; 0 in HiRes)
+// 0x005cd4b8: int32_t  horizon blit origin Y (DAT_005cd4b8; 0 in HiRes)
+// 0x005cd4c4: IDirectDrawSurface* horizon panorama columns [0, half) (DAT_005cd4c4)
+// 0x005cd4c8: IDirectDrawSurface* horizon panorama columns [half, width) (DAT_005cd4c8)
+// 0x005ce340: int32_t  horizon panorama width, 720 in HiRes (DAT_005ce340)
+// 0x005ce344: int32_t  horizon surface width, half the panorama (DAT_005ce344)
 // 0x006036a4: int32_t  horizon height in scanlines used by FUN_00469770 (DAT_006036a4)
 // 0x006036b8: int32_t  locked 8bpp surface pitch set by FUN_004688e0 (DAT_006036b8)
 // 0x006036bc: uint8_t* locked 8bpp viewport base pointer set by FUN_004688e0 (DAT_006036bc)
@@ -39,6 +49,7 @@ constexpr int32_t  kSurfaceHeight    = 480;
 // 0x00618580: int16_t[16] 4 vertices {x, y, u, v} (DAT_00618580..0x0061859e)
 // 0x006185a4: const uint8_t* active mip level texel pointer set by FUN_0042e850 (DAT_006185a4)
 // 0x006185e0: const uint8_t* current render node poly = ccb + 0x68 (DAT_006185e0)
+// 0x00612838: int32_t  camera heading term FUN_0045ac50 turns into the horizon scroll (DAT_00612838)
 constexpr uint32_t kVaSpriteClutTable   = 0x00596a90;
 constexpr uint32_t kVaSpritePdatPtr     = 0x005aaa04;
 constexpr uint32_t kVaSnapShift         = 0x005aaa14;
@@ -47,6 +58,15 @@ constexpr uint32_t kVaGlobalRscHandle   = 0x005ca79c;
 constexpr uint32_t kVaTrackRscHandle    = 0x005ca7a0;
 constexpr uint32_t kVaBikerSprBuf       = 0x005cab48;
 constexpr uint32_t kVaSurfaceLockedFlag = 0x005ce34c;
+constexpr uint32_t kVaHorizonBlitWidth  = 0x005a2934;
+constexpr uint32_t kVaHiResFlag         = 0x005a292a;
+constexpr uint32_t kVaHorizonBlitX      = 0x005cd4b4;
+constexpr uint32_t kVaHorizonBlitY      = 0x005cd4b8;
+constexpr uint32_t kVaHorizonSurfaceA   = 0x005cd4c4;
+constexpr uint32_t kVaHorizonSurfaceB   = 0x005cd4c8;
+constexpr uint32_t kVaHorizonPanoWidth  = 0x005ce340;
+constexpr uint32_t kVaHorizonHalfWidth  = 0x005ce344;
+constexpr uint32_t kVaHorizonCamera     = 0x00612838;
 constexpr uint32_t kVaHorizonHeight     = 0x006036a4;
 constexpr uint32_t kVaSurfacePitch      = 0x006036b8;
 constexpr uint32_t kVaSurfaceBasePtr    = 0x006036bc;
@@ -77,6 +97,26 @@ bool g_dumpTriggeredCheckedThisFrame = false;
 bool g_horizonCapturedThisFrame = false;
 int32_t g_horizonHeight = 360;
 uint8_t g_horizonBuffer[kSurfaceWidth * kSurfaceHeight];
+
+// Widescreen horizon (W2): the composed wide layer and a copy of the engine's sky panorama, read
+// from the horizon surfaces DAT_005cd4c4/DAT_005cd4c8 (8bpp system-memory surfaces created in
+// FUN_0045f7f0 with caps 0x840). Only the game thread touches these.
+uint8_t g_wideHorizonBuffer[kMaxWideHorizonWidth * kSurfaceHeight];
+int32_t g_wideHorizonWidth = 0;
+bool g_wideHorizonComposedThisFrame = false;
+
+struct HorizonPanoramaCache {
+    std::vector<uint8_t> pixels;  // width x height, pitch width
+    int width = 0;
+    int height = 0;
+    uintptr_t surfaceA = 0;
+    uintptr_t surfaceB = 0;
+    bool valid = false;
+    uint32_t frame = 0;             // widescreen horizon frames composed
+    uint32_t retryAfterFrame = 0;   // no re-read before this frame after a failed one
+    uint32_t mismatchFrames = 0;    // frames whose sides fell back to edge repeat
+};
+HorizonPanoramaCache& g_horizonPanorama = *new HorizonPanoramaCache();
 
 LevelStateSnapshot g_levelSnapshot;
 
@@ -214,6 +254,140 @@ void CheckAndInvalidateCacheOnLevelChange() {
     }
 }
 
+// Frames to wait before reading the horizon surfaces again after a read that failed or did not
+// reproduce the engine's blit.
+constexpr uint32_t kHorizonPanoramaRetryFrames = 120;
+
+// Copies the two horizon surfaces into g_horizonPanorama as one width x height panorama (columns
+// [0, half) from DAT_005cd4c4, [half, width) from DAT_005cd4c8, the order FUN_00468560 fills them
+// from the file). Read-only locks on system-memory surfaces; nothing is written to the game.
+bool ReadHorizonPanorama(int width, int half, int height) {
+    HorizonPanoramaCache& c = g_horizonPanorama;
+    c.valid = false;
+    IDirectDrawSurface* surfaces[2] = {*GlobalPtr<IDirectDrawSurface*>(kVaHorizonSurfaceA),
+                                       *GlobalPtr<IDirectDrawSurface*>(kVaHorizonSurfaceB)};
+    if (!surfaces[0] || !surfaces[1] || half <= 0 || width != 2 * half || width > kMaxHorizonPanoramaWidth ||
+        height <= 0 || height > kSurfaceHeight) {
+        return false;
+    }
+    c.pixels.assign(static_cast<size_t>(width) * height, 0);
+    for (int i = 0; i < 2; ++i) {
+        DDSURFACEDESC desc = {};
+        desc.dwSize = sizeof(desc);
+        const HRESULT hr = surfaces[i]->Lock(nullptr, &desc, DDLOCK_WAIT | DDLOCK_READONLY, nullptr);
+        if (FAILED(hr)) {
+            LOG_WARN("Widescreen horizon: Lock of horizon surface %d failed (0x%08lX)", i,
+                     static_cast<unsigned long>(hr));
+            return false;
+        }
+        const bool formatOk = (desc.dwFlags & DDSD_PIXELFORMAT) == 0 || desc.ddpfPixelFormat.dwRGBBitCount == 8;
+        const bool ok = desc.lpSurface != nullptr && desc.lPitch >= half && static_cast<int>(desc.dwWidth) >= half &&
+                        static_cast<int>(desc.dwHeight) >= height && formatOk;
+        if (ok) {
+            const auto* src = static_cast<const uint8_t*>(desc.lpSurface);
+            for (int y = 0; y < height; ++y) {
+                std::memcpy(&c.pixels[static_cast<size_t>(y) * width + static_cast<size_t>(i) * half],
+                            src + static_cast<ptrdiff_t>(y) * desc.lPitch, static_cast<size_t>(half));
+            }
+        }
+        surfaces[i]->Unlock(nullptr);
+        if (!ok) {
+            LOG_WARN("Widescreen horizon: horizon surface %d is %lux%lu pitch %ld, %lu bpp; expected %dx%d 8 bpp", i,
+                     desc.dwWidth, desc.dwHeight, desc.lPitch, desc.ddpfPixelFormat.dwRGBBitCount, half, height);
+            return false;
+        }
+    }
+    c.width = width;
+    c.height = height;
+    c.surfaceA = reinterpret_cast<uintptr_t>(surfaces[0]);
+    c.surfaceB = reinterpret_cast<uintptr_t>(surfaces[1]);
+    c.valid = true;
+    return true;
+}
+
+// Widescreen only: builds g_wideHorizonBuffer from this frame's horizon snapshot. The sides
+// continue the panorama when the blit geometry is the HiRes one and the panorama reproduces the
+// snapshot (ComposeWideHorizon verifies it); otherwise they repeat the edge columns.
+void ComposeWideHorizonIfActive() {
+    g_wideHorizonComposedThisFrame = false;
+    if (!WidescreenIsActive()) {
+        return;
+    }
+    HorizonPanoramaCache& c = g_horizonPanorama;
+    ++c.frame;
+    int projectionWidth = WidescreenGetAppliedWidth();
+    if (projectionWidth > kMaxProjectionWidth) {
+        projectionWidth = kMaxProjectionWidth;
+    }
+
+    WideHorizonInput in;
+    in.snapshot = g_horizonBuffer;
+    in.snapshotRows = g_horizonHeight;
+    in.wideWidth = projectionWidth * 2;
+    in.cropTop = 0;  // FUN_0045ac50 calls FUN_00469770 with EDX = 0 (0x45ad06)
+
+    const bool hiRes = *GlobalPtr<const uint8_t>(kVaHiResFlag) != 0;
+    const int panoW = *GlobalPtr<const int32_t>(kVaHorizonPanoWidth);
+    const int half = *GlobalPtr<const int32_t>(kVaHorizonHalfWidth);
+    const int blitX = *GlobalPtr<const int32_t>(kVaHorizonBlitX);
+    const int blitY = *GlobalPtr<const int32_t>(kVaHorizonBlitY);
+    const int blitW = *GlobalPtr<const int32_t>(kVaHorizonBlitWidth);
+    const int surfaceH = *GlobalPtr<const int32_t>(kVaHorizonHeight);
+    const bool geometryOk = hiRes && blitX == 0 && blitY == 0 && blitW == kHorizonBlitWidth && half > 0 &&
+                            panoW == 2 * half && panoW <= kMaxHorizonPanoramaWidth && surfaceH == g_horizonHeight;
+    in.blitY = blitY;
+
+    bool freshRead = false;
+    auto panoramaMatches = [&]() {
+        return c.valid && c.width == panoW && c.height == surfaceH &&
+               c.surfaceA == reinterpret_cast<uintptr_t>(*GlobalPtr<IDirectDrawSurface*>(kVaHorizonSurfaceA)) &&
+               c.surfaceB == reinterpret_cast<uintptr_t>(*GlobalPtr<IDirectDrawSurface*>(kVaHorizonSurfaceB));
+    };
+    auto readNow = [&]() {
+        const bool firstRead = !c.valid;
+        freshRead = ReadHorizonPanorama(panoW, half, surfaceH);
+        if (freshRead && firstRead) {
+            LOG_INFO("Widescreen horizon: read the %dx%d sky panorama from the horizon surfaces", panoW, surfaceH);
+        }
+        return freshRead;
+    };
+    if (geometryOk) {
+        in.scroll = HorizonScrollFromCamera(*GlobalPtr<const int32_t>(kVaHorizonCamera), true);
+        if (!panoramaMatches() && c.frame >= c.retryAfterFrame) {
+            readNow();
+        }
+        if (panoramaMatches()) {
+            in.panorama = HorizonPanoramaView{c.pixels.data(), c.width, c.height, c.width};
+        }
+    }
+
+    WideHorizonResult result = ComposeWideHorizon(in, g_wideHorizonBuffer);
+    if (result == WideHorizonResult::EdgeRepeat && in.panorama.pixels != nullptr && !freshRead &&
+        c.frame >= c.retryAfterFrame) {
+        // The cached panorama no longer reproduces the blit (the surfaces were refilled): read once.
+        if (readNow()) {
+            in.panorama = HorizonPanoramaView{c.pixels.data(), c.width, c.height, c.width};
+            result = ComposeWideHorizon(in, g_wideHorizonBuffer);
+        }
+    }
+    if (result == WideHorizonResult::Invalid) {
+        return;
+    }
+    if (result == WideHorizonResult::EdgeRepeat) {
+        if (c.frame >= c.retryAfterFrame) {
+            c.retryAfterFrame = c.frame + kHorizonPanoramaRetryFrames;
+        }
+        if (c.mismatchFrames++ % 600 == 0) {
+            LOG_WARN("Widescreen horizon: sides repeat the edge columns (%u frame(s); geometry %s: HiRes=%d "
+                     "blit %d,%d w%d panorama %d/%d h%d/%d; panorama %s)",
+                     c.mismatchFrames, geometryOk ? "ok" : "unexpected", hiRes ? 1 : 0, blitX, blitY, blitW, panoW,
+                     half, surfaceH, g_horizonHeight, in.panorama.pixels ? "did not match the blit" : "unavailable");
+        }
+    }
+    g_wideHorizonWidth = in.wideWidth;
+    g_wideHorizonComposedThisFrame = true;
+}
+
 void SnapshotHorizonAndClearSurfaceIfNeeded() {
     if (g_horizonCapturedThisFrame || !g_hostModule || !CaptureShouldSkipSoftwareRasterizer()) {
         return;
@@ -251,6 +425,7 @@ void SnapshotHorizonAndClearSurfaceIfNeeded() {
             std::memset(dstRow, 0, kSurfaceWidth);
         }
     }
+    ComposeWideHorizonIfActive();
 
     // Clear the locked 8bpp surface to this frame's HUD sentinel so that after FUN_004688e0
     // finishes and FUN_0045d6d0 draws the dashboard/HUD/gauges/text onto DAT_005cd4bc, only pixels
@@ -816,13 +991,23 @@ void CaptureInit(HMODULE hostModule, const std::wstring& dumpDir) {
     g_horizonCapturedThisFrame = false;
     g_horizonHeight = 360;
     std::memset(g_horizonBuffer, 0, sizeof(g_horizonBuffer));
+    g_wideHorizonComposedThisFrame = false;
+    g_wideHorizonWidth = 0;
     g_levelSnapshot = LevelStateSnapshot{};
     g_hudSentinel = HudSentinelState{};
     CaptureInvalidateCache();
     EnsureCrcTable();
 }
 
+void CaptureInvalidateHorizonPanorama() {
+    HorizonPanoramaCache& c = g_horizonPanorama;
+    c.valid = false;
+    c.retryAfterFrame = 0;
+    c.mismatchFrames = 0;
+}
+
 void CaptureInvalidateCache() {
+    CaptureInvalidateHorizonPanorama();
     std::memset(g_crcCache, 0, sizeof(g_crcCache));
     g_texelClearPending = false;
     g_texPixelCache.clear();
@@ -977,6 +1162,12 @@ const CapturedQuad* CaptureGetWorldQuads(uint32_t& outCount) {
 const uint8_t* CaptureGetHorizonLayer(int32_t& outHorizonHeight) {
     outHorizonHeight = g_horizonHeight;
     return g_horizonCapturedThisFrame ? g_horizonBuffer : nullptr;
+}
+
+const uint8_t* CaptureGetWideHorizonLayer(int32_t& outWidth) {
+    const bool available = g_horizonCapturedThisFrame && g_wideHorizonComposedThisFrame;
+    outWidth = available ? g_wideHorizonWidth : 0;
+    return available ? g_wideHorizonBuffer : nullptr;
 }
 
 const uint8_t* CaptureLookupTexturePixels(uint32_t pdatPtr,
@@ -1374,6 +1565,7 @@ void CaptureEndFrame() {
     g_dumpThisFrame = false;
     g_dumpTriggeredCheckedThisFrame = false;
     g_horizonCapturedThisFrame = false;
+    g_wideHorizonComposedThisFrame = false;
 }
 
 CaptureFrameCounters CaptureGetFrameCounters() {
