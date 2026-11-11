@@ -164,6 +164,68 @@ SubPixelVertices ResolveSubPixelVertices(const CapturedQuad& q);
 // vertices lie on one scanline is kept when its resolved 16.16 corners span a non-zero height.
 bool ShouldCullTexturedQuadForGpu(const CapturedQuad& q, bool subPixel, bool keepThinQuads);
 
+// Diagnostics (D2b): why a textured quad on the GPU world path whose snapped vertices lie on one
+// scanline (minY == maxY) was kept or culled. NotThin covers every other quad. The culled reasons
+// are tested in this order: KeepThinQuads or SubPixel off, pdatPtr == 0, zero 16.16 height, no exact
+// corner match (ResolveSubPixelVertices fell back to the snapped vertices), clip rect or x-span.
+enum class ThinQuadVerdict : uint8_t {
+    NotThin = 0,
+    Kept,
+    CulledDisabled,
+    CulledNoPdat,
+    CulledZeroHeight,
+    CulledNoCornerMatch,
+    CulledClip,
+    Count
+};
+inline constexpr size_t kThinQuadVerdictCount = static_cast<size_t>(ThinQuadVerdict::Count);
+ThinQuadVerdict ClassifyThinTexturedQuadForGpu(const CapturedQuad& q, bool subPixel, bool keepThinQuads);
+
+// Per-frame verdict counts, then totals over the log period (one entry per frame that drew at
+// least one textured quad on the GPU world path).
+struct ThinQuadFrameCounts {
+    uint32_t count[kThinQuadVerdictCount] = {};
+};
+struct ThinQuadStats {
+    uint64_t frames = 0;
+    uint64_t total[kThinQuadVerdictCount] = {};
+    uint32_t maxCulledPerFrame = 0;   // thin quads culled for any reason in one frame
+};
+void RecordThinQuadVerdict(ThinQuadFrameCounts& frame, ThinQuadVerdict verdict);
+uint32_t ThinQuadCulledCount(const ThinQuadFrameCounts& frame);
+void AccumulateThinQuadFrame(ThinQuadStats& stats, const ThinQuadFrameCounts& frame);
+// Totals since the previous call; resets them.
+ThinQuadStats CaptureTakeThinQuadStats();
+
+// Diagnostics (D2b): the engine's crest rule. FUN_00459cb0 (decomp 48918-48955) walks the road
+// slices DAT_0060bd00 (stride 0x224) from index 0 (nearest) to DAT_0059ec90 inclusive, keeps a
+// running horizon DAT_0060bce0 and writes byte +0xC of each slice: 0 when the slice lies behind the
+// horizon, so its road tiles are not drawn. DAT_0059ec90 is clamped to [1, 0x30] by the engine.
+inline constexpr uint32_t kRoadSliceStride = 0x224;
+inline constexpr uint32_t kRoadSliceFlagOffset = 0x0C;
+inline constexpr int32_t kRoadSliceMaxCount = 0x30;
+struct RoadSliceFrameSample {
+    bool valid = false;          // count was in [1, 0x30]; nothing is read otherwise
+    uint32_t slices = 0;         // slices read (count + 1)
+    uint32_t dropped = 0;        // slices whose flag byte is 0
+    int32_t nearestDropped = -1; // smallest dropped index, -1 when none
+    int32_t farthestDropped = -1;
+};
+// sliceArray points to slice 0; count is DAT_0059ec90. Reads only the flag bytes of slices
+// 0..count when count is in [1, kRoadSliceMaxCount].
+RoadSliceFrameSample SampleRoadSliceFlags(const uint8_t* sliceArray, int32_t count);
+struct RoadSliceStats {
+    uint64_t frames = 0;               // valid samples
+    uint64_t invalidFrames = 0;        // count out of range, nothing read
+    uint64_t slicesTotal = 0;
+    uint64_t droppedTotal = 0;
+    uint64_t framesWithDrop = 0;
+    uint64_t nearestDroppedSum = 0;    // over framesWithDrop
+    uint32_t maxDroppedInFrame = 0;
+    int32_t minNearestDropped = -1;    // smallest dropped index seen, -1 when none
+};
+void AccumulateRoadSliceSample(RoadSliceStats& stats, const RoadSliceFrameSample& sample);
+
 void CaptureInit(HMODULE hostModule, const std::wstring& dumpDir);
 void CaptureInvalidateCache();
 void CaptureOnBatchStart();

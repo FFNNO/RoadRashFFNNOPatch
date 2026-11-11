@@ -94,6 +94,12 @@ bool g_f11WasDown = false;
 bool g_dumpThisFrame = false;
 bool g_dumpTriggeredCheckedThisFrame = false;
 
+// Diagnostics (D2b): thin textured quad verdicts on the GPU world path, this frame and since the
+// last CaptureTakeThinQuadStats. Game thread only, like the rest of the capture state.
+ThinQuadFrameCounts g_thinQuadFrame;
+bool g_thinQuadFrameActive = false;
+ThinQuadStats g_thinQuadStats;
+
 bool g_horizonCapturedThisFrame = false;
 int32_t g_horizonHeight = 360;
 uint8_t g_horizonBuffer[kSurfaceWidth * kSurfaceHeight];
@@ -621,25 +627,109 @@ static bool CornersSpanHeight(const CapturedQuad& q) {
     return false;
 }
 
+ThinQuadVerdict ClassifyThinTexturedQuadForGpu(const CapturedQuad& q, bool subPixel, bool keepThinQuads) {
+    if (!IsSingleScanline(q.verts)) {
+        return ThinQuadVerdict::NotThin;
+    }
+    if (!keepThinQuads || !subPixel) {
+        return ThinQuadVerdict::CulledDisabled;
+    }
+    if (q.pdatPtr == 0) {
+        return ThinQuadVerdict::CulledNoPdat;
+    }
+    if (!CornersSpanHeight(q)) {
+        return ThinQuadVerdict::CulledZeroHeight;
+    }
+    // FUN_0042e850 draws no scanline for these quads; at 640x480 the neighbouring rows cover that
+    // line. The GPU world is drawn larger and at the 16.16 corners, so a quad whose corners still
+    // span a height is drawn there instead of leaving a gap. Every other cull rule stays.
+    const SubPixelVertices spv = ResolveSubPixelVertices(q);
+    if (!spv.useCorners) {
+        return ThinQuadVerdict::CulledNoCornerMatch;
+    }
+    float minY = spv.y[0];
+    float maxY = spv.y[0];
+    for (int i = 1; i < 4; ++i) {
+        minY = std::min(minY, spv.y[i]);
+        maxY = std::max(maxY, spv.y[i]);
+    }
+    if (!(maxY > minY)) {
+        return ThinQuadVerdict::CulledZeroHeight;
+    }
+    return CullTexturedQuadBounds(q.verts, q.clipRect, q.pdatPtr, true) ? ThinQuadVerdict::CulledClip
+                                                                         : ThinQuadVerdict::Kept;
+}
+
+static bool ShouldCullTexturedQuadForVerdict(const CapturedQuad& q, ThinQuadVerdict verdict) {
+    if (verdict == ThinQuadVerdict::NotThin) {
+        return ShouldCullTexturedQuad(q.verts, q.clipRect, q.pdatPtr);
+    }
+    return verdict != ThinQuadVerdict::Kept;
+}
+
 bool ShouldCullTexturedQuadForGpu(const CapturedQuad& q, bool subPixel, bool keepThinQuads) {
-    if (keepThinQuads && subPixel && q.pdatPtr != 0 && IsSingleScanline(q.verts)) {
-        // FUN_0042e850 draws no scanline for these quads; at 640x480 the neighbouring rows cover that
-        // line. The GPU world is drawn larger and at the 16.16 corners, so a quad whose corners still
-        // span a height is drawn there instead of leaving a gap. Every other cull rule stays.
-        const SubPixelVertices spv = ResolveSubPixelVertices(q);
-        if (spv.useCorners) {
-            float minY = spv.y[0];
-            float maxY = spv.y[0];
-            for (int i = 1; i < 4; ++i) {
-                minY = std::min(minY, spv.y[i]);
-                maxY = std::max(maxY, spv.y[i]);
+    return ShouldCullTexturedQuadForVerdict(q, ClassifyThinTexturedQuadForGpu(q, subPixel, keepThinQuads));
+}
+
+void RecordThinQuadVerdict(ThinQuadFrameCounts& frame, ThinQuadVerdict verdict) {
+    const size_t index = static_cast<size_t>(verdict);
+    if (index < kThinQuadVerdictCount) {
+        ++frame.count[index];
+    }
+}
+
+uint32_t ThinQuadCulledCount(const ThinQuadFrameCounts& frame) {
+    uint32_t culled = 0;
+    for (size_t i = static_cast<size_t>(ThinQuadVerdict::CulledDisabled); i < kThinQuadVerdictCount; ++i) {
+        culled += frame.count[i];
+    }
+    return culled;
+}
+
+void AccumulateThinQuadFrame(ThinQuadStats& stats, const ThinQuadFrameCounts& frame) {
+    ++stats.frames;
+    for (size_t i = 0; i < kThinQuadVerdictCount; ++i) {
+        stats.total[i] += frame.count[i];
+    }
+    stats.maxCulledPerFrame = std::max(stats.maxCulledPerFrame, ThinQuadCulledCount(frame));
+}
+
+RoadSliceFrameSample SampleRoadSliceFlags(const uint8_t* sliceArray, int32_t count) {
+    RoadSliceFrameSample out;
+    if (!sliceArray || count < 1 || count > kRoadSliceMaxCount) {
+        return out;
+    }
+    out.valid = true;
+    // FUN_00459cb0 writes the flag of slices 0..count inclusive.
+    for (int32_t i = 0; i <= count; ++i) {
+        ++out.slices;
+        if (sliceArray[static_cast<size_t>(i) * kRoadSliceStride + kRoadSliceFlagOffset] == 0) {
+            ++out.dropped;
+            if (out.nearestDropped < 0) {
+                out.nearestDropped = i;
             }
-            if (maxY > minY) {
-                return CullTexturedQuadBounds(q.verts, q.clipRect, q.pdatPtr, true);
-            }
+            out.farthestDropped = i;
         }
     }
-    return ShouldCullTexturedQuad(q.verts, q.clipRect, q.pdatPtr);
+    return out;
+}
+
+void AccumulateRoadSliceSample(RoadSliceStats& stats, const RoadSliceFrameSample& sample) {
+    if (!sample.valid) {
+        ++stats.invalidFrames;
+        return;
+    }
+    ++stats.frames;
+    stats.slicesTotal += sample.slices;
+    stats.droppedTotal += sample.dropped;
+    stats.maxDroppedInFrame = std::max(stats.maxDroppedInFrame, sample.dropped);
+    if (sample.nearestDropped >= 0) {
+        ++stats.framesWithDrop;
+        stats.nearestDroppedSum += static_cast<uint64_t>(sample.nearestDropped);
+        if (stats.minNearestDropped < 0 || sample.nearestDropped < stats.minNearestDropped) {
+            stats.minNearestDropped = sample.nearestDropped;
+        }
+    }
 }
 
 bool ShouldCullFlatQuad(const CapturedVertex verts[4],
@@ -1428,18 +1518,24 @@ void CaptureTexturedQuadAfter(int slotIndex, bool rasterizerSkipped) {
         if (q.verts[i].y > maxY) maxY = q.verts[i].y;
     }
 
+    if (rasterizerSkipped) {
+        // The verdict is the ShouldCullTexturedQuadForGpu decision; it is also counted for the log (D2b).
+        const Config& cfg = GetConfig();
+        const ThinQuadVerdict verdict = ClassifyThinTexturedQuadForGpu(q, cfg.subPixel, cfg.keepThinQuads);
+        RecordThinQuadVerdict(g_thinQuadFrame, verdict);
+        g_thinQuadFrameActive = true;
+        if (q.pdatPtr != 0) {
+            // The engine selected no mip: every GPU-drawn quad, thin quads kept by
+            // ShouldCullTexturedQuadForGpu included, uses level 0 and the sampler minifies from there.
+            q.culled = ShouldCullTexturedQuadForVerdict(q, verdict);
+            q.chosenMip = (q.culled && minY == maxY) ? -1 : 0;
+            return;
+        }
+    }
+
     if (q.pdatPtr == 0) {
         q.chosenMip = -1;
         q.culled = true;
-        return;
-    }
-
-    if (rasterizerSkipped) {
-        // The engine selected no mip: every GPU-drawn quad, thin quads kept by
-        // ShouldCullTexturedQuadForGpu included, uses level 0 and the sampler minifies from there.
-        const Config& cfg = GetConfig();
-        q.culled = ShouldCullTexturedQuadForGpu(q, cfg.subPixel, cfg.keepThinQuads);
-        q.chosenMip = (q.culled && minY == maxY) ? -1 : 0;
         return;
     }
 
@@ -1608,7 +1704,18 @@ void CaptureOnRacePresent(const uint8_t* surface, int pitch, const uint8_t* pale
     }
 }
 
+ThinQuadStats CaptureTakeThinQuadStats() {
+    const ThinQuadStats out = g_thinQuadStats;
+    g_thinQuadStats = ThinQuadStats{};
+    return out;
+}
+
 void CaptureEndFrame() {
+    if (g_thinQuadFrameActive) {
+        AccumulateThinQuadFrame(g_thinQuadStats, g_thinQuadFrame);
+        g_thinQuadFrame = ThinQuadFrameCounts{};
+        g_thinQuadFrameActive = false;
+    }
     if (g_horizonCapturedThisFrame) {
         HudSentinelAdvance(g_hudSentinel);
     }

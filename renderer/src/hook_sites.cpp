@@ -78,6 +78,24 @@ FUN_0045b930_Fn g_orig_FUN_0045b930 = nullptr;
 // FUN_004688e0, FUN_0042e850 and FUN_00467cb0 are all hooked; widescreen depends on it, because
 // those detours are what keep the software world rasterizers from running.
 bool g_worldHooksInstalled = false;
+
+// Diagnostics (D2b): the engine's crest rule, read without hooking at each race present.
+// 0x0060bd00: road slice array DAT_0060bd00 (stride 0x224, static .data)
+// 0x0059ec90: int slice count DAT_0059ec90 (FUN_00459cb0 clamps it to [1, 0x30])
+constexpr uint32_t kVaRoadSlices     = 0x0060bd00;
+constexpr uint32_t kVaRoadSliceCount = 0x0059ec90;
+RoadSliceStats g_roadSliceStats;
+
+// Only with the world hooks installed (the race code is the verified build) and from the race
+// present. The count is checked before anything else is read; the array is static .data, so the
+// flag bytes of slices 0..0x30 are always inside the image.
+void SampleRoadSlicesForLog() {
+    if (!g_worldHooksInstalled || !g_hostModule) {
+        return;
+    }
+    const int32_t count = *GlobalPtr<const int32_t>(kVaRoadSliceCount);
+    AccumulateRoadSliceSample(g_roadSliceStats, SampleRoadSliceFlags(GlobalPtr<const uint8_t>(kVaRoadSlices), count));
+}
 // GpuWorld toggle key pressed during a widescreen race; applied at the next race start.
 bool g_gpuWorldTogglePending = false;
 
@@ -313,6 +331,49 @@ void RecordFrameAndLogFps(bool presentedByD3D) {
                      sp.fallbackQuads,
                      sp.maxFallbackPerFrame);
         }
+        const ThinQuadStats tq = CaptureTakeThinQuadStats();
+        if (GetConfig().gpuWorld && tq.frames > 0) {
+            const double frames = static_cast<double>(tq.frames);
+            auto total = [&tq](ThinQuadVerdict v) { return tq.total[static_cast<size_t>(v)]; };
+            const uint64_t culled = total(ThinQuadVerdict::CulledDisabled) + total(ThinQuadVerdict::CulledNoPdat) +
+                                    total(ThinQuadVerdict::CulledZeroHeight) +
+                                    total(ThinQuadVerdict::CulledNoCornerMatch) + total(ThinQuadVerdict::CulledClip);
+            LOG_INFO("ThinQuads: %llu GPU world frames, kept %.2f/frame (%llu), culled %.2f/frame (%llu, max %u in one "
+                     "frame): zeroHeight %.2f (%llu), noCornerMatch %.2f (%llu), noPdat %.2f (%llu), clip %.2f (%llu), "
+                     "disabled %.2f (%llu)",
+                     tq.frames,
+                     static_cast<double>(total(ThinQuadVerdict::Kept)) / frames, total(ThinQuadVerdict::Kept),
+                     static_cast<double>(culled) / frames, culled, tq.maxCulledPerFrame,
+                     static_cast<double>(total(ThinQuadVerdict::CulledZeroHeight)) / frames,
+                     total(ThinQuadVerdict::CulledZeroHeight),
+                     static_cast<double>(total(ThinQuadVerdict::CulledNoCornerMatch)) / frames,
+                     total(ThinQuadVerdict::CulledNoCornerMatch),
+                     static_cast<double>(total(ThinQuadVerdict::CulledNoPdat)) / frames,
+                     total(ThinQuadVerdict::CulledNoPdat),
+                     static_cast<double>(total(ThinQuadVerdict::CulledClip)) / frames,
+                     total(ThinQuadVerdict::CulledClip),
+                     static_cast<double>(total(ThinQuadVerdict::CulledDisabled)) / frames,
+                     total(ThinQuadVerdict::CulledDisabled));
+        }
+        if (g_roadSliceStats.frames > 0 || g_roadSliceStats.invalidFrames > 0) {
+            const RoadSliceStats& rs = g_roadSliceStats;
+            const double frames = rs.frames > 0 ? static_cast<double>(rs.frames) : 1.0;
+            LOG_INFO("RoadSlices: %llu race frames (%llu with count out of range), %.1f slices/frame, "
+                     "%.2f dropped by the horizon/frame (%llu total, max %u in one frame), %llu frames with a drop, "
+                     "nearest dropped index avg %.1f min %d",
+                     rs.frames,
+                     rs.invalidFrames,
+                     static_cast<double>(rs.slicesTotal) / frames,
+                     static_cast<double>(rs.droppedTotal) / frames,
+                     rs.droppedTotal,
+                     rs.maxDroppedInFrame,
+                     rs.framesWithDrop,
+                     rs.framesWithDrop > 0 ? static_cast<double>(rs.nearestDroppedSum) /
+                                                 static_cast<double>(rs.framesWithDrop)
+                                           : -1.0,
+                     rs.minNearestDropped);
+            g_roadSliceStats = RoadSliceStats{};
+        }
         if (GetConfig().texturePackDump) {
             LOG_INFO("TexturePack: %u textures dumped (%u queued)",
                      TextureDumpGetDumpedCount(),
@@ -333,6 +394,7 @@ void RecordFrameAndLogFps(bool presentedByD3D) {
 
 void FinishRaceFrameAndPollHotkeys() {
     static RaceFrameHotkeyState s_hotkeyState;
+    SampleRoadSlicesForLog();
     const Config& cfg = GetConfig();
     const uint32_t vk = cfg.toggleKey;
     const bool keyDown = (vk != 0) && (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;

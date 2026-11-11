@@ -1343,6 +1343,97 @@ int main() {
         Check(!ShouldCullTexturedQuadForGpu(tall, true, true) && !ShouldCullTexturedQuadForGpu(tall, false, false),
               "a quad spanning several scanlines is kept on the GPU path as before");
         Check(Config{}.keepThinQuads, "KeepThinQuads defaults to on");
+
+        // D2b: why thin quads are kept or culled on the GPU path.
+        Check(ClassifyThinTexturedQuadForGpu(thin, true, true) == ThinQuadVerdict::Kept, "thin quad verdict: kept");
+        Check(ClassifyThinTexturedQuadForGpu(thin, false, true) == ThinQuadVerdict::CulledDisabled,
+              "thin quad verdict: SubPixel off");
+        Check(ClassifyThinTexturedQuadForGpu(thin, true, false) == ThinQuadVerdict::CulledDisabled,
+              "thin quad verdict: KeepThinQuads off");
+        Check(ClassifyThinTexturedQuadForGpu(thinNoPdat, true, true) == ThinQuadVerdict::CulledNoPdat,
+              "thin quad verdict: pdatPtr == 0");
+        Check(ClassifyThinTexturedQuadForGpu(flatThin, true, true) == ThinQuadVerdict::CulledZeroHeight,
+              "thin quad verdict: zero 16.16 height");
+        Check(ClassifyThinTexturedQuadForGpu(thinRebuilt, true, true) == ThinQuadVerdict::CulledNoCornerMatch,
+              "thin quad verdict: no exact corner match");
+        Check(ClassifyThinTexturedQuadForGpu(thinOutside, true, true) == ThinQuadVerdict::CulledClip &&
+                  ClassifyThinTexturedQuadForGpu(thinClippedX, true, true) == ThinQuadVerdict::CulledClip,
+              "thin quad verdict: clip rect and x-span");
+        Check(ClassifyThinTexturedQuadForGpu(tall, true, true) == ThinQuadVerdict::NotThin,
+              "a quad spanning several scanlines is not thin");
+        {
+            const CapturedQuad verdictCases[] = {thin, thinNoPdat, flatThin, thinRebuilt, thinOutside, thinClippedX, tall};
+            bool agrees = true;
+            for (const CapturedQuad& c : verdictCases) {
+                for (int flags = 0; flags < 4; ++flags) {
+                    const bool sp = (flags & 1) != 0;
+                    const bool keep = (flags & 2) != 0;
+                    const ThinQuadVerdict v = ClassifyThinTexturedQuadForGpu(c, sp, keep);
+                    const bool culled = ShouldCullTexturedQuadForGpu(c, sp, keep);
+                    if (v == ThinQuadVerdict::NotThin) {
+                        agrees = agrees && culled == ShouldCullTexturedQuad(c.verts, c.clipRect, c.pdatPtr);
+                    } else {
+                        agrees = agrees && culled == (v != ThinQuadVerdict::Kept);
+                    }
+                }
+            }
+            Check(agrees, "the thin quad verdict agrees with the GPU cull decision");
+        }
+
+        ThinQuadFrameCounts tf1;
+        RecordThinQuadVerdict(tf1, ThinQuadVerdict::Kept);
+        RecordThinQuadVerdict(tf1, ThinQuadVerdict::CulledZeroHeight);
+        RecordThinQuadVerdict(tf1, ThinQuadVerdict::CulledClip);
+        RecordThinQuadVerdict(tf1, ThinQuadVerdict::NotThin);
+        RecordThinQuadVerdict(tf1, ThinQuadVerdict::Count);  // out of range: ignored
+        ThinQuadFrameCounts tf2;
+        RecordThinQuadVerdict(tf2, ThinQuadVerdict::CulledNoCornerMatch);
+        Check(ThinQuadCulledCount(tf1) == 2 && ThinQuadCulledCount(tf2) == 1, "culled thin quads per frame");
+        ThinQuadStats ts;
+        AccumulateThinQuadFrame(ts, tf1);
+        AccumulateThinQuadFrame(ts, tf2);
+        Check(ts.frames == 2 && ts.total[static_cast<size_t>(ThinQuadVerdict::Kept)] == 1 &&
+                  ts.total[static_cast<size_t>(ThinQuadVerdict::CulledZeroHeight)] == 1 &&
+                  ts.total[static_cast<size_t>(ThinQuadVerdict::CulledNoCornerMatch)] == 1 &&
+                  ts.total[static_cast<size_t>(ThinQuadVerdict::NotThin)] == 1 && ts.maxCulledPerFrame == 2,
+              "thin quad totals over frames");
+    }
+
+    // 13b. Crest rule diagnostics (D2b): slice flag summary from a fake slice array.
+    {
+        std::vector<uint8_t> slices(static_cast<size_t>(kRoadSliceMaxCount + 1) * kRoadSliceStride, 0xCD);
+        auto setFlag = [&](int index, uint8_t value) {
+            slices[static_cast<size_t>(index) * kRoadSliceStride + kRoadSliceFlagOffset] = value;
+        };
+        for (int i = 0; i <= kRoadSliceMaxCount; ++i) setFlag(i, 1);
+
+        RoadSliceFrameSample rs = SampleRoadSliceFlags(slices.data(), 10);
+        Check(rs.valid && rs.slices == 11 && rs.dropped == 0 && rs.nearestDropped == -1 && rs.farthestDropped == -1,
+              "no dropped slices when every flag is set");
+        setFlag(7, 0);
+        setFlag(10, 0);
+        setFlag(11, 0);  // past count: not read
+        rs = SampleRoadSliceFlags(slices.data(), 10);
+        Check(rs.valid && rs.slices == 11 && rs.dropped == 2 && rs.nearestDropped == 7 && rs.farthestDropped == 10,
+              "dropped slices counted over 0..count inclusive");
+        Check(!SampleRoadSliceFlags(slices.data(), 0).valid && !SampleRoadSliceFlags(slices.data(), kRoadSliceMaxCount + 1).valid &&
+                  !SampleRoadSliceFlags(slices.data(), -5).valid && !SampleRoadSliceFlags(nullptr, 10).valid,
+              "out-of-range count or null array reads nothing");
+        rs = SampleRoadSliceFlags(slices.data(), kRoadSliceMaxCount);
+        Check(rs.valid && rs.slices == static_cast<uint32_t>(kRoadSliceMaxCount + 1) && rs.dropped == 3 &&
+                  rs.farthestDropped == 11,
+              "count 0x30 reads 49 slices");
+
+        RoadSliceStats st;
+        AccumulateRoadSliceSample(st, SampleRoadSliceFlags(slices.data(), 10));   // 2 dropped, nearest 7
+        AccumulateRoadSliceSample(st, SampleRoadSliceFlags(slices.data(), 5));    // none
+        AccumulateRoadSliceSample(st, SampleRoadSliceFlags(slices.data(), 0x40)); // invalid
+        setFlag(3, 0);
+        AccumulateRoadSliceSample(st, SampleRoadSliceFlags(slices.data(), 12));   // 3, 7, 10, 11: nearest 3
+        Check(st.frames == 3 && st.invalidFrames == 1 && st.slicesTotal == 11 + 6 + 13 && st.droppedTotal == 6 &&
+                  st.framesWithDrop == 2 && st.nearestDroppedSum == 10 && st.maxDroppedInFrame == 4 &&
+                  st.minNearestDropped == 3,
+              "slice flag totals over frames");
     }
 
     // 14. Blended mipmaps (T6): config, engine mip chain cache, atlas level limit, analytic gradients.
