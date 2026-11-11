@@ -26,7 +26,7 @@ The game queues 32-bit icons for the message codes `\x01`-`\x05` (`FUN_00463e20`
 ## Tasks
 - [x] I1 Pure alpha-recovery helper `RecoverHudIconLayer` with unit tests (transparent, opaque, 50% blend of a known colour, clamping, malformed pair, empty). Route: delegated writer. Check: RED observed (hook_test failed to build: missing `hud_icons.h`), then GREEN.
 - [x] I2 GPU glue: icon layer build in the race present detour, presenter texture, pixel shader, premultiplied blend and draw over the HUD layer. Route: delegated writer (2+ non-trivial files). Check: build `/W4 /WX` OK; no automated test for the D3D glue.
-- [ ] I3 In-game check with GpuWorld=1: pause prompt shows the ESC icon, in 4:3 and widescreen; software mode unchanged.
+- [x] I3 In-game check with GpuWorld=1: pause prompt shows the ESC icon, in 4:3 and widescreen; software mode unchanged.
 - [x] I4 Localize the widescreen option label: the graphics menu item text follows the game's language global `DAT_00595968` (0 English, 0x10 French, 0x20 German, 0x30 Italian, 0x40 Spanish, other values fall back to English), read on every draw in the `FUN_0045b930` detour. Labels: "Widescreen", "Écran large", "Breitbild", "Schermo panoramico", "Pantalla panorámica". Pure mapping `WidescreenMenuLabel(language)` in `renderer/src/options_menu.*`. Route: inline (one mechanical mapping plus call site). Check: RED observed (hook_test failed to build: `kGameLanguageSpanish` undeclared), then GREEN.
 
 ## Acceptance criteria
@@ -40,6 +40,7 @@ The game queues 32-bit icons for the message codes `\x01`-`\x05` (`FUN_00463e20`
 - `python renderer/tools/check_hook_sites.py` (needs the git-ignored game executables)
 
 ## Progress
+- 2026-11-11: I3 and I4 checked in game (670771a build, 1920x1080, Spanish, GpuWorld=1, La Ciudad). The pause prompt shows the ESC key icon in widescreen (projection 426) and in 4:3 (projection 320). The graphics menu shows "Pantalla panorámica: On" and "Off" in Spanish, and toggling it applies at the next race. No warnings or errors in rr95gpu.log. Software mode (Scroll Lock) was not re-checked; its code path is unchanged. Other languages were not checked in game (they need the HKLM Language value changed).
 - 2026-11-11 I1+I2 (worktree `fix/gpu-hud-icons`, base `e038520`):
   - `cmd //c "renderer\build.bat"`: `build.bat: OK` (only MSB8029 warnings about the build dir under %TEMP%).
   - `renderer/build/Release/hook_test.exe`: `OK (0 failure(s))`, 431 PASS lines, 14 new `hud icons:` checks.
