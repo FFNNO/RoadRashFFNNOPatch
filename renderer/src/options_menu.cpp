@@ -100,12 +100,23 @@ std::string EncodeCp1252(const wchar_t* text) {
     return out;
 }
 
-std::string WidescreenMenuLabel() {
-    return EncodeCp1252(L"Pantalla panor\u00E1mica");
+std::string WidescreenMenuLabel(uint32_t gameLanguage) {
+    switch (gameLanguage) {
+    case kGameLanguageFrench:
+        return EncodeCp1252(L"\u00C9cran large");
+    case kGameLanguageGerman:
+        return EncodeCp1252(L"Breitbild");
+    case kGameLanguageItalian:
+        return EncodeCp1252(L"Schermo panoramico");
+    case kGameLanguageSpanish:
+        return EncodeCp1252(L"Pantalla panor\u00E1mica");
+    default:
+        return EncodeCp1252(L"Widescreen");
+    }
 }
 
-std::string WidescreenMenuText(bool on, const char* onText, const char* offText) {
-    std::string text = WidescreenMenuLabel();
+std::string WidescreenMenuText(bool on, const char* onText, const char* offText, uint32_t gameLanguage) {
+    std::string text = WidescreenMenuLabel(gameLanguage);
     text += ": ";
     const char* state = on ? onText : offText;
     text += state ? state : "";

@@ -4,7 +4,8 @@
 #include <string>
 #include "widescreen.h"
 
-// "Pantalla panoramica" item in the graphics options menu (feature rr95-widescreen, task W3).
+// Widescreen item ("Pantalla panoramica" in Spanish) in the graphics options menu (feature
+// rr95-widescreen, task W3; labelled in the game's language since rr95-gpu-hud-icons I4).
 //
 // Menu id 19 "Opciones Graficas y de Sonido" is a column of 0x38-byte items at 0x005a08a8 (count 8
 // at 0x005a0a70). Slot 5 (0x005a09c0), between "Pantalla" (slot 4) and "Ya esta" (slot 6), ships
@@ -68,12 +69,24 @@ void BuildWidescreenMenuSlots(const uint8_t* shipped, uint32_t selectHandler, ui
 // has no CP-1252 byte.
 std::string EncodeCp1252(const wchar_t* text);
 
-// Item label "Pantalla panoramica" (a acute) in CP-1252.
-std::string WidescreenMenuLabel();
+// The game's language: DAT_00595968, set at startup from the HKLM\SOFTWARE\Electronic Arts\
+// RoadRash 95 "Language" value before Text_ENU/FRA/DEU/ITA/ESP.dll is loaded. It is the string id
+// base the engine adds to LoadStringA ids; any other language name gives 0xffffffff.
+inline constexpr uint32_t kVaGameLanguage = 0x00595968;
+inline constexpr uint32_t kGameLanguageEnglish = 0x00;
+inline constexpr uint32_t kGameLanguageFrench = 0x10;
+inline constexpr uint32_t kGameLanguageGerman = 0x20;
+inline constexpr uint32_t kGameLanguageItalian = 0x30;
+inline constexpr uint32_t kGameLanguageSpanish = 0x40;
+
+// Item label in the game's language, CP-1252: "Widescreen" (English and unknown values),
+// "Ecran large" (E acute), "Breitbild", "Schermo panoramico", "Pantalla panoramica" (a acute).
+// Kept short: the 180 px button clips longer text.
+std::string WidescreenMenuLabel(uint32_t gameLanguage);
 
 // The item text. Menu 19 buttons are 180 px wide and FUN_00439680 draws the "\x01" value part at
 // x = 300, outside them, so the state goes in the single label part: "<label>: <on|off>".
-std::string WidescreenMenuText(bool on, const char* onText, const char* offText);
+std::string WidescreenMenuText(bool on, const char* onText, const char* offText, uint32_t gameLanguage);
 
 // Registry value HKCU\SOFTWARE\Electronic Arts\RoadRash 95\Widescreen, REG_BINARY 1 byte like the
 // game's own HiRes/Inset (FUN_0045bd20): 1 = on (auto width), 0 = off.

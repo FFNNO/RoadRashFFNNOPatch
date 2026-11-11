@@ -2844,15 +2844,35 @@ int main() {
         Check(!GraphicsMenuSlotsAreShipped(out.data(), delta), "menu W3: rewritten slots no longer verify as shipped");
 
         // Label encoding (CP-1252 like the engine's ANSI strings).
-        const std::string labelBytes = WidescreenMenuLabel();
+        const std::string labelBytes = WidescreenMenuLabel(kGameLanguageSpanish);
         Check(labelBytes == std::string("Pantalla panor\xE1mica"), "menu W3: label is 'Pantalla panor\\xE1mica' in CP-1252");
         Check(EncodeCp1252(L"Resolución") == std::string("Resoluci\xF3n"),
               "menu W3: CP-1252 encodes o acute as 0xF3 like the game's 'Resolucion'");
         Check(EncodeCp1252(L"Sí") == std::string("S\xED"), "menu W3: CP-1252 encodes i acute as 0xED");
         Check(EncodeCp1252(L"中").empty(), "menu W3: a character outside CP-1252 gives an empty string");
-        Check(WidescreenMenuText(true, "On", "Off") == std::string("Pantalla panor\xE1mica: On") &&
-                  WidescreenMenuText(false, "On", "Off") == std::string("Pantalla panor\xE1mica: Off"),
+        Check(WidescreenMenuText(true, "On", "Off", kGameLanguageSpanish) == std::string("Pantalla panor\xE1mica: On") &&
+                  WidescreenMenuText(false, "On", "Off", kGameLanguageSpanish) ==
+                      std::string("Pantalla panor\xE1mica: Off"),
               "menu W3: item text is '<label>: On|Off' with no \\x01 value part");
+
+        // Label language follows the game's DAT_00595968 (Language registry value read at startup).
+        Check(kVaGameLanguage == 0x00595968 && kGameLanguageEnglish == 0 && kGameLanguageFrench == 0x10 &&
+                  kGameLanguageGerman == 0x20 && kGameLanguageItalian == 0x30 && kGameLanguageSpanish == 0x40,
+              "menu I4: game language global 0x595968 and its indices 0/0x10/0x20/0x30/0x40");
+        Check(WidescreenMenuLabel(kGameLanguageEnglish) == "Widescreen", "menu I4: English label 'Widescreen'");
+        Check(WidescreenMenuLabel(kGameLanguageFrench) == std::string("\xC9" "cran large"),
+              "menu I4: French label 'Ecran large' with E acute as 0xC9");
+        Check(WidescreenMenuLabel(kGameLanguageGerman) == "Breitbild", "menu I4: German label 'Breitbild'");
+        Check(WidescreenMenuLabel(kGameLanguageItalian) == "Schermo panoramico",
+              "menu I4: Italian label 'Schermo panoramico'");
+        Check(WidescreenMenuLabel(kGameLanguageSpanish) == std::string("Pantalla panor\xE1mica"),
+              "menu I4: Spanish label 'Pantalla panor\\xE1mica'");
+        Check(WidescreenMenuLabel(0xffffffffu) == "Widescreen" && WidescreenMenuLabel(0x50) == "Widescreen" &&
+                  WidescreenMenuLabel(0x41) == "Widescreen",
+              "menu I4: unknown language (0xffffffff, 0x50, 0x41) falls back to 'Widescreen'");
+        Check(WidescreenMenuText(false, "On", "Off", kGameLanguageEnglish) == "Widescreen: Off" &&
+                  WidescreenMenuText(true, "On", "Off", kGameLanguageFrench) == std::string("\xC9" "cran large: On"),
+              "menu I4: item text uses the language's label");
         Check(kShippedOnOffStrings[0] == 'O' && kShippedOnOffStrings[4] == 'O' && kVaOnOffStrings == 0x005064a8,
               "menu W3: the game's On/Off strings are expected at 0x5064a8/0x5064ac");
 

@@ -703,8 +703,8 @@ void __cdecl Detour_FUN_00457ef0() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// "Pantalla panoramica" item in graphics options menu 19, slot 5 (feature rr95-widescreen W3; item
-// layout and verification in options_menu.h).
+// Widescreen item in graphics options menu 19, slot 5, labelled in the game's language (feature
+// rr95-widescreen W3, task I4 of rr95-gpu-hud-icons; item layout and verification in options_menu.h).
 //
 // Engine code (preferred VAs, same bytes in both exe builds):
 // 0x0045b930: const char* __fastcall FUN_0045b930(item): text of a flag-0x100000 item; its only
@@ -727,8 +727,9 @@ char g_widescreenMenuText[96] = {};
 
 const char* __fastcall Detour_FUN_0045b930(void* item) {
     if (g_widescreenMenuInstalled && item == GlobalPtr<void>(kVaWidescreenMenuItem)) {
+        // The language is read on every draw: the game sets it at startup, before any menu opens.
         const std::string text = WidescreenMenuText(g_menuWidescreenOn.load(), g_menuOnText.c_str(),
-                                                    g_menuOffText.c_str());
+                                                    g_menuOffText.c_str(), *GlobalPtr<const uint32_t>(kVaGameLanguage));
         strncpy_s(g_widescreenMenuText, text.c_str(), _TRUNCATE);
         return g_widescreenMenuText;
     }
@@ -741,11 +742,11 @@ int __fastcall WidescreenMenuSelect(void* item) {
     const bool newOn = !g_menuWidescreenOn.load();
     if (WriteWidescreenRegistryValue(newOn)) {
         g_menuWidescreenOn = newOn;
-        LOG_INFO("Options menu: Pantalla panoramica set to %s (HKCU\\%s\\%s = %d, REG_BINARY); applied at the next "
+        LOG_INFO("Options menu: Widescreen set to %s (HKCU\\%s\\%s = %d, REG_BINARY); applied at the next "
                  "race start",
                  newOn ? "On" : "Off", kGameRegistryKey, kWidescreenRegistryValueName, newOn ? 1 : 0);
     } else {
-        LOG_WARN("Options menu: could not write HKCU\\%s\\%s; Pantalla panoramica stays %s", kGameRegistryKey,
+        LOG_WARN("Options menu: could not write HKCU\\%s\\%s; Widescreen stays %s", kGameRegistryKey,
                  kWidescreenRegistryValueName, newOn ? "Off" : "On");
     }
     auto fnRedraw = reinterpret_cast<FUN_00439160_Fn>(Rebase(kVaItemRedraw));
@@ -891,7 +892,7 @@ static void WriteGraphicsMenuSlots(uint8_t* slots, const uint8_t* bytes) {
 static void InstallWidescreenMenuItem() {
     const Config& cfg = GetConfig();
     if (!cfg.gpuWorld || !cfg.presenterEnabled) {
-        LOG_INFO("Options menu: GpuWorld is off; the Pantalla panoramica item is not added");
+        LOG_INFO("Options menu: GpuWorld is off; the Widescreen item is not added");
         return;
     }
     const intptr_t delta = reinterpret_cast<intptr_t>(g_hostModule) - static_cast<intptr_t>(rr95::kPreferredImageBase);
@@ -923,7 +924,7 @@ static void InstallWidescreenMenuItem() {
                              rewritten);
     g_widescreenMenuInstalled = true;
     WriteGraphicsMenuSlots(slots, rewritten);
-    LOG_INFO("Options menu: Pantalla panoramica added to the graphics menu (slot 5 at 0x%08X), showing %s "
+    LOG_INFO("Options menu: Widescreen added to the graphics menu (slot 5 at 0x%08X), showing %s "
              "(setting %s from %s)",
              static_cast<unsigned>(reinterpret_cast<uintptr_t>(slots + kMenuItemSize)),
              g_menuWidescreenOn.load() ? "On" : "Off", DescribeWidescreenSetting(effective.setting).c_str(),

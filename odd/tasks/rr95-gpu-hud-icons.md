@@ -27,6 +27,7 @@ The game queues 32-bit icons for the message codes `\x01`-`\x05` (`FUN_00463e20`
 - [x] I1 Pure alpha-recovery helper `RecoverHudIconLayer` with unit tests (transparent, opaque, 50% blend of a known colour, clamping, malformed pair, empty). Route: delegated writer. Check: RED observed (hook_test failed to build: missing `hud_icons.h`), then GREEN.
 - [x] I2 GPU glue: icon layer build in the race present detour, presenter texture, pixel shader, premultiplied blend and draw over the HUD layer. Route: delegated writer (2+ non-trivial files). Check: build `/W4 /WX` OK; no automated test for the D3D glue.
 - [ ] I3 In-game check with GpuWorld=1: pause prompt shows the ESC icon, in 4:3 and widescreen; software mode unchanged.
+- [x] I4 Localize the widescreen option label: the graphics menu item text follows the game's language global `DAT_00595968` (0 English, 0x10 French, 0x20 German, 0x30 Italian, 0x40 Spanish, other values fall back to English), read on every draw in the `FUN_0045b930` detour. Labels: "Widescreen", "Écran large", "Breitbild", "Schermo panoramico", "Pantalla panorámica". Pure mapping `WidescreenMenuLabel(language)` in `renderer/src/options_menu.*`. Route: inline (one mechanical mapping plus call site). Check: RED observed (hook_test failed to build: `kGameLanguageSpanish` undeclared), then GREEN.
 
 ## Acceptance criteria
 - The pause prompt and other icon messages show their icons with GpuWorld=1, at the same place as in software mode.
@@ -46,5 +47,13 @@ The game queues 32-bit icons for the message codes `\x01`-`\x05` (`FUN_00463e20`
   - `check_hook_sites.py`: skipped, the original/patched executables are not in the worktree. No hook site bytes changed.
   - Commit: recorded in the delegation report (this document is part of that commit).
 
+- 2026-11-11 I4 (worktree `fix/gpu-hud-icons`, base `b620584`):
+  - `cmd //c "rendereruild.bat"`: `build.bat: OK`.
+  - `renderer/build/Release/hook_test.exe`: `OK (0 failure(s))`, 439 PASS lines, 8 new `menu I4:` checks; the two W3 Spanish label checks now pass the Spanish index explicitly.
+  - `renderer/build/Release/forward_test.exe`: `OK (0 failure(s))`.
+  - `check_hook_sites.py`: skipped, the game executables are not in the worktree. No hook site bytes changed.
+  - Not tested: the live read of `0x00595968` in the game and the on-screen fit of the French/Italian labels in the 180 px button.
+  - Commit: recorded in the delegation report (this document is part of that commit).
+
 ## Next step
-I3 in-game check by the user.
+I3 in-game check by the user (also check the I4 label in the game's language).
