@@ -31,6 +31,7 @@ struct Config {
     int internalHeight = 1080;
     uint32_t toggleKey = 0x91;  // VK_SCROLL (Scroll Lock)
     bool subPixel = true;       // [World] SubPixel: draw world quads at their 16.16 corners
+    bool keepThinQuads = true;  // [World] KeepThinQuads: draw one-scanline textured quads with 16.16 height
     MipFilter mipFilter = MipFilter::Trilinear;
     int anisotropy = 8;         // [World] Anisotropy: 2..16 = anisotropic filtering, 0 or 1 = off
     WidescreenSetting widescreen;          // [World] Widescreen: off (default) | auto | 320..640 even

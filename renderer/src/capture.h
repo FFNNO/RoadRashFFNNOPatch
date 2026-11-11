@@ -144,7 +144,8 @@ bool ShouldCullFlatQuad(const CapturedVertex verts[4],
 // distance between each corner and the centre of its snapped pixel. The quad falls back to its
 // snapped vertices when no permutation matches exactly (rebuilt or clipped vertex) or when a
 // matched corner lies farther than kSubPixelMaxDeltaPx (+1 px when the mask snaps to 2 px) from its
-// snapped vertex. Single-scanline quads always use the snapped vertices.
+// snapped vertex. Single-scanline quads use the snapped vertices, except textured ones whose 16.16
+// corners span a height (kept for the GPU world by ShouldCullTexturedQuadForGpu).
 inline constexpr float kSubPixelMaxDeltaPx = 1.5f;
 
 struct SubPixelVertices {
@@ -157,6 +158,11 @@ struct SubPixelVertices {
 };
 
 SubPixelVertices ResolveSubPixelVertices(const CapturedQuad& q);
+
+// Cull decision for a textured quad the GPU world path draws (the software rasterizer was skipped).
+// Same as ShouldCullTexturedQuad, except that with subPixel and keepThinQuads a quad whose snapped
+// vertices lie on one scanline is kept when its resolved 16.16 corners span a non-zero height.
+bool ShouldCullTexturedQuadForGpu(const CapturedQuad& q, bool subPixel, bool keepThinQuads);
 
 void CaptureInit(HMODULE hostModule, const std::wstring& dumpDir);
 void CaptureInvalidateCache();

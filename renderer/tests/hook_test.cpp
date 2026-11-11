@@ -1287,6 +1287,62 @@ int main() {
         q = makeQuad(flatCorners, identity, 0xFFFFFFFFu);
         s = ResolveSubPixelVertices(q);
         Check(!s.eligible && !s.useCorners, "single-scanline quads keep their snapped vertices");
+
+        // Thin far quads (D2a): snapped to one scanline, but their 16.16 corners span a height.
+        const double thinCorners[8] = {100.5, 50.0, 200.5, 50.0, 200.5, 50.75, 100.5, 50.75};
+        CapturedQuad thin = makeQuad(thinCorners, identity, 0xFFFFFFFFu);
+        thin.pdatPtr = 0x005AAA04u;
+        const int32_t thinClip[4] = {0, 0, 640, 479};
+        for (int i = 0; i < 4; ++i) thin.clipRect[i] = thinClip[i];
+        Check(thin.verts[0].y == 50 && thin.verts[2].y == 50 && ShouldCullTexturedQuad(thin.verts, thin.clipRect, thin.pdatPtr),
+              "a thin quad snaps to one scanline and the software cull rule still drops it");
+        s = ResolveSubPixelVertices(thin);
+        Check(s.eligible && s.useCorners && s.y[0] == 50.0f && s.y[2] == 50.75f,
+              "a textured single-scanline quad with 16.16 height resolves to its corners");
+        Check(!ShouldCullTexturedQuadForGpu(thin, true, true),
+              "GPU sub-pixel path keeps a single-scanline quad whose 16.16 corners span a height");
+        Check(ShouldCullTexturedQuadForGpu(thin, false, true),
+              "without SubPixel the thin quad is culled as in the software rasterizer");
+        Check(ShouldCullTexturedQuadForGpu(thin, true, false),
+              "KeepThinQuads=0 culls the thin quad as before");
+
+        CapturedQuad flatThin = makeQuad(flatCorners, identity, 0xFFFFFFFFu);
+        flatThin.pdatPtr = 0x005AAA04u;
+        for (int i = 0; i < 4; ++i) flatThin.clipRect[i] = thinClip[i];
+        Check(ShouldCullTexturedQuadForGpu(flatThin, true, true),
+              "a single-scanline quad with zero 16.16 height is still culled");
+
+        CapturedQuad thinFlatKind = thin;
+        thinFlatKind.kind = QuadKind::Flat;
+        Check(!ResolveSubPixelVertices(thinFlatKind).eligible,
+              "single-scanline flat quads keep their snapped vertices");
+
+        CapturedQuad thinNoPdat = thin;
+        thinNoPdat.pdatPtr = 0;
+        Check(ShouldCullTexturedQuadForGpu(thinNoPdat, true, true), "a kept thin quad is still culled when pdatPtr == 0");
+
+        CapturedQuad thinOutside = thin;
+        thinOutside.clipRect[1] = 60;
+        Check(ShouldCullTexturedQuadForGpu(thinOutside, true, true),
+              "a kept thin quad is still culled when its scanline is outside the clip rect");
+
+        CapturedQuad thinClippedX = thin;
+        thinClippedX.clipRect[0] = 300;
+        Check(ShouldCullTexturedQuadForGpu(thinClippedX, true, true),
+              "a kept thin quad is still culled when its x-span is clipped away");
+
+        CapturedQuad thinRebuilt = thin;
+        thinRebuilt.verts[2].x = 150;
+        Check(ShouldCullTexturedQuadForGpu(thinRebuilt, true, true),
+              "a thin quad without an exact corner match falls back to the cull");
+
+        const double tallCorners[8] = {100.25, 50.75, 200.5, 50.125, 200.875, 150.25, 100.0, 150.96875};
+        CapturedQuad tall = makeQuad(tallCorners, identity, 0xFFFFFFFFu);
+        tall.pdatPtr = 0x005AAA04u;
+        for (int i = 0; i < 4; ++i) tall.clipRect[i] = thinClip[i];
+        Check(!ShouldCullTexturedQuadForGpu(tall, true, true) && !ShouldCullTexturedQuadForGpu(tall, false, false),
+              "a quad spanning several scanlines is kept on the GPU path as before");
+        Check(Config{}.keepThinQuads, "KeepThinQuads defaults to on");
     }
 
     // 14. Blended mipmaps (T6): config, engine mip chain cache, atlas level limit, analytic gradients.

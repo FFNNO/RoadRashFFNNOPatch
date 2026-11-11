@@ -571,9 +571,10 @@ bool UpdateLevelStateSnapshot(LevelStateSnapshot& snap,
     return changed;
 }
 
-bool ShouldCullTexturedQuad(const CapturedVertex verts[4],
-                            const int32_t clipRect[4],
-                            uint32_t pdatPtr) {
+static bool CullTexturedQuadBounds(const CapturedVertex verts[4],
+                                   const int32_t clipRect[4],
+                                   uint32_t pdatPtr,
+                                   bool allowSingleScanline) {
     if (!verts || !clipRect || pdatPtr == 0) {
         return true;
     }
@@ -591,7 +592,7 @@ bool ShouldCullTexturedQuad(const CapturedVertex verts[4],
     // - local_c == local_18 (minY == maxY) early-outs before mip selection and draws 0 scanlines.
     // - Y scanlines are inclusive [clipT, clipB] (clipT > clipB culls).
     // - X spans are half-open [clipL, clipR) where uVar13 = right - left (clipL >= clipR draws 0 pixels).
-    if (minY == maxY) {
+    if (minY == maxY && !allowSingleScanline) {
         return true;
     }
     const int32_t clipL = (minX > clipRect[0]) ? minX : clipRect[0];
@@ -599,6 +600,46 @@ bool ShouldCullTexturedQuad(const CapturedVertex verts[4],
     const int32_t clipR = (maxX < clipRect[2]) ? maxX : clipRect[2];
     const int32_t clipB = (maxY < clipRect[3]) ? maxY : clipRect[3];
     return (clipL >= clipR) || (clipT > clipB);
+}
+
+bool ShouldCullTexturedQuad(const CapturedVertex verts[4],
+                            const int32_t clipRect[4],
+                            uint32_t pdatPtr) {
+    return CullTexturedQuadBounds(verts, clipRect, pdatPtr, false);
+}
+
+static bool IsSingleScanline(const CapturedVertex verts[4]) {
+    return verts[0].y == verts[1].y && verts[0].y == verts[2].y && verts[0].y == verts[3].y;
+}
+
+static bool CornersSpanHeight(const CapturedQuad& q) {
+    for (int c = 1; c < 4; ++c) {
+        if (q.corners16_16[c * 2 + 1] != q.corners16_16[1]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ShouldCullTexturedQuadForGpu(const CapturedQuad& q, bool subPixel, bool keepThinQuads) {
+    if (keepThinQuads && subPixel && q.pdatPtr != 0 && IsSingleScanline(q.verts)) {
+        // FUN_0042e850 draws no scanline for these quads; at 640x480 the neighbouring rows cover that
+        // line. The GPU world is drawn larger and at the 16.16 corners, so a quad whose corners still
+        // span a height is drawn there instead of leaving a gap. Every other cull rule stays.
+        const SubPixelVertices spv = ResolveSubPixelVertices(q);
+        if (spv.useCorners) {
+            float minY = spv.y[0];
+            float maxY = spv.y[0];
+            for (int i = 1; i < 4; ++i) {
+                minY = std::min(minY, spv.y[i]);
+                maxY = std::max(maxY, spv.y[i]);
+            }
+            if (maxY > minY) {
+                return CullTexturedQuadBounds(q.verts, q.clipRect, q.pdatPtr, true);
+            }
+        }
+    }
+    return ShouldCullTexturedQuad(q.verts, q.clipRect, q.pdatPtr);
 }
 
 bool ShouldCullFlatQuad(const CapturedVertex verts[4],
@@ -641,7 +682,10 @@ SubPixelVertices ResolveSubPixelVertices(const CapturedQuad& q) {
         maxY = (q.verts[i].y > maxY) ? q.verts[i].y : maxY;
     }
     const int32_t shift = q.snapShift & 0x1F;
-    if (minY == maxY || shift == 0) {
+    // A textured single-scanline quad whose 16.16 corners span a height is kept for the GPU world
+    // (ShouldCullTexturedQuadForGpu), so it needs its corners; every other single-scanline quad keeps
+    // its snapped vertices.
+    if (shift == 0 || (minY == maxY && (q.kind != QuadKind::Textured || !CornersSpanHeight(q)))) {
         return out;
     }
     out.eligible = true;
@@ -1384,16 +1428,25 @@ void CaptureTexturedQuadAfter(int slotIndex, bool rasterizerSkipped) {
         if (q.verts[i].y > maxY) maxY = q.verts[i].y;
     }
 
-    // In FUN_0042e850, local_c == local_18 (minY == maxY) is the only early return before DAT_006185a4 is written.
-    if (minY == maxY || q.pdatPtr == 0) {
+    if (q.pdatPtr == 0) {
         q.chosenMip = -1;
         q.culled = true;
         return;
     }
 
     if (rasterizerSkipped) {
-        q.chosenMip = 0;
-        q.culled = ShouldCullTexturedQuad(q.verts, q.clipRect, q.pdatPtr);
+        // The engine selected no mip: every GPU-drawn quad, thin quads kept by
+        // ShouldCullTexturedQuadForGpu included, uses level 0 and the sampler minifies from there.
+        const Config& cfg = GetConfig();
+        q.culled = ShouldCullTexturedQuadForGpu(q, cfg.subPixel, cfg.keepThinQuads);
+        q.chosenMip = (q.culled && minY == maxY) ? -1 : 0;
+        return;
+    }
+
+    // In FUN_0042e850, local_c == local_18 (minY == maxY) is the only early return before DAT_006185a4 is written.
+    if (minY == maxY) {
+        q.chosenMip = -1;
+        q.culled = true;
         return;
     }
 

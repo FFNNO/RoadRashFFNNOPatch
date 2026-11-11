@@ -154,6 +154,9 @@ void ParseConfigFile(const std::wstring& iniFilePath, Config& cfg) {
     UINT subPixelVal = GetPrivateProfileIntW(L"World", L"SubPixel", 1, iniFilePath.c_str());
     cfg.subPixel = (subPixelVal != 0);
 
+    UINT keepThinVal = GetPrivateProfileIntW(L"World", L"KeepThinQuads", 1, iniFilePath.c_str());
+    cfg.keepThinQuads = (keepThinVal != 0);
+
     wchar_t mipBuf[64] = {0};
     GetPrivateProfileStringW(L"World", L"MipFilter", L"trilinear", mipBuf, 64, iniFilePath.c_str());
     ParseMipFilter(mipBuf, cfg.mipFilter);
