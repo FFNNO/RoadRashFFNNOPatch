@@ -211,6 +211,17 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 }
 )";
 
+// HUD key icons: premultiplied BGRA layer, blended with (ONE, INV_SRC_ALPHA) so partially
+// transparent icon edges match the game's own compositor; no alpha discard.
+const char* kIconPixelShaderSrc = R"(
+Texture2D<float4> texLayer : register(t0);
+SamplerState      samp     : register(s0);
+
+float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    return texLayer.Sample(samp, uv);
+}
+)";
+
 // Save/load toast overlay: one textured quad in client pixels, alpha blended over the final image.
 const char* kOverlayVertexShaderSrc = R"(
 cbuffer OverlayCB : register(b0) {
@@ -456,7 +467,8 @@ public:
         return PresenterStateAllowsGpuWorld(m_failureState) && !m_inBackoffCooldown;
     }
 
-    bool Present8bpp(HWND hwnd, const uint8_t* surface, int pitch, const uint8_t* palette, int width, int height) {
+    bool Present8bpp(HWND hwnd, const uint8_t* surface, int pitch, const uint8_t* palette, int width, int height,
+                     const uint32_t* hudIcons) {
         const InPresentScope inPresent(m_inPresent);
         const uint64_t nowMs = GetTickCount64();
         if (!PresenterCanAttempt(m_failureState, nowMs)) {
@@ -479,7 +491,7 @@ public:
 
         ServiceTexturePack();
         if (GetConfig().gpuWorld && CaptureHasWorldFrame()) {
-            return PresentWorldFrame(surface, pitch, palette, width, height, clientW, clientH, nowMs);
+            return PresentWorldFrame(surface, pitch, palette, width, height, clientW, clientH, nowMs, hudIcons);
         }
 
         // Upload 8bpp indexed surface
@@ -650,6 +662,13 @@ public:
         m_layerUvCB.Reset();
         m_layerUvVS.Reset();
         m_layerUvFailed = false;
+        m_srvHudIcons.Reset();
+        m_texHudIcons.Reset();
+        m_hudIconsTexW = 0;
+        m_hudIconsTexH = 0;
+        m_hudIconPS.Reset();
+        m_blendPremul.Reset();
+        m_hudIconsFailed = false;
         m_srvWideHorizon.Reset();
         m_texWideHorizon.Reset();
         m_wideHorizonTexW = 0;
@@ -1450,11 +1469,14 @@ private:
         return true;
     }
 
-    bool DrawFullscreenLayerOnWorld(ID3D11ShaderResourceView* srv, int worldW, int worldH, bool alphaBlend) {
+    // psOverride / blendOverride replace the layer pixel shader and the alpha blend (HUD icons).
+    bool DrawFullscreenLayerOnWorld(ID3D11ShaderResourceView* srv, int worldW, int worldH, bool alphaBlend,
+                                    ID3D11PixelShader* psOverride = nullptr,
+                                    ID3D11BlendState* blendOverride = nullptr) {
         m_context->IASetInputLayout(nullptr);
         m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         m_context->VSSetShader(m_layerVS.Get(), nullptr, 0);
-        m_context->PSSetShader(m_layerPS.Get(), nullptr, 0);
+        m_context->PSSetShader(psOverride ? psOverride : m_layerPS.Get(), nullptr, 0);
         m_context->PSSetShaderResources(0, 1, &srv);
         m_context->PSSetSamplers(0, 1, m_samplerClamp.GetAddressOf());
         m_context->RSSetState(m_rasterScissor.Get());
@@ -1463,7 +1485,8 @@ private:
         m_context->RSSetScissorRects(1, &fullScissor);
 
         const float blendFactor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        m_context->OMSetBlendState(alphaBlend ? m_blendAlpha.Get() : nullptr, blendFactor, 0xFFFFFFFFu);
+        ID3D11BlendState* blend = blendOverride ? blendOverride : (alphaBlend ? m_blendAlpha.Get() : nullptr);
+        m_context->OMSetBlendState(blend, blendFactor, 0xFFFFFFFFu);
 
         m_context->Draw(3, 0);
         return true;
@@ -1550,7 +1573,8 @@ private:
     // horizon snapshot when the wide horizon layer is unavailable, so the sky has no gap at the sides);
     // otherwise the layer is scissored to its rect (HUD and dashboard).
     bool DrawLayerRectOnWorld(ID3D11ShaderResourceView* srv, int worldW, int worldH, int layerL, int layerR,
-                              bool alphaBlend, bool extendEdges) {
+                              bool alphaBlend, bool extendEdges, ID3D11PixelShader* psOverride = nullptr,
+                              ID3D11BlendState* blendOverride = nullptr) {
         if (layerR <= layerL || !EnsureLayerUvResources()) {
             return false;
         }
@@ -1572,7 +1596,7 @@ private:
         m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         m_context->VSSetShader(m_layerUvVS.Get(), nullptr, 0);
         m_context->VSSetConstantBuffers(0, 1, m_layerUvCB.GetAddressOf());
-        m_context->PSSetShader(m_layerPS.Get(), nullptr, 0);
+        m_context->PSSetShader(psOverride ? psOverride : m_layerPS.Get(), nullptr, 0);
         m_context->PSSetShaderResources(0, 1, &srv);
         m_context->PSSetSamplers(0, 1, m_samplerClamp.GetAddressOf());
         m_context->RSSetState(m_rasterScissor.Get());
@@ -1582,12 +1606,116 @@ private:
         m_context->RSSetScissorRects(1, &scissor);
 
         const float blendFactor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        m_context->OMSetBlendState(alphaBlend ? m_blendAlpha.Get() : nullptr, blendFactor, 0xFFFFFFFFu);
+        ID3D11BlendState* blend = blendOverride ? blendOverride : (alphaBlend ? m_blendAlpha.Get() : nullptr);
+        m_context->OMSetBlendState(blend, blendFactor, 0xFFFFFFFFu);
 
         m_context->Draw(3, 0);
         ID3D11Buffer* nullCb = nullptr;
         m_context->VSSetConstantBuffers(0, 1, &nullCb);
         return true;
+    }
+
+    // HUD key icon layer: created on the first frame that has icons. Any failure disables the
+    // icon layer until the device is recreated, logged once; it never fails the frame.
+    bool EnsureHudIconResources(int width, int height) {
+        if (m_hudIconsFailed) {
+            return false;
+        }
+        if (m_hudIconPS && m_blendPremul && m_texHudIcons && m_srvHudIcons && m_hudIconsTexW == width &&
+            m_hudIconsTexH == height) {
+            return true;
+        }
+        HRESULT hr = S_OK;
+        if (!m_hudIconPS) {
+            ComPtr<ID3DBlob> psBlob;
+            ComPtr<ID3DBlob> errBlob;
+            hr = D3DCompile(kIconPixelShaderSrc, std::strlen(kIconPixelShaderSrc), "hud_icon_ps", nullptr, nullptr,
+                            "main", "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psBlob, &errBlob);
+            if (FAILED(hr) || FAILED(hr = m_device->CreatePixelShader(psBlob->GetBufferPointer(),
+                                                                      psBlob->GetBufferSize(), nullptr,
+                                                                      &m_hudIconPS))) {
+                return FailHudIcons("pixel shader", hr);
+            }
+        }
+        if (!m_blendPremul) {
+            D3D11_BLEND_DESC bd = {};
+            bd.RenderTarget[0].BlendEnable = TRUE;
+            bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+            bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+            bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+            bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+            bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+            bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+            bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+            hr = m_device->CreateBlendState(&bd, &m_blendPremul);
+            if (FAILED(hr)) {
+                return FailHudIcons("blend state", hr);
+            }
+        }
+        m_srvHudIcons.Reset();
+        m_texHudIcons.Reset();
+        m_hudIconsTexW = 0;
+        m_hudIconsTexH = 0;
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = static_cast<UINT>(width);
+        td.Height = static_cast<UINT>(height);
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DYNAMIC;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        hr = m_device->CreateTexture2D(&td, nullptr, &m_texHudIcons);
+        if (SUCCEEDED(hr)) {
+            hr = m_device->CreateShaderResourceView(m_texHudIcons.Get(), nullptr, &m_srvHudIcons);
+        }
+        if (FAILED(hr)) {
+            m_srvHudIcons.Reset();
+            m_texHudIcons.Reset();
+            return FailHudIcons("texture", hr);
+        }
+        m_hudIconsTexW = width;
+        m_hudIconsTexH = height;
+        return true;
+    }
+
+    bool FailHudIcons(const char* what, HRESULT hr) {
+        LOG_ERROR("HUD icon layer %s creation failed (0x%08lX); key icons are not drawn with GpuWorld",
+                  what, static_cast<unsigned long>(hr));
+        m_hudIconsFailed = true;
+        return false;
+    }
+
+    // Draws the HUD key icon layer (premultiplied, srcW x srcH) where the HUD layer was drawn. A
+    // failure skips the icons for this frame only; the frame itself is still presented.
+    void DrawHudIcons(const uint32_t* hudIcons, int srcW, int srcH, int worldW, int worldH, bool widescreen,
+                      const WorldTargetLayout& layout) {
+        if (!EnsureHudIconResources(srcW, srcH)) {
+            return;
+        }
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        const HRESULT hr = m_context->Map(m_texHudIcons.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+        if (FAILED(hr)) {
+            if (!m_hudIconsMapFailLogged) {
+                m_hudIconsMapFailLogged = true;
+                LOG_ERROR("D3D11 Map(texHudIcons) failed: 0x%08lX; key icons skipped", static_cast<unsigned long>(hr));
+            }
+            return;
+        }
+        for (int y = 0; y < srcH; ++y) {
+            std::memcpy(static_cast<uint8_t*>(mapped.pData) + static_cast<size_t>(y) * mapped.RowPitch,
+                        hudIcons + static_cast<size_t>(y) * static_cast<size_t>(srcW),
+                        static_cast<size_t>(srcW) * sizeof(uint32_t));
+        }
+        m_context->Unmap(m_texHudIcons.Get(), 0);
+        if (widescreen) {
+            DrawLayerRectOnWorld(m_srvHudIcons.Get(), worldW, worldH, layout.layerLeft, layout.layerRight, true,
+                                 false, m_hudIconPS.Get(), m_blendPremul.Get());
+        } else {
+            DrawFullscreenLayerOnWorld(m_srvHudIcons.Get(), worldW, worldH, true, m_hudIconPS.Get(),
+                                       m_blendPremul.Get());
+        }
     }
 
     // With GpuWorld on, the texture pack is indexed as soon as the device exists, in menus too, so
@@ -1648,7 +1776,8 @@ private:
     }
 
     bool PresentWorldFrame(const uint8_t* surface, int pitch, const uint8_t* palette,
-                           int srcW, int srcH, int clientW, int clientH, uint64_t nowMs) {
+                           int srcW, int srcH, int clientW, int clientH, uint64_t nowMs,
+                           const uint32_t* hudIcons) {
         // srcW x srcH is the software surface (640x480): the horizon snapshot and HUD layers. The
         // world quads live in worldSrcW x worldSrcH engine pixels: the same 640x480, or with
         // widescreen (projection width << 1) x 480, drawn into a target as wide as the window aspect.
@@ -2046,6 +2175,10 @@ private:
         if (!hudDrawn) {
             return RecordFailure(nowMs);
         }
+        // Pass 4: HUD key icons (the game blends them into the DIB, which GpuWorld does not compose)
+        if (hudIcons) {
+            DrawHudIcons(hudIcons, srcW, srcH, worldW, worldH, widescreen, layout);
+        }
 
         // Restore rasterizer and blend state before final letterbox present
         ID3D11ShaderResourceView* nullSrv = nullptr;
@@ -2439,6 +2572,15 @@ private:
     ComPtr<ID3D11ShaderResourceView> m_srvWhite;
     ComPtr<ID3D11Texture2D> m_texLayerRgba;
     ComPtr<ID3D11ShaderResourceView> m_srvLayerRgba;
+    // HUD key icon layer (GpuWorld), created on the first frame with icons.
+    ComPtr<ID3D11PixelShader> m_hudIconPS;
+    ComPtr<ID3D11BlendState> m_blendPremul;
+    ComPtr<ID3D11Texture2D> m_texHudIcons;
+    ComPtr<ID3D11ShaderResourceView> m_srvHudIcons;
+    int m_hudIconsTexW = 0;
+    int m_hudIconsTexH = 0;
+    bool m_hudIconsFailed = false;
+    bool m_hudIconsMapFailLogged = false;
     ComPtr<ID3D11Texture2D> m_texWorld;
     ComPtr<ID3D11RenderTargetView> m_rtvWorld;
     ComPtr<ID3D11ShaderResourceView> m_srvWorld;
@@ -2520,8 +2662,9 @@ std::string PresenterWorldPixelShaderSource() {
     return BuildWorldPixelShaderSource();
 }
 
-bool PresenterPresent8bpp(HWND hwnd, const uint8_t* surface, int pitch, const uint8_t* palette, int width, int height) {
-    return g_presenter.Present8bpp(hwnd, surface, pitch, palette, width, height);
+bool PresenterPresent8bpp(HWND hwnd, const uint8_t* surface, int pitch, const uint8_t* palette, int width, int height,
+                          const uint32_t* hudIcons) {
+    return g_presenter.Present8bpp(hwnd, surface, pitch, palette, width, height, hudIcons);
 }
 
 bool PresenterPresentBgra(HWND hwnd, const uint32_t* dib, int width, int height) {

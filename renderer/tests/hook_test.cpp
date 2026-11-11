@@ -26,6 +26,7 @@
 #include "../src/overlay_text.h"
 #include "../src/widescreen.h"
 #include "../src/options_menu.h"
+#include "../src/hud_icons.h"
 
 namespace {
 
@@ -85,6 +86,33 @@ void FillTestBasePalette(uint8_t (&palette)[1024]) {
         palette[i * 4 + 2] = static_cast<uint8_t>(64 + i / 4);
         palette[i * 4 + 3] = 0;
     }
+}
+
+// Mirrors the per-pixel blend of the game's icon compositor FUN_00464140 (0x00464140): the icon
+// texel is premultiplied BGRA; alpha 0 leaves the DIB pixel, alpha 255 copies the colour, otherwise
+// each channel becomes min(255, dst * (255 - a) / 255 + src). The top DIB byte is written as 0.
+uint32_t GameBlendIconTexel(uint32_t dst, uint8_t b, uint8_t g, uint8_t r, uint8_t a) {
+    if (a == 0) {
+        return dst;
+    }
+    if (a == 255) {
+        return (static_cast<uint32_t>(r) << 16) | (static_cast<uint32_t>(g) << 8) | b;
+    }
+    const uint32_t inv = 255u - a;
+    const uint32_t outR = std::min<uint32_t>(255u, ((dst >> 16) & 0xFFu) * inv / 255u + r);
+    const uint32_t outG = std::min<uint32_t>(255u, ((dst >> 8) & 0xFFu) * inv / 255u + g);
+    const uint32_t outB = std::min<uint32_t>(255u, (dst & 0xFFu) * inv / 255u + b);
+    return (outR << 16) | (outG << 8) | outB;
+}
+
+// Composites a recovered premultiplied 0xAARRGGBB icon pixel over dst the way the GPU blend
+// (ONE, INV_SRC_ALPHA) does into a UNORM target, in exact integer form.
+uint32_t CompositePremultiplied(uint32_t dst, uint32_t icon) {
+    const uint32_t inv = 255u - (icon >> 24);
+    auto channel = [&](int shift) {
+        return std::min<uint32_t>(255u, ((dst >> shift) & 0xFFu) * inv / 255u + ((icon >> shift) & 0xFFu));
+    };
+    return (channel(16) << 16) | (channel(8) << 8) | channel(0);
 }
 
 uint32_t PackRgba(const uint8_t* palette, int idx) {
@@ -2877,6 +2905,75 @@ int main() {
         Check(std::strcmp(WidescreenSettingSourceToString(WidescreenSettingSource::Registry), "registry") == 0 &&
                   std::strcmp(WidescreenSettingSourceToString(WidescreenSettingSource::Ini), "ini") == 0,
               "menu W3: WidescreenSettingSourceToString names the sources");
+    }
+
+    // HUD key icons under GpuWorld: the icon layer is recovered from two runs of the game's
+    // compositor, one over opaque black and one over opaque white.
+    {
+        const uint32_t black = 0xFF000000u;
+        const uint32_t white = 0xFFFFFFFFu;
+
+        // Fully transparent: the game leaves both prefills untouched.
+        uint32_t onBlack[4] = {black, black, black, black};
+        uint32_t onWhite[4] = {white, white, white, white};
+        uint32_t out[4] = {0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu};
+        size_t visible = RecoverHudIconLayer(onBlack, onWhite, out, 4);
+        Check(visible == 0, "hud icons: untouched prefills report no visible pixel");
+        Check(out[0] == 0 && out[1] == 0 && out[2] == 0 && out[3] == 0,
+              "hud icons: untouched prefills recover fully transparent pixels");
+
+        // Fully opaque: alpha 255 copies the colour into both runs (top byte written as 0).
+        onBlack[1] = GameBlendIconTexel(black, 0x30, 0x80, 0xF0, 255);
+        onWhite[1] = GameBlendIconTexel(white, 0x30, 0x80, 0xF0, 255);
+        visible = RecoverHudIconLayer(onBlack, onWhite, out, 4);
+        Check(visible == 1, "hud icons: one opaque pixel is the only visible pixel");
+        Check(out[1] == 0xFFF08030u, "hud icons: opaque pixel recovers its colour with alpha 255");
+        Check(out[0] == 0 && out[2] == 0 && out[3] == 0, "hud icons: the other pixels stay transparent");
+
+        // 50% blend of a known colour: straight (R,G,B) = (200,100,50) at alpha 128, premultiplied.
+        const uint8_t a = 128;
+        const uint8_t pr = static_cast<uint8_t>(200 * a / 255);
+        const uint8_t pg = static_cast<uint8_t>(100 * a / 255);
+        const uint8_t pb = static_cast<uint8_t>(50 * a / 255);
+        onBlack[2] = GameBlendIconTexel(black, pb, pg, pr, a);
+        onWhite[2] = GameBlendIconTexel(white, pb, pg, pr, a);
+        visible = RecoverHudIconLayer(onBlack, onWhite, out, 4);
+        Check(visible == 2, "hud icons: the half-transparent pixel is visible");
+        Check(out[2] == ((static_cast<uint32_t>(a) << 24) | (static_cast<uint32_t>(pr) << 16) |
+                         (static_cast<uint32_t>(pg) << 8) | pb),
+              "hud icons: 50% pixel recovers alpha 128 and its premultiplied colour");
+        const uint32_t dsts[4] = {0x00000000u, 0x00FFFFFFu, 0x00406080u, 0x00FF0010u};
+        bool matchesGame = true;
+        for (uint32_t dst : dsts) {
+            matchesGame = matchesGame &&
+                          CompositePremultiplied(dst, out[2]) == GameBlendIconTexel(dst, pb, pg, pr, a);
+        }
+        Check(matchesGame, "hud icons: compositing the recovered 50% pixel matches the game blend on any DIB");
+
+        // Clamping: a premultiplied channel above alpha saturates the white run; alpha comes from
+        // the unsaturated channels and the over-bright channel is kept (the GPU target saturates too).
+        const uint8_t ca = 64;
+        onBlack[3] = GameBlendIconTexel(black, 10, 20, 250, ca);
+        onWhite[3] = GameBlendIconTexel(white, 10, 20, 250, ca);
+        visible = RecoverHudIconLayer(onBlack, onWhite, out, 4);
+        Check(visible == 3, "hud icons: the over-bright pixel is visible");
+        Check((out[3] >> 24) == ca, "hud icons: a saturated channel does not change the recovered alpha");
+        Check((out[3] & 0x00FFFFFFu) == 0x00FA140Au, "hud icons: the over-bright colour is kept as drawn");
+        bool clampMatchesGame = true;
+        for (uint32_t dst : dsts) {
+            clampMatchesGame = clampMatchesGame &&
+                               CompositePremultiplied(dst, out[3]) == GameBlendIconTexel(dst, 10, 20, 250, ca);
+        }
+        Check(clampMatchesGame, "hud icons: compositing the over-bright pixel matches the game blend (clamped)");
+
+        // A malformed pair (white darker than black) never yields a negative difference.
+        const uint32_t badBlack[1] = {0x00808080u};
+        const uint32_t badWhite[1] = {0x00404040u};
+        uint32_t badOut[1] = {0};
+        visible = RecoverHudIconLayer(badBlack, badWhite, badOut, 1);
+        Check(visible == 1 && badOut[0] == 0xFF808080u,
+              "hud icons: white darker than black is clamped to an opaque pixel");
+        Check(RecoverHudIconLayer(nullptr, nullptr, nullptr, 0) == 0, "hud icons: zero pixels is a no-op");
     }
 
     std::printf("%s (%d failure(s))\n", g_failures == 0 ? "OK" : "FAILED", g_failures);

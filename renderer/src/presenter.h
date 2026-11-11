@@ -44,7 +44,11 @@ PresenterSubPixelStats PresenterTakeSubPixelStats();
 // Full HLSL source of the world pixel shader (shared quad mapping + main), exposed for tests.
 std::string PresenterWorldPixelShaderSource();
 
-bool PresenterPresent8bpp(HWND hwnd, const uint8_t* surface, int pitch, const uint8_t* palette, int width, int height);
+// hudIcons: optional width x height premultiplied 0xAARRGGBB layer (see hud_icons.h) drawn over
+// the HUD layer of a GPU world frame; ignored on the software path. A failure to draw it is
+// logged once and the frame is presented without it.
+bool PresenterPresent8bpp(HWND hwnd, const uint8_t* surface, int pitch, const uint8_t* palette, int width, int height,
+                          const uint32_t* hudIcons = nullptr);
 bool PresenterPresentBgra(HWND hwnd, const uint32_t* dib, int width, int height);
 bool PresenterIsLatchedOff();
 bool PresenterGpuWorldAllowed();

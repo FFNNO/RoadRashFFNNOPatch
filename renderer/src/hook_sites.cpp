@@ -9,12 +9,16 @@
 #include "overlay_text.h"
 #include "widescreen.h"
 #include "options_menu.h"
+#include "hud_icons.h"
 #include <windows.h>
 #include <commdlg.h>
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -354,6 +358,48 @@ void FinishRaceFrameAndPollHotkeys() {
     }
 }
 
+// GpuWorld: the race present does not compose the 32bpp DIB, so the HUD key icons queued for
+// FUN_00464140 (ESC, arrows, ...) are recovered as their own premultiplied layer by running it over
+// a black and a white scratch buffer (see hud_icons.h); the game's DIB is not touched. FUN_00464140
+// clears the queue count on return, so the count is restored after each run and the caller clears
+// it once the frame is presented, as the software path does. Returns nullptr when no icon pixel
+// is visible or the scratch buffers cannot be allocated (logged once; the frame goes on without
+// icons).
+const uint32_t* BuildHudIconLayer(int width, int height) {
+    static std::vector<uint32_t> onBlack;
+    static std::vector<uint32_t> onWhite;
+    static std::vector<uint32_t> layer;
+    static bool allocFailedLogged = false;
+    const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
+    try {
+        onBlack.resize(pixelCount);
+        onWhite.resize(pixelCount);
+        layer.resize(pixelCount);
+    } catch (const std::bad_alloc&) {
+        if (!allocFailedLogged) {
+            allocFailedLogged = true;
+            LOG_ERROR("HUD icon layer: %ux%u scratch buffers could not be allocated; key icons skipped",
+                      static_cast<unsigned>(width), static_cast<unsigned>(height));
+        }
+        return nullptr;
+    }
+    std::fill(onBlack.begin(), onBlack.end(), 0xFF000000u);
+    std::fill(onWhite.begin(), onWhite.end(), 0xFFFFFFFFu);
+
+    int* overlayCount = GlobalPtr<int>(kVaOverlayCount);
+    const int queued = *overlayCount;
+    auto fnBlendOverlays = reinterpret_cast<FUN_00464140_Fn>(Rebase(0x00464140));
+    fnBlendOverlays(onBlack.data(), width, height);
+    *overlayCount = queued;
+    fnBlendOverlays(onWhite.data(), width, height);
+    *overlayCount = queued;
+
+    if (RecoverHudIconLayer(onBlack.data(), onWhite.data(), layer.data(), pixelCount) == 0) {
+        return nullptr;
+    }
+    return layer.data();
+}
+
 void __fastcall Detour_FUN_0046e630(uint8_t* buffer, int pitch, int palette) {
     const int width = *GlobalPtr<int>(kVaBufferWidth);
     const int height = *GlobalPtr<int>(kVaBufferHeight);
@@ -390,7 +436,8 @@ void __fastcall Detour_FUN_0046e630(uint8_t* buffer, int pitch, int palette) {
 
     bool ok = false;
     const uint8_t* palBytes = reinterpret_cast<const uint8_t*>(palette);
-    if (overlayCount > 0 && !(GetConfig().gpuWorld && CaptureHasWorldFrame())) {
+    const bool gpuWorldFrame = GetConfig().gpuWorld && CaptureHasWorldFrame();
+    if (overlayCount > 0 && !gpuWorldFrame) {
         uint32_t lut[256];
         for (int i = 0; i < 256; ++i) {
             const uint32_t r = palBytes[i * 4 + 0];
@@ -411,7 +458,14 @@ void __fastcall Detour_FUN_0046e630(uint8_t* buffer, int pitch, int palette) {
         fnBlendOverlays(dib, width, height);
         ok = PresenterPresentBgra(hwnd, dib, width, height);
     } else {
-        ok = PresenterPresent8bpp(hwnd, buffer, pitch, palBytes, width, height);
+        const bool withIcons = overlayCount > 0 && gpuWorldFrame;
+        const uint32_t* hudIcons = withIcons ? BuildHudIconLayer(width, height) : nullptr;
+        ok = PresenterPresent8bpp(hwnd, buffer, pitch, palBytes, width, height, hudIcons);
+        if (ok && withIcons) {
+            // Consumed, as FUN_00464140 does on the software path. On a failed present the queue is
+            // kept, so the GDI fallback below still blends the icons.
+            *GlobalPtr<int>(kVaOverlayCount) = 0;
+        }
     }
 
     if (!ok) {
