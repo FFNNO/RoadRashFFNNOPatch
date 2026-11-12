@@ -10,6 +10,7 @@
 #include "widescreen.h"
 #include "options_menu.h"
 #include "hud_icons.h"
+#include "draw_distance.h"
 #include <windows.h>
 #include <commdlg.h>
 #include <algorithm>
@@ -92,14 +93,19 @@ constexpr uint32_t kVaRoadSliceCount = 0x0059ec90;
 RoadSliceStats g_roadSliceStats;
 
 // Only with the world hooks installed (the race code is the verified build) and from the race
-// present. The count is checked before anything else is read; the array is static .data, so the
-// flag bytes of slices 0..0x30 are always inside the image.
+// present. The count is checked before anything else is read against the active cap; the array is
+// the engine's static .data or, with a raised draw distance (D3), the DLL's copy sized for that cap,
+// so the flag bytes of slices 0..cap are always inside it.
 void SampleRoadSlicesForLog() {
     if (!g_worldHooksInstalled || !g_hostModule) {
         return;
     }
     const int32_t count = *GlobalPtr<const int32_t>(kVaRoadSliceCount);
-    AccumulateRoadSliceSample(g_roadSliceStats, SampleRoadSliceFlags(GlobalPtr<const uint8_t>(kVaRoadSlices), count));
+    const uint8_t* slices = rr95::DrawDistanceSliceArrayOverride();
+    if (slices == nullptr) {
+        slices = GlobalPtr<const uint8_t>(kVaRoadSlices);
+    }
+    AccumulateRoadSliceSample(g_roadSliceStats, SampleRoadSliceFlags(slices, count, rr95::DrawDistanceSliceMax()));
 }
 // GpuWorld toggle key pressed during a widescreen race; applied at the next race start.
 bool g_gpuWorldTogglePending = false;
@@ -789,8 +795,25 @@ void ApplyRaceProjectionWidth() {
     }
 }
 
+// [World] DrawSegments (D3): decided at every race start, before FUN_00457ef0 initialises the
+// slices (its FUN_0045aa90 call at 0x457f81 then initialises the moved arrays). Same condition as
+// widescreen: GpuWorld on, presenter on and not latched off, world hooks installed. Anything else,
+// or DrawSegments=48, restores the engine's 48 segments. Nothing changes mid-race; a GpuWorld
+// toggle during the race keeps the race's segment count (the software path draws them too).
+void ApplyRaceDrawDistance() {
+    const Config& cfg = GetConfig();
+    const bool gpuWorldEffective = cfg.gpuWorld && cfg.presenterEnabled && g_worldHooksInstalled &&
+                                   !PresenterIsLatchedOff();
+    const int active = rr95::DrawDistanceRaceStart(g_hostModule, cfg.drawSegments, gpuWorldEffective);
+    if (cfg.drawSegments > rr95::kEngineDrawSegments && active == rr95::kEngineDrawSegments) {
+        LOG_INFO("Draw distance: race start with the engine's %d segments (DrawSegments=%d, GpuWorld=%d)",
+                 rr95::kEngineDrawSegments, cfg.drawSegments, gpuWorldEffective ? 1 : 0);
+    }
+}
+
 void __cdecl Detour_FUN_00457ef0() {
     ApplyRaceProjectionWidth();
+    ApplyRaceDrawDistance();
     CaptureDistanceFadeRaceStart();  // a new race or track starts from its own far depth
     if (g_orig_FUN_00457ef0) {
         g_orig_FUN_00457ef0();
@@ -1208,6 +1231,13 @@ bool InstallHooks(ExeBuild build) {
                      DescribeWidescreenSetting(effective.setting).c_str(),
                      WidescreenSettingSourceToString(effective.source));
             InstallWidescreenMenuItem();
+            if (cfg.drawSegmentsAdjusted) {
+                LOG_WARN("[World] DrawSegments is outside %d..%d or not a number; using %d",
+                         rr95::kEngineDrawSegments, rr95::kMaxDrawSegments, cfg.drawSegments);
+            }
+            if (cfg.drawSegments > rr95::kEngineDrawSegments) {
+                LOG_INFO("[World] DrawSegments=%d (applied at each race start when GpuWorld is on)", cfg.drawSegments);
+            }
         } else {
             LOG_WARN("Failed to install race init hook on FUN_00457ef0; widescreen unavailable");
         }
@@ -1234,6 +1264,7 @@ void RemoveHooks() {
     rr95::RemoveHook(g_site_FUN_0043f580, hostModule);
     rr95::RemoveHook(g_site_FUN_0043f7c0, hostModule);
     RemoveWidescreenMenuItem(hostModule);
+    rr95::DrawDistanceShutdown();  // the moved arrays live in this DLL
     rr95::RemoveHook(g_site_FUN_00457ef0, hostModule);
     g_worldHooksInstalled = false;
     CaptureSetDistanceFadeHooks(false);

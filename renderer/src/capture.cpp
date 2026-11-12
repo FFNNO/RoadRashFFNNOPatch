@@ -1,5 +1,6 @@
 #include "capture.h"
 #include "config.h"
+#include "draw_distance.h"
 #include "hook.h"
 #include "log.h"
 #include "presenter.h"
@@ -1871,7 +1872,12 @@ void CaptureDepthBeginSlice(const uint8_t* slice) {
         return;
     }
     const int32_t count = *GlobalPtr<const int32_t>(kVaRoadSliceCountVar);
-    const int32_t z = ReadRoadSliceDepth(slice, GlobalPtr<const uint8_t>(kVaRoadSliceArray), count);
+    // With a raised draw distance (D3) the slices live in the DLL, sized for the active cap.
+    const uint8_t* slices = rr95::DrawDistanceSliceArrayOverride();
+    if (slices == nullptr) {
+        slices = GlobalPtr<const uint8_t>(kVaRoadSliceArray);
+    }
+    const int32_t z = ReadRoadSliceDepth(slice, slices, count, rr95::DrawDistanceSliceMax());
     DepthTagBeginSlice(g_depthTags, PolyBufferCursorIndex(), z);
 }
 
