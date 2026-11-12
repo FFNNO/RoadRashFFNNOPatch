@@ -407,6 +407,9 @@ void FinishRaceFrameAndPollHotkeys() {
     if (actions.endCaptureFrame) {
         CaptureEndFrame();
     }
+    // Distance fade: the end-of-frame flush FUN_0046c7c0 goes through FUN_004227f0, which always ends
+    // in the hooked FUN_004688e0, so every entry was drawn by now; no tag survives into the next frame.
+    CaptureDepthEndFrame();
     if (actions.toggleGpuWorld && WidescreenIsActive()) {
         // Turning GpuWorld off mid-race would leave the world undrawn: the software rasterizers stay
         // skipped while the widened projection width is applied. Defer to the next race start.
@@ -788,6 +791,7 @@ void ApplyRaceProjectionWidth() {
 
 void __cdecl Detour_FUN_00457ef0() {
     ApplyRaceProjectionWidth();
+    CaptureDistanceFadeRaceStart();  // a new race or track starts from its own far depth
     if (g_orig_FUN_00457ef0) {
         g_orig_FUN_00457ef0();
     }

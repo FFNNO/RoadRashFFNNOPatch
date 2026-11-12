@@ -259,15 +259,21 @@ struct DepthTagState {
 void DepthTagFill(DepthTagState& s, int32_t cursorIndex);
 void DepthTagBeginSlice(DepthTagState& s, int32_t cursorIndex, int32_t z);
 void DepthTagEndSlice(DepthTagState& s, int32_t cursorIndex);
+// After a flush: the entries it drew lose their tags and tagging restarts at entry 0.
 void DepthTagFlushEnd(DepthTagState& s);
+// Frame end: every tag is invalidated (kNoDepth), so a depth can never reach a later frame's quad.
 void DepthTagEndFrame(DepthTagState& s);
 int32_t DepthTagLookup(const DepthTagState& s, int32_t entryIndex);
+// Race start (and hook toggles): no tags, no frame maximum and no far reference, so a new race or
+// track starts from its own far depth.
+void DistanceFadeReset(DepthTagState& s, float& farZ);
 // Depth of a slice (z of the row slice+0x14 points to), or kNoDepth unless count is in
 // [1, kRoadSliceMaxCount], slice is one of slices 0..count-1 of sliceArray (the engine draws only
 // those) and the row lies inside the slice array.
 int32_t ReadRoadSliceDepth(const uint8_t* slice, const uint8_t* sliceArray, int32_t count);
 // 0 = drawn as is, 1 = fully the backdrop: linear from startFraction * farZ to farZ.
 float DistanceFadeFactor(int32_t z, float farZ, float startFraction, bool enabled);
+// Peak hold: max(frameMaxZ, previous * decay); a frame without a slice (frameMaxZ <= 0) resets it to 0.
 float UpdateDistanceFadeFarZ(float previous, int32_t frameMaxZ);
 
 void CaptureInit(HMODULE hostModule, const std::wstring& dumpDir);
@@ -283,6 +289,11 @@ void CaptureFlatQuadAfter(int slotIndex, int32_t* polyVerts, bool rasterizerSkip
 // Distance fade engine side (hook_sites.cpp). Nothing is read from the engine until the slice
 // draw hooks report installed.
 void CaptureSetDistanceFadeHooks(bool installed);
+// Race start (FUN_00457ef0 detour): drops the previous race's tags and far reference.
+void CaptureDistanceFadeRaceStart();
+// End of every race frame, after the present read the far reference: commits it and invalidates
+// every tag (runs whatever CaptureEndFrame's capture/GpuWorld condition is).
+void CaptureDepthEndFrame();
 void CaptureDepthBeginSlice(const uint8_t* slice);
 void CaptureDepthEndSlice();
 void CaptureDepthOnFlushStart();

@@ -1093,6 +1093,11 @@ private:
         }
         // Distance fade: world quads blend over the horizon layer already in the world target by their
         // alpha (1 - fade); the target's own alpha is kept. Without it the fade is off, not the GPU path.
+        // Keeping the target alpha (instead of writing texel.a * color.a as the opaque world pass does)
+        // is safe because nothing reads the world target's alpha: the HUD layer (m_blendAlpha) and HUD
+        // icons (m_blendPremul) blend by their own source alpha and overwrite it, and DrawAndPresent's
+        // FetchTexel returns float4(c.rgb, 1.0) for m_srvWorld, also when re-presenting the last frame.
+        // A future consumer of that alpha (DEST_ALPHA blend, readback) must revisit this.
         bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO;
         bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
         hr = m_device->CreateBlendState(&bd, &m_blendWorldFade);

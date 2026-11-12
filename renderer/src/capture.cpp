@@ -785,12 +785,25 @@ void DepthTagEndSlice(DepthTagState& s, int32_t cursorIndex) {
 }
 
 void DepthTagFlushEnd(DepthTagState& s) {
+    const uint32_t drawn = std::min(s.lastTagged, kPolyBufferEntries);
+    for (uint32_t i = 0; i < drawn; ++i) {
+        s.tags[i] = kNoDepth;
+    }
     s.lastTagged = 0;
 }
 
 void DepthTagEndFrame(DepthTagState& s) {
+    for (int32_t& tag : s.tags) {
+        tag = kNoDepth;
+    }
+    s.lastTagged = 0;
     s.frameMaxZ = 0;
     s.currentZ = kNoDepth;
+}
+
+void DistanceFadeReset(DepthTagState& s, float& farZ) {
+    s = DepthTagState{};
+    farZ = 0.0f;
 }
 
 int32_t DepthTagLookup(const DepthTagState& s, int32_t entryIndex) {
@@ -837,6 +850,9 @@ float DistanceFadeFactor(int32_t z, float farZ, float startFraction, bool enable
 }
 
 float UpdateDistanceFadeFarZ(float previous, int32_t frameMaxZ) {
+    if (frameMaxZ <= 0) {
+        return 0.0f;  // no slice this frame (menu, loading, new track): the next one starts fresh
+    }
     return std::max(static_cast<float>(std::max(frameMaxZ, 0)), previous * kDistanceFadeFarZDecay);
 }
 
@@ -1835,8 +1851,19 @@ static int32_t DepthOfPoly(const uint8_t* poly) {
 
 void CaptureSetDistanceFadeHooks(bool installed) {
     g_distanceFadeHooks = installed;
-    g_depthTags = DepthTagState{};
-    g_distanceFadeFarZ = 0.0f;
+    DistanceFadeReset(g_depthTags, g_distanceFadeFarZ);
+}
+
+void CaptureDistanceFadeRaceStart() {
+    DistanceFadeReset(g_depthTags, g_distanceFadeFarZ);
+}
+
+void CaptureDepthEndFrame() {
+    if (!g_distanceFadeHooks) {
+        return;
+    }
+    g_distanceFadeFarZ = UpdateDistanceFadeFarZ(g_distanceFadeFarZ, g_depthTags.frameMaxZ);
+    DepthTagEndFrame(g_depthTags);
 }
 
 void CaptureDepthBeginSlice(const uint8_t* slice) {
@@ -1883,10 +1910,6 @@ ThinQuadStats CaptureTakeThinQuadStats() {
 }
 
 void CaptureEndFrame() {
-    if (g_distanceFadeHooks) {
-        g_distanceFadeFarZ = UpdateDistanceFadeFarZ(g_distanceFadeFarZ, g_depthTags.frameMaxZ);
-        DepthTagEndFrame(g_depthTags);
-    }
     if (g_thinQuadFrameActive) {
         AccumulateThinQuadFrame(g_thinQuadStats, g_thinQuadFrame);
         g_thinQuadFrame = ThinQuadFrameCounts{};

@@ -1485,6 +1485,28 @@ int main() {
         Check(wrap.currentZ == kNoDepth && DepthTagLookup(wrap, 19) == 2000, "a slice without depth tags no depth");
         DepthTagEndFrame(wrap);
         Check(wrap.frameMaxZ == 0 && wrap.currentZ == kNoDepth, "frame end clears the frame maximum");
+        Check(wrap.lastTagged == 0 && DepthTagLookup(wrap, 0) == kNoDepth && DepthTagLookup(wrap, 19) == kNoDepth &&
+                  DepthTagLookup(wrap, 99) == kNoDepth,
+              "frame end invalidates every tag, so no depth reaches a later frame's quads");
+
+        DepthTagState flushed;
+        DepthTagBeginSlice(flushed, 0, 6000);
+        DepthTagFill(flushed, 40);
+        DepthTagFlushEnd(flushed);
+        Check(DepthTagLookup(flushed, 0) == kNoDepth && DepthTagLookup(flushed, 39) == kNoDepth,
+              "a flush invalidates the tags of the entries it drew");
+        DepthTagEndSlice(flushed, 5);
+        Check(DepthTagLookup(flushed, 4) == 6000 && DepthTagLookup(flushed, 5) == kNoDepth,
+              "entries written after the flush are tagged again, older slots stay untagged");
+
+        DepthTagState race;
+        DepthTagBeginSlice(race, 0, 8000);
+        DepthTagFill(race, 30);
+        float raceFarZ = 9000.0f;
+        DistanceFadeReset(race, raceFarZ);
+        Check(raceFarZ == 0.0f && race.frameMaxZ == 0 && race.lastTagged == 0 && race.currentZ == kNoDepth &&
+                  DepthTagLookup(race, 0) == kNoDepth && DepthTagLookup(race, 29) == kNoDepth,
+              "race start clears the tags and the far reference");
 
         // Slice depth from a fake slice array: slice+0x14 points to an inline row, row+0x18 = z.
         std::vector<uint8_t> slices(static_cast<size_t>(kRoadSliceMaxCount + 1) * kRoadSliceStride, 0);
@@ -1524,9 +1546,10 @@ int main() {
               "at or past the farthest row: fully faded");
         Check(std::fabs(UpdateDistanceFadeFarZ(10000.0f, 9000) - 10000.0f * kDistanceFadeFarZDecay) < 1e-3f &&
                   UpdateDistanceFadeFarZ(10000.0f, 12000) == 12000.0f &&
-                  UpdateDistanceFadeFarZ(10000.0f, 0) == 10000.0f * kDistanceFadeFarZDecay &&
                   UpdateDistanceFadeFarZ(0.0f, 0) == 0.0f,
               "far reference holds the peak and decays slowly");
+        Check(UpdateDistanceFadeFarZ(10000.0f, 0) == 0.0f && UpdateDistanceFadeFarZ(10000.0f, -5) == 0.0f,
+              "a frame without a slice resets the far reference");
 
         // Config.
         Check(Config{}.distanceFade && Config{}.distanceFadeStart == 0.8f, "defaults: DistanceFade=1, DistanceFadeStart=0.8");
