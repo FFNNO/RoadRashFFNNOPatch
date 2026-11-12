@@ -31,6 +31,7 @@ add_library(ddraw SHARED
   src/widescreen.cpp
   src/options_menu.cpp
   src/hud_icons.cpp
+  src/draw_distance.cpp
   src/ddraw.def
 )
 set_target_properties(ddraw PROPERTIES OUTPUT_NAME "ddraw" PREFIX "")
@@ -59,6 +60,7 @@ add_executable(hook_test
   src/widescreen.cpp
   src/options_menu.cpp
   src/hud_icons.cpp
+  src/draw_distance.cpp
 )
 target_compile_options(hook_test PRIVATE ${RR95_COMMON_OPTIONS})
 target_compile_definitions(hook_test PRIVATE ${RR95_COMMON_DEFINITIONS})

@@ -1,5 +1,6 @@
 #include "config.h"
 #include <windows.h>
+#include "draw_distance.h"
 #include <cwctype>
 
 static Config g_config;
@@ -185,6 +186,10 @@ void ParseConfigFile(const std::wstring& iniFilePath, Config& cfg) {
     wchar_t fadeStartBuf[64] = {0};
     GetPrivateProfileStringW(L"World", L"DistanceFadeStart", L"0.8", fadeStartBuf, 64, iniFilePath.c_str());
     ParseDistanceFadeStart(fadeStartBuf, cfg.distanceFadeStart);
+
+    wchar_t drawSegmentsBuf[64] = {0};
+    GetPrivateProfileStringW(L"World", L"DrawSegments", L"48", drawSegmentsBuf, 64, iniFilePath.c_str());
+    cfg.drawSegmentsAdjusted = !rr95::ParseDrawSegments(drawSegmentsBuf, cfg.drawSegments);
 
     wchar_t widescreenBuf[64] = {0};
     GetPrivateProfileStringW(L"World", L"Widescreen", L"off", widescreenBuf, 64, iniFilePath.c_str());

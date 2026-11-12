@@ -27,6 +27,7 @@
 #include "../src/widescreen.h"
 #include "../src/options_menu.h"
 #include "../src/hud_icons.h"
+#include "../src/draw_distance.h"
 
 namespace {
 
@@ -748,6 +749,246 @@ std::vector<uint8_t> SnapshotAfterBlit(int param_1, const Geometry& g, const Pan
 }
 
 }  // namespace engine_horizon
+
+// Draw distance (D3): config, patch table, layout, all-or-nothing apply/revert on a fake image,
+// reciprocal and threshold tables against an emulation of FUN_0045aa90.
+void TestDrawDistance() {
+    using namespace rr95;
+
+    int seg = 0;
+    Check(ParseDrawSegments(L"48", seg) && seg == 48 && ParseDrawSegments(L" 60 ", seg) && seg == 60 &&
+              ParseDrawSegments(L"72", seg) && seg == 72,
+          "draw distance: DrawSegments accepts 48..72");
+    Check(!ParseDrawSegments(L"96", seg) && seg == kMaxDrawSegments && !ParseDrawSegments(L"10", seg) && seg == 48 &&
+              !ParseDrawSegments(L"abc", seg) && seg == 48 && !ParseDrawSegments(L"60x", seg) && seg == 48 &&
+              !ParseDrawSegments(L"", seg) && seg == 48 && !ParseDrawSegments(nullptr, seg) && seg == 48,
+          "draw distance: DrawSegments clamps above the maximum and falls back to 48 otherwise");
+    Check(Config{}.drawSegments == 48, "draw distance: default DrawSegments=48");
+    {
+        const std::wstring ini = MakeTestTempPath(L"rr95_draw_cfg_") + L".ini";
+        WritePrivateProfileStringW(L"World", L"DrawSegments", L"200", ini.c_str());
+        Config parsed;
+        ParseConfigFile(ini, parsed);
+        Check(parsed.drawSegments == kMaxDrawSegments && parsed.drawSegmentsAdjusted,
+              "draw distance: [World] DrawSegments parsed and clamped");
+        DeleteFileW(ini.c_str());
+    }
+
+    // Patch table shape: every field inside its instruction, original constants as shipped.
+    const DrawPatchSite* sites = DrawPatchSites();
+    size_t perField[11] = {};
+    bool shapeOk = sites != nullptr;
+    bool constantsOk = true;
+    bool orderOk = true;
+    for (size_t i = 0; shapeOk && i < kDrawPatchSiteCount; ++i) {
+        const DrawPatchSite& s = sites[i];
+        ++perField[static_cast<size_t>(s.field)];
+        shapeOk = shapeOk && s.length <= sizeof(s.expected) && s.fieldOffset + s.fieldSize <= s.length &&
+                  (s.fieldSize == 1 || s.fieldSize == 4) &&
+                  (s.absoluteOffset < 0 || s.absoluteOffset + 4 <= s.length);
+        if (i > 0) {
+            orderOk = orderOk && sites[i - 1].va + sites[i - 1].length <= s.va;
+        }
+        uint32_t original = s.expected[s.fieldOffset];
+        if (s.fieldSize == 4) {
+            std::memcpy(&original, s.expected + s.fieldOffset, 4);
+        }
+        switch (s.field) {
+            case DrawField::DrawPush: constantsOk = constantsOk && original == 0x31; break;
+            case DrawField::DrawCap: constantsOk = constantsOk && original == 0x30; break;
+            case DrawField::CacheEntries:
+            case DrawField::SliceEntries: constantsOk = constantsOk && original == 0x32; break;
+            case DrawField::ReciprocalMax: constantsOk = constantsOk && original == 0x1bff; break;
+            case DrawField::ReciprocalLimit: constantsOk = constantsOk && original == 0x1c00; break;
+            case DrawField::SliceAddr:
+                constantsOk = constantsOk && s.absoluteOffset == s.fieldOffset &&
+                              (original == 0x0060bd00 || original == 0x0060bd14 || original == 0x0060badc ||
+                               original == 0x0060bae4);
+                break;
+            case DrawField::Cache1Addr: constantsOk = constantsOk && original == 0x006084a0; break;
+            case DrawField::Cache2Addr: constantsOk = constantsOk && original == 0x0060a0c0; break;
+            case DrawField::ThresholdAddr: constantsOk = constantsOk && original == 0x00608320; break;
+            case DrawField::ReciprocalAddr: constantsOk = constantsOk && original == 0x00597c90; break;
+        }
+        // Not inside the D1 slice draw hook spans or the race init hook span.
+        const auto overlaps = [&](uint32_t va, uint32_t len) { return s.va < va + len && va < s.va + s.length; };
+        orderOk = orderOk && !overlaps(0x0045a790, 10) && !overlaps(0x0045a870, 10) && !overlaps(0x00457ef0, 5);
+    }
+    Check(shapeOk && orderOk, "draw distance: 103 sites, fields inside their instructions, sorted, no overlaps");
+    Check(constantsOk, "draw distance: expected bytes hold the shipped constants and addresses");
+    Check(perField[static_cast<size_t>(DrawField::DrawPush)] == 1 && perField[static_cast<size_t>(DrawField::DrawCap)] == 2 &&
+              perField[static_cast<size_t>(DrawField::CacheEntries)] == 1 &&
+              perField[static_cast<size_t>(DrawField::SliceEntries)] == 1 &&
+              perField[static_cast<size_t>(DrawField::SliceAddr)] == 8 &&
+              perField[static_cast<size_t>(DrawField::Cache1Addr)] == 5 &&
+              perField[static_cast<size_t>(DrawField::Cache2Addr)] == 3 &&
+              perField[static_cast<size_t>(DrawField::ThresholdAddr)] == 2 &&
+              perField[static_cast<size_t>(DrawField::ReciprocalAddr)] == 28 &&
+              perField[static_cast<size_t>(DrawField::ReciprocalMax)] == 24 &&
+              perField[static_cast<size_t>(DrawField::ReciprocalLimit)] == 28,
+          "draw distance: per-field site counts");
+
+    // Layout: the second cache ends 0x20 bytes before slice 0, the first one right before it.
+    const DrawLayout l72 = ComputeDrawLayout(0x10000000u, 72);
+    const DrawLayout l60 = ComputeDrawLayout(0x10000000u, 60);
+    Check(l72.sliceArray == 0x10000000u + kDrawSliceBlockOffset && l72.cache1 == 0x10000000u &&
+              l72.cache2 == l72.cache1 + 74 * kDrawRowCacheStride &&
+              l72.sliceArray == l72.cache2 + 74 * kDrawRowCacheStride + kDrawCacheSliceGap,
+          "draw distance: layout for 72 segments fills the block");
+    Check(l60.sliceArray == l72.sliceArray && l60.cache2 + 62 * kDrawRowCacheStride + kDrawCacheSliceGap == l60.sliceArray &&
+              l60.cache1 + 62 * kDrawRowCacheStride == l60.cache2 && l60.cache1 > 0x10000000u,
+          "draw distance: layout for 60 segments keeps the engine's relative layout");
+
+    // Field values.
+    DrawTargets t;
+    t.segments = 72;
+    t.sliceArray = 0x20000000u;
+    t.cache1 = 0x21000000u;
+    t.cache2 = 0x22000000u;
+    t.threshold = 0x23000000u;
+    t.reciprocal = 0x24000000u;
+    bool valuesOk = true;
+    for (size_t i = 0; i < kDrawPatchSiteCount; ++i) {
+        const DrawPatchSite& s = sites[i];
+        uint32_t original = s.expected[s.fieldOffset];
+        if (s.fieldSize == 4) {
+            std::memcpy(&original, s.expected + s.fieldOffset, 4);
+        }
+        const uint32_t v = DrawPatchFieldValue(s, t);
+        switch (s.field) {
+            case DrawField::DrawPush: valuesOk = valuesOk && v == 73; break;
+            case DrawField::DrawCap: valuesOk = valuesOk && v == 72; break;
+            case DrawField::CacheEntries:
+            case DrawField::SliceEntries: valuesOk = valuesOk && v == 74; break;
+            case DrawField::ReciprocalMax: valuesOk = valuesOk && v == kDrawReciprocalEntries - 1; break;
+            case DrawField::ReciprocalLimit: valuesOk = valuesOk && v == kDrawReciprocalEntries; break;
+            case DrawField::SliceAddr: valuesOk = valuesOk && v == t.sliceArray + (original - 0x0060bd00u); break;
+            case DrawField::Cache1Addr: valuesOk = valuesOk && v == t.cache1; break;
+            case DrawField::Cache2Addr: valuesOk = valuesOk && v == t.cache2; break;
+            case DrawField::ThresholdAddr: valuesOk = valuesOk && v == t.threshold; break;
+            case DrawField::ReciprocalAddr: valuesOk = valuesOk && v == t.reciprocal; break;
+        }
+    }
+    Check(valuesOk, "draw distance: field values for 72 segments (slice[-1] refs keep their offset)");
+
+    // Fake image of VAs 0x400000..0x470000 holding every site, relocated to the buffer's address.
+    std::vector<uint8_t> image(0x70000, 0xCC);
+    uint8_t* base = image.data();
+    const uint32_t delta = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(base)) - 0x00400000u;
+    Check(sites[kDrawPatchSiteCount - 1].va + sites[kDrawPatchSiteCount - 1].length <= 0x00470000u,
+          "draw distance: the fake image covers every site");
+    for (size_t i = 0; i < kDrawPatchSiteCount; ++i) {
+        const DrawPatchSite& s = sites[i];
+        uint8_t* p = base + (s.va - 0x00400000u);
+        std::memcpy(p, s.expected, s.length);
+        if (s.absoluteOffset >= 0) {
+            uint32_t a = 0;
+            std::memcpy(&a, p + s.absoluteOffset, 4);
+            a += delta;
+            std::memcpy(p + s.absoluteOffset, &a, 4);
+        }
+    }
+    const std::vector<uint8_t> pristine = image;
+    Check(VerifyDrawPatchSites(base) == 0, "draw distance: every site verifies on the relocated fake image");
+
+    DrawPatchState st;
+    Check(ApplyDrawPatches(st, base, t) && st.applied, "draw distance: apply on a matching image");
+    bool writesOk = true;
+    for (size_t i = 0; i < kDrawPatchSiteCount; ++i) {
+        const DrawPatchSite& s = sites[i];
+        const uint8_t* p = base + (s.va - 0x00400000u);
+        const uint8_t* q = pristine.data() + (s.va - 0x00400000u);
+        uint32_t v = p[s.fieldOffset];
+        if (s.fieldSize == 4) {
+            std::memcpy(&v, p + s.fieldOffset, 4);
+        }
+        writesOk = writesOk && v == DrawPatchFieldValue(s, t);
+        for (uint8_t b = 0; b < s.length; ++b) {
+            if (b < s.fieldOffset || b >= s.fieldOffset + s.fieldSize) {
+                writesOk = writesOk && p[b] == q[b];
+            }
+        }
+    }
+    Check(writesOk, "draw distance: only the fields change");
+    Check(!ApplyDrawPatches(st, base, t), "draw distance: a second apply is refused");
+    Check(RevertDrawPatches(st) && !st.applied && image == pristine, "draw distance: revert restores every byte");
+
+    image[sites[50].va - 0x00400000u + sites[50].length - 1] ^= 0x01;
+    const std::vector<uint8_t> broken = image;
+    Check(VerifyDrawPatchSites(base) == sites[50].va, "draw distance: verify names the first mismatching site");
+    DrawPatchState st2;
+    Check(!ApplyDrawPatches(st2, base, t) && !st2.applied && image == broken,
+          "draw distance: one mismatching site applies nothing");
+    image = pristine;
+    base = image.data();
+    DrawPatchState st3;
+    Check(ApplyDrawPatches(st3, base, t) && RevertDrawPatches(st3) && image == pristine,
+          "draw distance: apply and revert again after a refused apply");
+
+    // Reciprocal table: shipped presets below 0x1100, zeros above (what the exe's .data holds).
+    std::vector<int32_t> shipped(kEngineReciprocalEntries, 0);
+    for (int i = 0; i < kFirstComputedReciprocal; ++i) {
+        shipped[static_cast<size_t>(i)] = 163840 - i;
+    }
+    std::vector<int32_t> filled = shipped;  // FUN_0045aa90's fill loop
+    for (int i = 0; i < kEngineReciprocalEntries; ++i) {
+        if (filled[static_cast<size_t>(i)] == 0) {
+            filled[static_cast<size_t>(i)] = static_cast<int32_t>(0x1000000LL / (2LL * i));
+        }
+    }
+    Check(EngineReciprocalsLookShipped(shipped.data()) && EngineReciprocalsLookShipped(filled.data()),
+          "draw distance: shipped and engine-filled tables are recognised");
+    std::vector<int32_t> fromShipped(kDrawReciprocalEntries, 0);
+    std::vector<int32_t> fromFilled(kDrawReciprocalEntries, 0);
+    BuildReciprocalTable(shipped.data(), fromShipped.data(), kDrawReciprocalEntries);
+    BuildReciprocalTable(filled.data(), fromFilled.data(), kDrawReciprocalEntries);
+    bool recipOk = fromShipped == fromFilled &&
+                   std::memcmp(fromFilled.data(), filled.data(), filled.size() * sizeof(int32_t)) == 0;
+    for (int i = kEngineReciprocalEntries; i < kDrawReciprocalEntries; ++i) {
+        recipOk = recipOk && fromFilled[static_cast<size_t>(i)] == static_cast<int32_t>(0x1000000LL / (2LL * i)) &&
+                  EngineReciprocal(i) == fromFilled[static_cast<size_t>(i)];
+    }
+    Check(recipOk, "draw distance: extended table matches the engine byte for byte and continues its formula");
+    std::vector<int32_t> odd = filled;
+    odd[0x1500] += 1;
+    std::vector<int32_t> noZero = filled;
+    noZero[0] = 0;
+    Check(!EngineReciprocalsLookShipped(odd.data()) && !EngineReciprocalsLookShipped(noZero.data()),
+          "draw distance: an unexpected engine table is refused");
+
+    // Crest thresholds against FUN_0045aa90's loop (0x30 entries, old clamp).
+    int32_t source[kThresholdSourceEntries] = {3000, 2500, 2200, 2000, 1800, 1600, 1400, 1200, 1000, 800, 700, 700};
+    int32_t propagated[kThresholdSourceEntries];
+    std::memcpy(propagated, source, sizeof(source));
+    for (int i = 1; i < kThresholdSourceEntries; ++i) {
+        if (propagated[i] == 0) propagated[i] = propagated[i - 1];
+    }
+    int32_t engineThreshold[0x30];
+    for (int i = 0; i < 0x30; ++i) {
+        const uint32_t idx = std::min<uint32_t>((0x200u + 0x100u * i) >> 1, 0x1bffu);
+        engineThreshold[i] = static_cast<int32_t>(static_cast<uint32_t>(propagated[i]) << 16) / filled[idx];
+    }
+    int32_t thr[kMaxDrawSegments + 1] = {};
+    BuildThresholdTable(source, fromFilled.data(), kDrawReciprocalEntries, thr, kMaxDrawSegments + 1);
+    const int32_t expect72 = (700 << 16) / fromFilled[(0x200 + 0x100 * 72) >> 1];
+    Check(std::memcmp(thr, engineThreshold, sizeof(engineThreshold)) == 0 && thr[72] == expect72 && thr[71] < thr[72],
+          "draw distance: thresholds match the engine for 0..0x2f and continue past it");
+
+    // Renderer slice readers accept the larger cap only when told.
+    std::vector<uint8_t> slices(static_cast<size_t>(kMaxDrawSegments + 2) * kRoadSliceStride, 1);
+    Check(!SampleRoadSliceFlags(slices.data(), 60).valid && SampleRoadSliceFlags(slices.data(), 60, 72).valid &&
+              SampleRoadSliceFlags(slices.data(), 60, 72).slices == 61,
+          "draw distance: slice flag sampling uses the active cap");
+    uint8_t* s60 = slices.data() + 60 * kRoadSliceStride;
+    const uint32_t row = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(s60 + 0x1c));
+    std::memcpy(s60 + kRoadSliceRowPtrOffset, &row, 4);
+    const int32_t z = 0x3d00;
+    std::memcpy(s60 + 0x1c + kRoadRowDepthOffset, &z, 4);
+    Check(ReadRoadSliceDepth(s60, slices.data(), 70) == kNoDepth && ReadRoadSliceDepth(s60, slices.data(), 70, 72) == z,
+          "draw distance: slice depth uses the active cap");
+    Check(DrawDistanceSliceArrayOverride() == nullptr && DrawDistanceSliceMax() == kEngineDrawSegments,
+          "draw distance: nothing applied at runtime means the engine's array and 48");
+}
 
 }  // namespace
 
@@ -3285,6 +3526,8 @@ int main() {
               "hud icons: white darker than black is clamped to an opaque pixel");
         Check(RecoverHudIconLayer(nullptr, nullptr, nullptr, 0) == 0, "hud icons: zero pixels is a no-op");
     }
+
+    TestDrawDistance();
 
     std::printf("%s (%d failure(s))\n", g_failures == 0 ? "OK" : "FAILED", g_failures);
     return g_failures == 0 ? 0 : 1;

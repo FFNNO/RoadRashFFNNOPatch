@@ -708,9 +708,9 @@ void AccumulateThinQuadFrame(ThinQuadStats& stats, const ThinQuadFrameCounts& fr
     stats.maxCulledPerFrame = std::max(stats.maxCulledPerFrame, ThinQuadCulledCount(frame));
 }
 
-RoadSliceFrameSample SampleRoadSliceFlags(const uint8_t* sliceArray, int32_t count) {
+RoadSliceFrameSample SampleRoadSliceFlags(const uint8_t* sliceArray, int32_t count, int32_t maxCount) {
     RoadSliceFrameSample out;
-    if (!sliceArray || count < 1 || count > kRoadSliceMaxCount) {
+    if (!sliceArray || count < 1 || count > maxCount) {
         return out;
     }
     out.valid = true;
@@ -813,8 +813,8 @@ int32_t DepthTagLookup(const DepthTagState& s, int32_t entryIndex) {
     return s.tags[entryIndex];
 }
 
-int32_t ReadRoadSliceDepth(const uint8_t* slice, const uint8_t* sliceArray, int32_t count) {
-    if (!slice || !sliceArray || count < 1 || count > kRoadSliceMaxCount || slice < sliceArray) {
+int32_t ReadRoadSliceDepth(const uint8_t* slice, const uint8_t* sliceArray, int32_t count, int32_t maxCount) {
+    if (!slice || !sliceArray || count < 1 || count > maxCount || slice < sliceArray) {
         return kNoDepth;
     }
     const uintptr_t offset = static_cast<uintptr_t>(slice - sliceArray);
@@ -823,9 +823,9 @@ int32_t ReadRoadSliceDepth(const uint8_t* slice, const uint8_t* sliceArray, int3
     }
     uint32_t rowAddr = 0;
     std::memcpy(&rowAddr, slice + kRoadSliceRowPtrOffset, sizeof(rowAddr));
-    // Rows sit inline in the slices; the array holds kRoadSliceMaxCount + 1 slices.
+    // Rows sit inline in the slices; the array holds maxCount + 1 slices or more.
     const uintptr_t lo = reinterpret_cast<uintptr_t>(sliceArray);
-    const uintptr_t hi = lo + static_cast<uintptr_t>(kRoadSliceMaxCount + 1) * kRoadSliceStride;
+    const uintptr_t hi = lo + static_cast<uintptr_t>(maxCount + 1) * kRoadSliceStride;
     if (rowAddr < lo || static_cast<uintptr_t>(rowAddr) + kRoadRowDepthOffset + sizeof(int32_t) > hi) {
         return kNoDepth;
     }

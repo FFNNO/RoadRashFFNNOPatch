@@ -214,7 +214,9 @@ struct RoadSliceFrameSample {
 };
 // sliceArray points to slice 0; count is DAT_0059ec90. Reads only the flag bytes of slices
 // 0..count when count is in [1, kRoadSliceMaxCount].
-RoadSliceFrameSample SampleRoadSliceFlags(const uint8_t* sliceArray, int32_t count);
+// maxCount is the active cap (DrawDistanceSliceMax(): 0x30 unless the draw distance is raised).
+RoadSliceFrameSample SampleRoadSliceFlags(const uint8_t* sliceArray, int32_t count,
+                                          int32_t maxCount = kRoadSliceMaxCount);
 struct RoadSliceStats {
     uint64_t frames = 0;               // valid samples
     uint64_t invalidFrames = 0;        // count out of range, nothing read
@@ -270,7 +272,9 @@ void DistanceFadeReset(DepthTagState& s, float& farZ);
 // Depth of a slice (z of the row slice+0x14 points to), or kNoDepth unless count is in
 // [1, kRoadSliceMaxCount], slice is one of slices 0..count-1 of sliceArray (the engine draws only
 // those) and the row lies inside the slice array.
-int32_t ReadRoadSliceDepth(const uint8_t* slice, const uint8_t* sliceArray, int32_t count);
+// maxCount: the active cap; the array holds maxCount + 1 slices or more.
+int32_t ReadRoadSliceDepth(const uint8_t* slice, const uint8_t* sliceArray, int32_t count,
+                           int32_t maxCount = kRoadSliceMaxCount);
 // 0 = drawn as is, 1 = fully the backdrop: linear from startFraction * farZ to farZ.
 float DistanceFadeFactor(int32_t z, float farZ, float startFraction, bool enabled);
 // Peak hold: max(frameMaxZ, previous * decay); a frame without a slice (frameMaxZ <= 0) resets it to 0.
