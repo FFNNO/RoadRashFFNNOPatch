@@ -8,13 +8,29 @@
 A proxy `ddraw.dll` for **Road Rash 95** (Steam 30th Anniversary Edition, app 2448570) that replaces the game's 640x480 software renderer with Direct3D 11:
 
 - the 3D world is drawn on the GPU at 1440x1080 (4:3) at a locked 60 fps;
+- optional widescreen race view: the world fills a 16:9 (or wider) window with a wider field of view, while the HUD stays a centred 4:3 layer;
+- far view: the road is drawn 72 segments ahead instead of the engine's 48, and the farthest segments fade into the sky instead of popping in;
+- thin far rows of road are kept, so far fewer rows of ground go missing at 1080p;
 - sub-pixel sprite corners and trilinear mipmaps, so buildings no longer jump pixel by pixel;
+- HUD key icons (for example the ESC icon in the pause prompt) are drawn with the GPU world;
 - a high-resolution texture pack (4x upscaled with AI) that replaces game textures by ID;
 - one-click saving and loading to a fixed file, with an on-screen "Partida guardada" / "Partida cargada" message.
+
+Widescreen and far view can be switched from the game's own graphics menu (see [In-game options](#in-game-options)).
 
 Nothing in the game's data files is modified. Deleting the DLL restores the original game. The story of how it was built is in [docs/PROCESS.md](docs/PROCESS.md).
 
 **No game files are included.** You need your own copy of Road Rash 95 on Steam. Game executables, decompilation, texture dumps and texture packs are kept out of this repository on purpose.
+
+## Screenshots
+
+![La Ciudad at 1920x1080 with widescreen, the GPU world and the texture pack](docs/images/race-city-widescreen.jpg)
+
+*La Ciudad at 1920x1080: widescreen on, GPU world, texture pack.*
+
+![Pause prompt showing the ESC key icon](docs/images/pause-esc-icon.jpg)
+
+*The pause prompt with its ESC key icon, drawn with the GPU world.*
 
 ## Install with the wizard
 
@@ -35,7 +51,7 @@ Existing `ddraw.dll`, `rr95gpu.ini` and `texture-pack\` are kept as `*.pre-ffnno
 
 Some antivirus tools may flag the proxy `ddraw.dll`, because it patches the game's code in memory. It does not modify any game file.
 
-Silent install, for example: `RoadRashFFNNOPatch-Setup-0.1.0.exe /VERYSILENT /CURRENTUSER /DIR="<game folder>" /TASKS="gpuworld,save,texturepack" /PACKDIR="<pack folder>"`. To test the installer without touching your game, run `python -I installer/tests/test_installer.py`. It installs into temporary fake game folders and uninstalls again.
+Silent install, for example: `RoadRashFFNNOPatch-Setup-0.1.2.exe /VERYSILENT /CURRENTUSER /DIR="<game folder>" /TASKS="gpuworld,save,texturepack" /PACKDIR="<pack folder>"`. To test the installer without touching your game, run `python -I installer/tests/test_installer.py`. It installs into temporary fake game folders and uninstalls again.
 
 ## 1. Requirements
 
@@ -97,16 +113,37 @@ Start from `renderer/rr95gpu.ini` (every key is documented there) and change:
 [World]
 GpuWorld=1          ; GPU world at 1440x1080 (Scroll Lock toggles it in race)
 ; Defaults you can keep (GpuWorld=1 only):
-; DrawSegments=72   ; road segments drawn ahead (48 = the engine's own distance, 72 = most)
-; DistanceFade=1    ; the farthest segments fade into the sky instead of popping in
-; KeepThinQuads=1   ; draw far one-scanline rows (fixes missing rows of the finish line)
+; DrawSegments=72        ; road segments drawn ahead (48 = the engine's own distance, 72 = most)
+; DistanceFade=1         ; the farthest segments fade into the sky instead of popping in
+; DistanceFadeStart=0.8  ; fade starts at this fraction of the farthest depth (0.8 = last fifth)
+; KeepThinQuads=1        ; draw far one-scanline rows (fixes missing rows of ground and finish line)
+; Widescreen=off         ; off, auto (window aspect) or an even width 320..640 (426 = 16:9)
 
 [TexturePack]
 MaxMiB=1536         ; the full Remacri pack needs about 1025 MiB of VRAM
 Dump=0              ; 1 = save every new texture the game draws to texture-dump/ (to grow the pack)
 ```
 
-With `GpuWorld=1` the game's "Opciones Gráficas y de Sonido" menu gets two On/Off items, labelled in the game's language: widescreen ("Pantalla panorámica") and far view ("Vista lejana": On = `DrawSegments=72` with `DistanceFade=1`, Off = the engine's 48 segments without the fade). Each choice is saved in the registry under `HKCU\SOFTWARE\Electronic Arts\RoadRash 95` (`Widescreen`, `FarView`), overrides the ini from then on, and applies at the next race start.
+`[World]` keys added since v0.1.0 (all need `GpuWorld=1`; every key is documented in `renderer/rr95gpu.ini`):
+
+| Key | Default | What it does |
+|---|---|---|
+| `DrawSegments` | `72` | Road segments drawn ahead. `48` leaves the engine unchanged; `49..72` patch it at race start. 72 is the maximum, because the game streams only 80 segments ahead. Roadside objects and traffic still appear at the original distance. |
+| `DistanceFade` | `1` | `1` = the farthest segments fade into the sky; `0` = drawn as before. |
+| `DistanceFadeStart` | `0.8` | Where the fade starts, as a fraction of the farthest segment's depth (0 to just below 1). |
+| `KeepThinQuads` | `1` | `1` = keep far textured rows that fall on one scanline at 640x480 but still have height at 1080p; `0` = cull them like the software renderer. Needs `SubPixel=1`. |
+| `Widescreen` | `off` | `off` = 4:3; `auto` = width from the window aspect (1920x1080 gives 426); `<n>` = fixed even width 320..640. Needs the game's high-resolution mode. |
+
+### In-game options
+
+With `GpuWorld=1` the game's "Opciones Gráficas y de Sonido" (graphics and sound options) menu has 9 items with wider buttons, including two On/Off items labelled in the game's language:
+
+| Item (English / Spanish) | Registry value | On | Off |
+|---|---|---|---|
+| "Widescreen" / "Pantalla panorámica" | `Widescreen` | `auto` widescreen | 4:3 |
+| "Far view" / "Vista lejana" | `FarView` | `DrawSegments=72` with `DistanceFade=1` | the engine's 48 segments without the fade |
+
+Both values live under `HKCU\SOFTWARE\Electronic Arts\RoadRash 95`. Once a value exists it overrides the matching ini keys; delete it to go back to the ini. Changes apply at the next race start. `KeepThinQuads` is ini-only.
 
 ### Uninstall
 
@@ -183,3 +220,17 @@ Git-ignored local folders: `original/`, `patched/`, `ghidra/`, `ghidra-home/`, `
 - **Pixelated vehicles on a track:** that track's textures are not in the pack yet. Set `Dump=1`, play it, and upscale the new textures (section 5).
 - **`MaxMiB ... reached` in the log:** raise `[TexturePack] MaxMiB` (up to 2048).
 - **The game hangs when the window is closed mid-race:** this is the original game's behaviour too; quit from the menu.
+- **Diagnostic log lines:** with `GpuWorld=1`, `rr95gpu.log` writes `ThinQuads:` (why thin far rows were kept or culled) and `RoadSlices:` (road slices dropped by the engine's horizon rule) every 5 seconds during a race, and `Draw distance: <n> segments for this race` at race start.
+
+## Known issues
+
+- **Missing roadside ground textures on some PCs.** Some players report roadside ground without textures. It has not been reproduced yet and is under investigation. To help, open an issue with:
+  - `rr95gpu.log` from the game folder, after a race where it happened;
+  - your GPU model and driver version;
+  - whether it also happens in software mode: press Scroll Lock in race to switch between the GPU world and the original renderer and compare.
+- **Rare gap in the far ground.** Thin far rows whose 16.16 corners have zero height are still culled, so a gap can very rarely show for a moment.
+
+## Support / Contact
+
+- Twitter/X: [@PagaTeamDev](https://x.com/PagaTeamDev)
+- Donations (Cafecito): [cafecito.app/pagateam](https://cafecito.app/pagateam)
