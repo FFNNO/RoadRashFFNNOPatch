@@ -6,7 +6,8 @@
 </p>
 
 <p align="center">
-  Twitter/X: <a href="https://x.com/PagaTeamDev">@PagaTeamDev</a> &middot; Donations (Cafecito): <a href="https://cafecito.app/pagateam">cafecito.app/pagateam</a>
+  <a href="https://x.com/PagaTeamDev"><img alt="Twitter/X @PagaTeamDev" src="https://img.shields.io/badge/X-%40PagaTeamDev-000000?logo=x&amp;style=for-the-badge"></a>
+  <a href="https://cafecito.app/pagateam"><img alt="Donate on Cafecito" src="https://img.shields.io/badge/Donate-Cafecito-0ea5e9?logo=buymeacoffee&amp;logoColor=white&amp;style=for-the-badge"></a>
 </p>
 
 **Players:** download `RoadRashFFNNOPatch-Setup-<version>.exe` from the [latest release](https://github.com/FFNNO/RoadRashFFNNOPatch/releases/latest). Every release is built by GitHub Actions from the tagged commit and lists the SHA-256 of the setup.
