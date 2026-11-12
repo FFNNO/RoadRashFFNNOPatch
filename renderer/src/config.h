@@ -34,6 +34,8 @@ struct Config {
     bool keepThinQuads = true;  // [World] KeepThinQuads: draw one-scanline textured quads with 16.16 height
     MipFilter mipFilter = MipFilter::Trilinear;
     int anisotropy = 8;         // [World] Anisotropy: 2..16 = anisotropic filtering, 0 or 1 = off
+    bool distanceFade = true;        // [World] DistanceFade: fade the farthest road slices into the sky
+    float distanceFadeStart = 0.8f;  // [World] DistanceFadeStart: fade start as a fraction of the far depth
     WidescreenSetting widescreen;          // [World] Widescreen: off (default) | auto | 320..640 even
     bool invalidWidescreenValue = false;   // the ini value was not understood; widescreen is off
     std::wstring rawWidescreenString;      // the ini value when invalidWidescreenValue
@@ -62,4 +64,6 @@ uint32_t ParseVirtualKey(const wchar_t* str, uint32_t defaultKey = 0x91);
 bool ParseFilterMode(const wchar_t* str, FilterMode& outMode);
 bool ParseMipFilter(const wchar_t* str, MipFilter& outMode);
 int ClampAnisotropy(int value);
+// [World] DistanceFadeStart: a decimal fraction in [0, 1). Anything else sets 0.8 and returns false.
+bool ParseDistanceFadeStart(const wchar_t* str, float& out);
 const char* FilterModeToString(FilterMode mode);

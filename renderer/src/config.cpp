@@ -67,6 +67,21 @@ int ClampAnisotropy(int value) {
     return value;
 }
 
+bool ParseDistanceFadeStart(const wchar_t* str, float& out) {
+    out = 0.8f;
+    const std::wstring s = ToLowerTrimmed(str);
+    if (s.empty()) {
+        return false;
+    }
+    wchar_t* end = nullptr;
+    const float value = std::wcstof(s.c_str(), &end);
+    if (end == s.c_str() || *end != L'\0' || !(value >= 0.0f && value < 1.0f)) {
+        return false;
+    }
+    out = value;
+    return true;
+}
+
 const char* FilterModeToString(FilterMode mode) {
     switch (mode) {
         case FilterMode::Nearest:       return "nearest";
@@ -163,6 +178,13 @@ void ParseConfigFile(const std::wstring& iniFilePath, Config& cfg) {
 
     const INT aniso = static_cast<INT>(GetPrivateProfileIntW(L"World", L"Anisotropy", 8, iniFilePath.c_str()));
     cfg.anisotropy = ClampAnisotropy(aniso);
+
+    UINT distanceFadeVal = GetPrivateProfileIntW(L"World", L"DistanceFade", 1, iniFilePath.c_str());
+    cfg.distanceFade = (distanceFadeVal != 0);
+
+    wchar_t fadeStartBuf[64] = {0};
+    GetPrivateProfileStringW(L"World", L"DistanceFadeStart", L"0.8", fadeStartBuf, 64, iniFilePath.c_str());
+    ParseDistanceFadeStart(fadeStartBuf, cfg.distanceFadeStart);
 
     wchar_t widescreenBuf[64] = {0};
     GetPrivateProfileStringW(L"World", L"Widescreen", L"off", widescreenBuf, 64, iniFilePath.c_str());

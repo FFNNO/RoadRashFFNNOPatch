@@ -76,6 +76,12 @@ constexpr uint32_t kVaFamilySlots       = 0x00603740;
 constexpr uint32_t kVaVertsInt16        = 0x00618580;
 constexpr uint32_t kVaActiveMipPtr      = 0x006185a4;
 constexpr uint32_t kVaCurrentPoly       = 0x006185e0;
+// Distance fade (D1): polygon buffer pointer DAT_005ce844 (heap, 250 x 0xA8, allocated at startup),
+// its write cursor DAT_005ce84c, road slices DAT_0060bd00 and their count DAT_0059ec90.
+constexpr uint32_t kVaPolyBufferBase    = 0x005ce844;
+constexpr uint32_t kVaPolyBufferCursor  = 0x005ce84c;
+constexpr uint32_t kVaRoadSliceArray    = 0x0060bd00;
+constexpr uint32_t kVaRoadSliceCountVar = 0x0059ec90;
 
 HMODULE g_hostModule = nullptr;
 // Heap-owning globals in this file are leaked on purpose (never destroyed), like the presenter and
@@ -99,6 +105,11 @@ bool g_dumpTriggeredCheckedThisFrame = false;
 ThinQuadFrameCounts g_thinQuadFrame;
 bool g_thinQuadFrameActive = false;
 ThinQuadStats g_thinQuadStats;
+
+// Distance fade (D1): slot tags of the polygon buffer and the far reference. Game thread only.
+bool g_distanceFadeHooks = false;
+DepthTagState g_depthTags;
+float g_distanceFadeFarZ = 0.0f;
 
 bool g_horizonCapturedThisFrame = false;
 int32_t g_horizonHeight = 360;
@@ -475,6 +486,9 @@ bool WriteFrameJson(const std::wstring& path, uint32_t frameNum, int width, int 
 
 }  // namespace
 
+// Distance fade (D1), defined with the other engine-side fade functions below.
+static int32_t DepthOfPoly(const uint8_t* poly);
+
 CacheInvalidation DecideCacheInvalidation(bool levelChanged, uint32_t batchIndex) {
     if (!levelChanged) {
         return CacheInvalidation::None;
@@ -730,6 +744,100 @@ void AccumulateRoadSliceSample(RoadSliceStats& stats, const RoadSliceFrameSample
             stats.minNearestDropped = sample.nearestDropped;
         }
     }
+}
+
+int32_t PolyBufferIndex(uintptr_t entry, uintptr_t base, bool allowEnd) {
+    if (base == 0 || entry < base) {
+        return -1;
+    }
+    const uintptr_t offset = entry - base;
+    if (offset % kPolyEntrySize != 0) {
+        return -1;
+    }
+    const uintptr_t index = offset / kPolyEntrySize;
+    const uintptr_t limit = allowEnd ? kPolyBufferEntries : kPolyBufferEntries - 1;
+    return index <= limit ? static_cast<int32_t>(index) : -1;
+}
+
+void DepthTagFill(DepthTagState& s, int32_t cursorIndex) {
+    if (cursorIndex < 0 || cursorIndex > static_cast<int32_t>(kPolyBufferEntries)) {
+        return;
+    }
+    const uint32_t cursor = static_cast<uint32_t>(cursorIndex);
+    if (cursor < s.lastTagged) {
+        s.lastTagged = 0;
+    }
+    for (uint32_t i = s.lastTagged; i < cursor; ++i) {
+        s.tags[i] = s.currentZ;
+    }
+    s.lastTagged = cursor;
+}
+
+void DepthTagBeginSlice(DepthTagState& s, int32_t cursorIndex, int32_t z) {
+    DepthTagFill(s, cursorIndex);
+    s.currentZ = z > 0 ? z : kNoDepth;
+    s.frameMaxZ = std::max(s.frameMaxZ, s.currentZ);
+}
+
+void DepthTagEndSlice(DepthTagState& s, int32_t cursorIndex) {
+    DepthTagFill(s, cursorIndex);
+    s.currentZ = kNoDepth;
+}
+
+void DepthTagFlushEnd(DepthTagState& s) {
+    s.lastTagged = 0;
+}
+
+void DepthTagEndFrame(DepthTagState& s) {
+    s.frameMaxZ = 0;
+    s.currentZ = kNoDepth;
+}
+
+int32_t DepthTagLookup(const DepthTagState& s, int32_t entryIndex) {
+    if (entryIndex < 0 || entryIndex >= static_cast<int32_t>(kPolyBufferEntries)) {
+        return kNoDepth;
+    }
+    return s.tags[entryIndex];
+}
+
+int32_t ReadRoadSliceDepth(const uint8_t* slice, const uint8_t* sliceArray, int32_t count) {
+    if (!slice || !sliceArray || count < 1 || count > kRoadSliceMaxCount || slice < sliceArray) {
+        return kNoDepth;
+    }
+    const uintptr_t offset = static_cast<uintptr_t>(slice - sliceArray);
+    if (offset % kRoadSliceStride != 0 || offset / kRoadSliceStride >= static_cast<uintptr_t>(count)) {
+        return kNoDepth;
+    }
+    uint32_t rowAddr = 0;
+    std::memcpy(&rowAddr, slice + kRoadSliceRowPtrOffset, sizeof(rowAddr));
+    // Rows sit inline in the slices; the array holds kRoadSliceMaxCount + 1 slices.
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(sliceArray);
+    const uintptr_t hi = lo + static_cast<uintptr_t>(kRoadSliceMaxCount + 1) * kRoadSliceStride;
+    if (rowAddr < lo || static_cast<uintptr_t>(rowAddr) + kRoadRowDepthOffset + sizeof(int32_t) > hi) {
+        return kNoDepth;
+    }
+    int32_t z = 0;
+    std::memcpy(&z, reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(rowAddr)) + kRoadRowDepthOffset, sizeof(z));
+    return z > 0 ? z : kNoDepth;
+}
+
+float DistanceFadeFactor(int32_t z, float farZ, float startFraction, bool enabled) {
+    if (!enabled || z <= 0 || !(farZ > 0.0f)) {
+        return 0.0f;
+    }
+    const float fz = static_cast<float>(z);
+    if (fz >= farZ) {
+        return 1.0f;
+    }
+    const float start = farZ * startFraction;
+    if (fz <= start) {
+        return 0.0f;
+    }
+    return (fz - start) / (farZ - start);
+}
+
+float UpdateDistanceFadeFarZ(float previous, int32_t frameMaxZ) {
+    return std::max(static_cast<float>(std::max(frameMaxZ, 0)), previous * kDistanceFadeFarZDecay);
 }
 
 bool ShouldCullFlatQuad(const CapturedVertex verts[4],
@@ -1392,6 +1500,7 @@ int CaptureTexturedQuadBefore() {
     q.drawOrder = slot;
     q.batchIndex = g_batchIndex;
     q.kind = QuadKind::Textured;
+    q.depthZ = DepthOfPoly(poly);
     q.culled = false;
     q.ccbFlags = *reinterpret_cast<const uint32_t*>(ccb + 0x00);
     q.uFlip = *(poly + 0x3d);
@@ -1589,6 +1698,7 @@ int CaptureFlatQuadBefore(const int32_t* polyVerts, int edxArg) {
     q.drawOrder = slot;
     q.batchIndex = g_batchIndex;
     q.kind = QuadKind::Flat;
+    q.depthZ = DepthOfPoly(poly);
     q.culled = false;
     q.chosenMip = -1;
     q.ccbFlags = *reinterpret_cast<const uint32_t*>(ccb + 0x00);
@@ -1704,6 +1814,68 @@ void CaptureOnRacePresent(const uint8_t* surface, int pitch, const uint8_t* pale
     }
 }
 
+// Write cursor of the polygon buffer as an entry index (0..250), or -1 when unreadable.
+static int32_t PolyBufferCursorIndex() {
+    if (!g_distanceFadeHooks || !g_hostModule) {
+        return -1;
+    }
+    const uintptr_t base = *GlobalPtr<const uintptr_t>(kVaPolyBufferBase);
+    const uintptr_t cursor = *GlobalPtr<const uintptr_t>(kVaPolyBufferCursor);
+    return PolyBufferIndex(cursor, base, true);
+}
+
+// Slice depth of the polygon-buffer entry a captured quad came from (poly = entry + 0x68).
+static int32_t DepthOfPoly(const uint8_t* poly) {
+    if (!g_distanceFadeHooks || !g_hostModule || !poly) {
+        return kNoDepth;
+    }
+    const uintptr_t base = *GlobalPtr<const uintptr_t>(kVaPolyBufferBase);
+    return DepthTagLookup(g_depthTags, PolyBufferIndex(reinterpret_cast<uintptr_t>(poly) - 0x68, base, false));
+}
+
+void CaptureSetDistanceFadeHooks(bool installed) {
+    g_distanceFadeHooks = installed;
+    g_depthTags = DepthTagState{};
+    g_distanceFadeFarZ = 0.0f;
+}
+
+void CaptureDepthBeginSlice(const uint8_t* slice) {
+    if (!g_distanceFadeHooks || !g_hostModule) {
+        return;
+    }
+    const int32_t count = *GlobalPtr<const int32_t>(kVaRoadSliceCountVar);
+    const int32_t z = ReadRoadSliceDepth(slice, GlobalPtr<const uint8_t>(kVaRoadSliceArray), count);
+    DepthTagBeginSlice(g_depthTags, PolyBufferCursorIndex(), z);
+}
+
+void CaptureDepthEndSlice() {
+    if (!g_distanceFadeHooks) {
+        return;
+    }
+    DepthTagEndSlice(g_depthTags, PolyBufferCursorIndex());
+}
+
+void CaptureDepthOnFlushStart() {
+    if (!g_distanceFadeHooks) {
+        return;
+    }
+    DepthTagFill(g_depthTags, PolyBufferCursorIndex());
+}
+
+void CaptureDepthOnFlushEnd() {
+    if (!g_distanceFadeHooks) {
+        return;
+    }
+    DepthTagFlushEnd(g_depthTags);
+}
+
+float CaptureGetDistanceFadeFarZ() {
+    if (!g_distanceFadeHooks) {
+        return 0.0f;
+    }
+    return UpdateDistanceFadeFarZ(g_distanceFadeFarZ, g_depthTags.frameMaxZ);
+}
+
 ThinQuadStats CaptureTakeThinQuadStats() {
     const ThinQuadStats out = g_thinQuadStats;
     g_thinQuadStats = ThinQuadStats{};
@@ -1711,6 +1883,10 @@ ThinQuadStats CaptureTakeThinQuadStats() {
 }
 
 void CaptureEndFrame() {
+    if (g_distanceFadeHooks) {
+        g_distanceFadeFarZ = UpdateDistanceFadeFarZ(g_distanceFadeFarZ, g_depthTags.frameMaxZ);
+        DepthTagEndFrame(g_depthTags);
+    }
     if (g_thinQuadFrameActive) {
         AccumulateThinQuadFrame(g_thinQuadStats, g_thinQuadFrame);
         g_thinQuadFrame = ThinQuadFrameCounts{};

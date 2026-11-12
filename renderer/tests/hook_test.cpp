@@ -1436,6 +1436,126 @@ int main() {
               "slice flag totals over frames");
     }
 
+    // 13c. Distance fade (D1): polygon-buffer slot tagging, slice depth, fade mapping, config, sites.
+    {
+        const uintptr_t base = 0x01000000u;
+        Check(PolyBufferIndex(base, base, false) == 0 && PolyBufferIndex(base + 3 * kPolyEntrySize, base, false) == 3 &&
+                  PolyBufferIndex(base + 249 * kPolyEntrySize, base, false) == 249,
+              "poly buffer index of entries 0, 3 and 249");
+        Check(PolyBufferIndex(base + 250 * kPolyEntrySize, base, false) == -1 &&
+                  PolyBufferIndex(base + 250 * kPolyEntrySize, base, true) == 250,
+              "the write cursor may sit one past the last entry, an entry may not");
+        Check(PolyBufferIndex(base + 251 * kPolyEntrySize, base, true) == -1 && PolyBufferIndex(base - kPolyEntrySize, base, true) == -1 &&
+                  PolyBufferIndex(base + 5, base, true) == -1 && PolyBufferIndex(base, 0, true) == -1,
+              "poly buffer index: outside, misaligned or null base is -1");
+
+        DepthTagState ds;
+        DepthTagBeginSlice(ds, 0, 5000);                 // farthest slice starts with an empty buffer
+        DepthTagBeginSlice(ds, 3, 4000);                 // entries 0..2 came from the slice at z 5000
+        DepthTagEndSlice(ds, 5);                         // entries 3..4 from the slice at z 4000
+        DepthTagFill(ds, 7);                             // entries 5..6 outside slice drawing (bikes)
+        Check(DepthTagLookup(ds, 0) == 5000 && DepthTagLookup(ds, 2) == 5000 && DepthTagLookup(ds, 3) == 4000 &&
+                  DepthTagLookup(ds, 4) == 4000 && DepthTagLookup(ds, 5) == kNoDepth && DepthTagLookup(ds, 6) == kNoDepth,
+              "slot tags follow the slice switches; entries outside slices have no depth");
+        Check(ds.frameMaxZ == 5000, "the farthest slice depth of the frame is tracked");
+        Check(DepthTagLookup(ds, -1) == kNoDepth && DepthTagLookup(ds, 250) == kNoDepth,
+              "out-of-range entries have no depth");
+        DepthTagFlushEnd(ds);
+        Check(ds.lastTagged == 0, "a flush restarts tagging at entry 0");
+
+        DepthTagState mid;
+        DepthTagBeginSlice(mid, 0, 3000);
+        DepthTagFill(mid, 250);                          // buffer full: flushed inside the slice
+        Check(DepthTagLookup(mid, 0) == 3000 && DepthTagLookup(mid, 249) == 3000,
+              "a mid-slice flush tags every pending entry with the current slice");
+        DepthTagFlushEnd(mid);
+        DepthTagEndSlice(mid, 10);
+        Check(DepthTagLookup(mid, 0) == 3000 && DepthTagLookup(mid, 9) == 3000 && mid.currentZ == kNoDepth,
+              "entries written after a mid-slice flush keep the slice depth");
+
+        DepthTagState wrap;
+        DepthTagBeginSlice(wrap, 0, 2000);
+        DepthTagFill(wrap, 100);
+        DepthTagBeginSlice(wrap, 20, 1500);              // cursor went back without a seen flush
+        Check(DepthTagLookup(wrap, 0) == 2000 && DepthTagLookup(wrap, 19) == 2000 && wrap.lastTagged == 20,
+              "a cursor below the last tagged entry restarts tagging at entry 0");
+        DepthTagFill(wrap, -1);
+        Check(wrap.lastTagged == 20, "an invalid cursor tags nothing");
+        DepthTagBeginSlice(wrap, 20, kNoDepth);
+        Check(wrap.currentZ == kNoDepth && DepthTagLookup(wrap, 19) == 2000, "a slice without depth tags no depth");
+        DepthTagEndFrame(wrap);
+        Check(wrap.frameMaxZ == 0 && wrap.currentZ == kNoDepth, "frame end clears the frame maximum");
+
+        // Slice depth from a fake slice array: slice+0x14 points to an inline row, row+0x18 = z.
+        std::vector<uint8_t> slices(static_cast<size_t>(kRoadSliceMaxCount + 1) * kRoadSliceStride, 0);
+        uint8_t* arr = slices.data();
+        auto setRow = [&](int index, uintptr_t rowAddr, int32_t z) {
+            uint8_t* s = arr + static_cast<size_t>(index) * kRoadSliceStride;
+            const uint32_t addr32 = static_cast<uint32_t>(rowAddr);
+            std::memcpy(s + kRoadSliceRowPtrOffset, &addr32, 4);
+            if (rowAddr >= reinterpret_cast<uintptr_t>(arr) && rowAddr + kRoadRowDepthOffset + 4 <= reinterpret_cast<uintptr_t>(arr) + slices.size()) {
+                std::memcpy(reinterpret_cast<uint8_t*>(rowAddr) + kRoadRowDepthOffset, &z, 4);
+            }
+        };
+        uint8_t* slice2 = arr + 2 * kRoadSliceStride;
+        setRow(2, reinterpret_cast<uintptr_t>(slice2 + 0x1C), 7000);
+        Check(ReadRoadSliceDepth(slice2, arr, 10) == 7000, "slice depth read through the row pointer");
+        Check(ReadRoadSliceDepth(slice2, arr, 2) == kNoDepth && ReadRoadSliceDepth(slice2, arr, 0) == kNoDepth &&
+                  ReadRoadSliceDepth(slice2, arr, kRoadSliceMaxCount + 1) == kNoDepth,
+              "a slice past the count, or an out-of-range count, has no depth");
+        Check(ReadRoadSliceDepth(slice2 + 4, arr, 10) == kNoDepth && ReadRoadSliceDepth(nullptr, arr, 10) == kNoDepth &&
+                  ReadRoadSliceDepth(slice2, nullptr, 10) == kNoDepth,
+              "a misaligned or null slice has no depth");
+        setRow(3, 0x00001000u, 7000);
+        Check(ReadRoadSliceDepth(arr + 3 * kRoadSliceStride, arr, 10) == kNoDepth,
+              "a row pointer outside the slice array has no depth");
+        setRow(4, reinterpret_cast<uintptr_t>(arr + 4 * kRoadSliceStride + 0x120), -5);
+        Check(ReadRoadSliceDepth(arr + 4 * kRoadSliceStride, arr, 10) == kNoDepth, "a non-positive z has no depth");
+
+        // Fade mapping: 0 = unfaded, 1 = fully the backdrop.
+        Check(DistanceFadeFactor(9000, 10000.0f, 0.8f, false) == 0.0f, "fade disabled: no fade");
+        Check(DistanceFadeFactor(kNoDepth, 10000.0f, 0.8f, true) == 0.0f && DistanceFadeFactor(-3, 10000.0f, 0.8f, true) == 0.0f,
+              "quads without depth are never faded");
+        Check(DistanceFadeFactor(9000, 0.0f, 0.8f, true) == 0.0f, "no far reference: no fade");
+        Check(DistanceFadeFactor(8000, 10000.0f, 0.8f, true) == 0.0f && DistanceFadeFactor(4000, 10000.0f, 0.8f, true) == 0.0f,
+              "nearer than the start: no fade");
+        Check(std::fabs(DistanceFadeFactor(9000, 10000.0f, 0.8f, true) - 0.5f) < 1e-6f, "halfway between start and end");
+        Check(DistanceFadeFactor(10000, 10000.0f, 0.8f, true) == 1.0f && DistanceFadeFactor(12000, 10000.0f, 0.8f, true) == 1.0f,
+              "at or past the farthest row: fully faded");
+        Check(std::fabs(UpdateDistanceFadeFarZ(10000.0f, 9000) - 10000.0f * kDistanceFadeFarZDecay) < 1e-3f &&
+                  UpdateDistanceFadeFarZ(10000.0f, 12000) == 12000.0f &&
+                  UpdateDistanceFadeFarZ(10000.0f, 0) == 10000.0f * kDistanceFadeFarZDecay &&
+                  UpdateDistanceFadeFarZ(0.0f, 0) == 0.0f,
+              "far reference holds the peak and decays slowly");
+
+        // Config.
+        Check(Config{}.distanceFade && Config{}.distanceFadeStart == 0.8f, "defaults: DistanceFade=1, DistanceFadeStart=0.8");
+        float fs = 0.0f;
+        Check(ParseDistanceFadeStart(L"0.6", fs) && fs == 0.6f && ParseDistanceFadeStart(L" 0 ", fs) && fs == 0.0f,
+              "DistanceFadeStart accepts fractions in [0, 1)");
+        Check(!ParseDistanceFadeStart(L"1", fs) && fs == 0.8f && !ParseDistanceFadeStart(L"-0.1", fs) && fs == 0.8f &&
+                  !ParseDistanceFadeStart(L"abc", fs) && fs == 0.8f && !ParseDistanceFadeStart(L"0.5x", fs) && fs == 0.8f &&
+                  !ParseDistanceFadeStart(L"", fs) && fs == 0.8f,
+              "DistanceFadeStart falls back to 0.8 on values outside [0, 1) or garbage");
+        const std::wstring ini = MakeTestTempPath(L"rr95_fade_cfg_") + L".ini";
+        WritePrivateProfileStringW(L"World", L"DistanceFade", L"0", ini.c_str());
+        WritePrivateProfileStringW(L"World", L"DistanceFadeStart", L"0.65", ini.c_str());
+        Config parsed;
+        ParseConfigFile(ini, parsed);
+        Check(!parsed.distanceFade && parsed.distanceFadeStart == 0.65f, "[World] DistanceFade and DistanceFadeStart parsed");
+        DeleteFileW(ini.c_str());
+
+        // Hook sites FUN_0045a790 / FUN_0045a870 share their first instruction:
+        // 69 05 90 ec 59 00 24 02 00 00  imul eax, dword ptr [0x0059ec90], 0x224 (absolute operand at 2).
+        rr95::HookSite sliceSite{"slice", 0, {0x69, 0x05, 0x90, 0xEC, 0x59, 0x00, 0x24, 0x02, 0x00, 0x00}, 10, {10},
+                                 nullptr, nullptr, false, {2}};
+        Check(rr95::ValidateHookDecoding(sliceSite) == nullptr, "slice draw hook site decodes");
+        uint8_t reloc[16] = {};
+        rr95::BuildRelocatedExpected(sliceSite, 0x10000, reloc);
+        Check(reloc[2] == 0x90 && reloc[3] == 0xEC && reloc[4] == 0x5A && reloc[5] == 0x00 && reloc[6] == 0x24,
+              "slice draw hook site: the count operand is rebased, the immediate is not");
+    }
+
     // 14. Blended mipmaps (T6): config, engine mip chain cache, atlas level limit, analytic gradients.
     {
         char what[256];

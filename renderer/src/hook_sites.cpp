@@ -65,6 +65,9 @@ using FUN_0042e850_Fn = void(__cdecl*)();
 using FUN_00467cb0_Fn = void(__fastcall*)(int* polyVerts, int edxArg);
 using FUN_00457ef0_Fn = void(__cdecl*)();
 using FUN_0045b930_Fn = const char*(__fastcall*)(void* item);
+// Road slice draws (distance fade D1): ECX = slice; EDX is passed through unchanged.
+using FUN_0045a790_Fn = void(__fastcall*)(uint8_t* slice, int edxArg);
+using FUN_0045a870_Fn = void(__fastcall*)(uint8_t* slice, int edxArg);
 
 FUN_0046e630_Fn g_orig_FUN_0046e630 = nullptr;
 FUN_0046ded0_Fn g_orig_FUN_0046ded0 = nullptr;
@@ -74,6 +77,8 @@ FUN_0042e850_Fn g_orig_FUN_0042e850 = nullptr;
 FUN_00467cb0_Fn g_orig_FUN_00467cb0 = nullptr;
 FUN_00457ef0_Fn g_orig_FUN_00457ef0 = nullptr;
 FUN_0045b930_Fn g_orig_FUN_0045b930 = nullptr;
+FUN_0045a790_Fn g_orig_FUN_0045a790 = nullptr;
+FUN_0045a870_Fn g_orig_FUN_0045a870 = nullptr;
 
 // FUN_004688e0, FUN_0042e850 and FUN_00467cb0 are all hooked; widescreen depends on it, because
 // those detours are what keep the software world rasterizers from running.
@@ -592,11 +597,16 @@ void __fastcall Detour_FUN_00460b00(char windowed) {
 }
 
 uint32_t __cdecl Detour_FUN_004688e0() {
+    // Distance fade: the entries this flush draws get their slice depth before it reads them, and
+    // tagging restarts at entry 0 afterwards (the caller resets the write cursor).
+    CaptureDepthOnFlushStart();
     if (!GetConfig().captureEnabled && !GetConfig().gpuWorld && !CaptureSoftwareWorldWritesForbidden()) {
+        uint32_t res = 1;
         if (g_orig_FUN_004688e0) {
-            return g_orig_FUN_004688e0();
+            res = g_orig_FUN_004688e0();
         }
-        return 1;
+        CaptureDepthOnFlushEnd();
+        return res;
     }
     CaptureOnBatchStart();
     uint32_t res = 1;
@@ -604,7 +614,26 @@ uint32_t __cdecl Detour_FUN_004688e0() {
         res = g_orig_FUN_004688e0();
     }
     CaptureOnBatchEnd();
+    CaptureDepthOnFlushEnd();
     return res;
+}
+
+// Distance fade (D1): FUN_0045ac50 calls these once per road slice, far to near. Everything the
+// slice queues into the polygon buffer between entry and return is tagged with its depth.
+void __fastcall Detour_FUN_0045a790(uint8_t* slice, int edxArg) {
+    CaptureDepthBeginSlice(slice);
+    if (g_orig_FUN_0045a790) {
+        g_orig_FUN_0045a790(slice, edxArg);
+    }
+    CaptureDepthEndSlice();
+}
+
+void __fastcall Detour_FUN_0045a870(uint8_t* slice, int edxArg) {
+    CaptureDepthBeginSlice(slice);
+    if (g_orig_FUN_0045a870) {
+        g_orig_FUN_0045a870(slice, edxArg);
+    }
+    CaptureDepthEndSlice();
 }
 
 void __cdecl Detour_FUN_0042e850() {
@@ -940,6 +969,55 @@ static rr95::HookSite g_site_FUN_0045b930{
     false
 };
 
+// First 10 bytes at 0x0045a790 (slice ground draw) and at 0x0045a870 (slice object draw) in both
+// original and patched exes:
+// 69 05 90 ec 59 00 24 02 00 00   imul eax, dword ptr ds:[0x0059ec90], 0x224   (10 bytes)
+// The slice count operand at offset 2 is an absolute address the loader relocates; InstallHook
+// rebases it before comparing. Both are __fastcall with the slice in ECX.
+static rr95::HookSite g_site_FUN_0045a790{
+    "FUN_0045a790",
+    0x0045a790,
+    {0x69, 0x05, 0x90, 0xEC, 0x59, 0x00, 0x24, 0x02, 0x00, 0x00},
+    10,
+    {10},
+    reinterpret_cast<void*>(&Detour_FUN_0045a790),
+    reinterpret_cast<void**>(&g_orig_FUN_0045a790),
+    false,
+    {2}
+};
+
+static rr95::HookSite g_site_FUN_0045a870{
+    "FUN_0045a870",
+    0x0045a870,
+    {0x69, 0x05, 0x90, 0xEC, 0x59, 0x00, 0x24, 0x02, 0x00, 0x00},
+    10,
+    {10},
+    reinterpret_cast<void*>(&Detour_FUN_0045a870),
+    reinterpret_cast<void**>(&g_orig_FUN_0045a870),
+    false,
+    {2}
+};
+
+// Distance fade needs both slice draw hooks; without them no quad carries a depth and nothing fades.
+static void InstallDistanceFadeHooks() {
+    if (!GetConfig().distanceFade) {
+        LOG_INFO("[World] DistanceFade=0: farthest road slices are not faded");
+        return;
+    }
+    if (!rr95::InstallHook(g_site_FUN_0045a790, g_hostModule)) {
+        LOG_WARN("Failed to install slice draw hook on FUN_0045a790; distance fade unavailable");
+        return;
+    }
+    if (!rr95::InstallHook(g_site_FUN_0045a870, g_hostModule)) {
+        LOG_WARN("Failed to install slice draw hook on FUN_0045a870; distance fade unavailable");
+        rr95::RemoveHook(g_site_FUN_0045a790, g_hostModule);
+        return;
+    }
+    CaptureSetDistanceFadeHooks(true);
+    LOG_INFO("[World] DistanceFade=1 (start at %.2f of the far depth): slice draw hooks installed",
+             static_cast<double>(GetConfig().distanceFadeStart));
+}
+
 // Copies bytes [4, kMenuItemSize) of each slot (never the HWND dword the engine owns), slot 5 and 6
 // before slot 4 so slot 4 never leads to a half-written item.
 static void WriteGraphicsMenuSlots(uint8_t* slots, const uint8_t* bytes) {
@@ -1104,6 +1182,7 @@ bool InstallHooks(ExeBuild build) {
         } else {
             g_worldHooksInstalled = true;
             LOG_INFO("Capture/world hooks on FUN_004688e0, FUN_0042e850, and FUN_00467cb0 installed");
+            InstallDistanceFadeHooks();
         }
     }
 
@@ -1153,6 +1232,9 @@ void RemoveHooks() {
     RemoveWidescreenMenuItem(hostModule);
     rr95::RemoveHook(g_site_FUN_00457ef0, hostModule);
     g_worldHooksInstalled = false;
+    CaptureSetDistanceFadeHooks(false);
+    rr95::RemoveHook(g_site_FUN_0045a870, hostModule);
+    rr95::RemoveHook(g_site_FUN_0045a790, hostModule);
     rr95::RemoveHook(g_site_FUN_00467cb0, hostModule);
     rr95::RemoveHook(g_site_FUN_0042e850, hostModule);
     rr95::RemoveHook(g_site_FUN_004688e0, hostModule);
@@ -1162,6 +1244,8 @@ void RemoveHooks() {
     g_orig_FUN_0043f580 = nullptr;
     g_orig_FUN_0043f7c0 = nullptr;
     g_orig_FUN_00457ef0 = nullptr;
+    g_orig_FUN_0045a870 = nullptr;
+    g_orig_FUN_0045a790 = nullptr;
     g_orig_FUN_00467cb0 = nullptr;
     g_orig_FUN_0042e850 = nullptr;
     g_orig_FUN_004688e0 = nullptr;

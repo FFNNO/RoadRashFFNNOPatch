@@ -67,6 +67,7 @@ struct CapturedQuad {
     int32_t snappedPreFix[8];
     int32_t snapShift;   // DAT_005aaa14 at capture time (pixel = corner / 2^snapShift)
     uint32_t snapMask;   // DAT_005aaa18 at capture time
+    int32_t depthZ;      // slice depth of the polygon-buffer entry (distance fade), kNoDepth if none
     CapturedVertex verts[4];
 };
 
@@ -226,6 +227,49 @@ struct RoadSliceStats {
 };
 void AccumulateRoadSliceSample(RoadSliceStats& stats, const RoadSliceFrameSample& sample);
 
+// Distance fade (D1). FUN_0045ac50 draws the road slices far to near: FUN_0045a790(slice) queues
+// one slice's ground and FUN_0045a870(slice) its objects into the polygon buffer DAT_005ce844
+// (250 entries of 0xA8 bytes, write cursor DAT_005ce84c), which FUN_004227f0 flushes through
+// FUN_004688e0 when it is full (also inside a slice) and FUN_0046c7c0 at the end of the frame.
+// Each entry is tagged with the depth of the slice that was being drawn when it was written: on
+// every slice switch and at the start of every flush, the entries written since the last tag
+// point get the current depth; a flush restarts tagging at entry 0. Entries written outside
+// slice drawing (bikes and sprites from FUN_0045d290) get kNoDepth and are never faded.
+inline constexpr uint32_t kPolyBufferEntries = 250;
+inline constexpr uint32_t kPolyEntrySize = 0xA8;
+inline constexpr uint32_t kRoadSliceRowPtrOffset = 0x14;  // slice+0x14: pointer to an inline row
+inline constexpr uint32_t kRoadRowDepthOffset = 0x18;     // row+0x18: camera depth z (+0x100 per row)
+inline constexpr int32_t kNoDepth = 0;
+// Per-frame decay of the far reference (peak hold), so the newest slice enters at full fade
+// instead of shifting every other slice's fade by one slice when it appears.
+inline constexpr float kDistanceFadeFarZDecay = 0.995f;
+
+// Index of the polygon-buffer entry at address entry (base = *DAT_005ce844), or -1 when outside,
+// misaligned or base is 0. allowEnd accepts index 250 (the write cursor after the last entry).
+int32_t PolyBufferIndex(uintptr_t entry, uintptr_t base, bool allowEnd);
+
+struct DepthTagState {
+    int32_t tags[kPolyBufferEntries] = {};
+    uint32_t lastTagged = 0;     // entries below this index carry their tag
+    int32_t currentZ = kNoDepth; // depth of the slice being drawn
+    int32_t frameMaxZ = 0;       // farthest slice depth seen this frame
+};
+// Tags entries [lastTagged, cursorIndex) with currentZ. A cursor below lastTagged (the buffer was
+// reset without a seen flush) restarts at entry 0; a negative cursor tags nothing.
+void DepthTagFill(DepthTagState& s, int32_t cursorIndex);
+void DepthTagBeginSlice(DepthTagState& s, int32_t cursorIndex, int32_t z);
+void DepthTagEndSlice(DepthTagState& s, int32_t cursorIndex);
+void DepthTagFlushEnd(DepthTagState& s);
+void DepthTagEndFrame(DepthTagState& s);
+int32_t DepthTagLookup(const DepthTagState& s, int32_t entryIndex);
+// Depth of a slice (z of the row slice+0x14 points to), or kNoDepth unless count is in
+// [1, kRoadSliceMaxCount], slice is one of slices 0..count-1 of sliceArray (the engine draws only
+// those) and the row lies inside the slice array.
+int32_t ReadRoadSliceDepth(const uint8_t* slice, const uint8_t* sliceArray, int32_t count);
+// 0 = drawn as is, 1 = fully the backdrop: linear from startFraction * farZ to farZ.
+float DistanceFadeFactor(int32_t z, float farZ, float startFraction, bool enabled);
+float UpdateDistanceFadeFarZ(float previous, int32_t frameMaxZ);
+
 void CaptureInit(HMODULE hostModule, const std::wstring& dumpDir);
 void CaptureInvalidateCache();
 void CaptureOnBatchStart();
@@ -236,6 +280,15 @@ int CaptureFlatQuadBefore(const int32_t* polyVerts, int edxArg);
 // rasterizerSkipped must be the decision the detour used for this call (the original
 // FUN_00467cb0 did not run), so the emulated prologue never runs on top of the original one.
 void CaptureFlatQuadAfter(int slotIndex, int32_t* polyVerts, bool rasterizerSkipped);
+// Distance fade engine side (hook_sites.cpp). Nothing is read from the engine until the slice
+// draw hooks report installed.
+void CaptureSetDistanceFadeHooks(bool installed);
+void CaptureDepthBeginSlice(const uint8_t* slice);
+void CaptureDepthEndSlice();
+void CaptureDepthOnFlushStart();
+void CaptureDepthOnFlushEnd();
+// Far reference for this frame (0 when the hooks are not installed or no slice was seen).
+float CaptureGetDistanceFadeFarZ();
 void CaptureOnRacePresent(const uint8_t* surface, int pitch, const uint8_t* palette, int width, int height);
 void CaptureEndFrame();
 CaptureFrameCounters CaptureGetFrameCounters();

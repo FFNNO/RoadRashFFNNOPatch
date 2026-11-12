@@ -334,7 +334,8 @@ cbuffer WorldCB : register(b0) {
     float2 dstSize;
     uint filterMode;
     uint useBgra;
-    float2 pad;
+    float distanceFadeOn;   // 1 = alpha carries the distance fade (blended over the horizon layer)
+    float pad1;
     float4 replacementFade;
 };
 
@@ -381,9 +382,15 @@ float4 SampleAtlas(float2 uv, float2 gx, float2 gy, float4 texInfo, float4 box) 
 //          trilinear/anisotropic sampler; 2 = atlas cell, per-level clamped trilinear.
 // flags.z: 1 = texture pack replacement. Originals are converted through the current palette and
 //          already fade; replacements are fixed full-brightness RGBA, so they get replacementFade.
+// flags.w: distance fade, 0 = drawn as is, 1 = fully the horizon layer underneath. Only used when
+//          distanceFadeOn; the output alpha is then 1 - flags.w for every quad.
 float4 main(PSIn p) : SV_Target {
     if (p.flags.x > 0.5) {
-        return p.color;
+        float4 flat = p.color;
+        if (distanceFadeOn > 0.5) {
+            flat.a = 1.0 - p.flags.w;
+        }
+        return flat;
     }
 
     float curX = p.pos.x * (srcSize.x / dstSize.x);
@@ -422,7 +429,11 @@ float4 main(PSIn p) : SV_Target {
     if (p.flags.z > 0.5) {
         texel.rgb *= replacementFade.rgb;
     }
-    return texel * p.color;
+    float4 outColor = texel * p.color;
+    if (distanceFadeOn > 0.5) {
+        outColor.a = 1.0 - p.flags.w;
+    }
+    return outColor;
 }
 )";
 
@@ -655,6 +666,7 @@ public:
         m_samplerAtlas.Reset();
         m_rasterScissor.Reset();
         m_blendAlpha.Reset();
+        m_blendWorldFade.Reset();
         m_worldVB.Reset();
         m_worldInputLayout.Reset();
         m_layerPS.Reset();
@@ -1078,6 +1090,16 @@ private:
         if (FAILED(hr)) {
             LOG_ERROR("CreateBlendState failed: 0x%08lX", static_cast<unsigned long>(hr));
             return false;
+        }
+        // Distance fade: world quads blend over the horizon layer already in the world target by their
+        // alpha (1 - fade); the target's own alpha is kept. Without it the fade is off, not the GPU path.
+        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO;
+        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+        hr = m_device->CreateBlendState(&bd, &m_blendWorldFade);
+        if (FAILED(hr)) {
+            LOG_WARN("CreateBlendState(world distance fade) failed: 0x%08lX; distance fade off",
+                     static_cast<unsigned long>(hr));
+            m_blendWorldFade.Reset();
         }
 
         D3D11_SAMPLER_DESC sd = {};
@@ -1875,6 +1897,12 @@ private:
         const float invSrcW = 1.0f / static_cast<float>(worldSrcW);
         const float invSrcH = 1.0f / static_cast<float>(worldSrcH);
 
+        // Distance fade (D1): quads from the farthest road slices blend into the horizon layer drawn
+        // in pass 1. Off (ini, hooks missing, no slice seen this frame, no blend state) = today's output.
+        const float fadeFarZ = CaptureGetDistanceFadeFarZ();
+        const bool distanceFade = GetConfig().distanceFade && fadeFarZ > 0.0f && m_blendWorldFade;
+        const float fadeStart = GetConfig().distanceFadeStart;
+
         // Upload constant buffer with srcSize and dstSize for PS coordinate mapping
         {
             D3D11_MAPPED_SUBRESOURCE mappedCB = {};
@@ -1890,7 +1918,7 @@ private:
             cb->dstSize[1] = static_cast<float>(worldH);
             cb->filterMode = 0;
             cb->useBgra = 0;
-            cb->pad[0] = 0.0f;
+            cb->pad[0] = distanceFade ? 1.0f : 0.0f;  // distanceFadeOn
             cb->pad[1] = 0.0f;
             cb->replacementFade[0] = m_replacementFade[0];
             cb->replacementFade[1] = m_replacementFade[1];
@@ -1907,6 +1935,10 @@ private:
             const CapturedQuad& q = quads[qi];
             if (q.culled) {
                 continue;
+            }
+            const float fade = DistanceFadeFactor(q.depthZ, fadeFarZ, fadeStart, distanceFade);
+            if (fade >= 1.0f) {
+                continue;  // fully the horizon layer
             }
             if (m_worldVerts.size() + 6 > kMaxWorldVertices) {
                 break;
@@ -1958,7 +1990,7 @@ private:
             float uv23[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             float uvClamp[4] = {0.0f, 0.0f, 1.0f, 1.0f};
             float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-            float flags[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float flags[4] = {0.0f, 0.0f, 0.0f, fade};
             float texInfo[4] = {1.0f, 1.0f, 0.0f, 0.0f};
             float box[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
@@ -2154,7 +2186,7 @@ private:
             m_context->PSSetSamplers(1, 1, m_samplerAtlas.GetAddressOf());
             m_context->RSSetState(m_rasterScissor.Get());
             const float blendFactor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            m_context->OMSetBlendState(nullptr, blendFactor, 0xFFFFFFFFu);
+            m_context->OMSetBlendState(distanceFade ? m_blendWorldFade.Get() : nullptr, blendFactor, 0xFFFFFFFFu);
 
             for (const WorldDrawBatch& b : m_worldBatches) {
                 m_context->RSSetScissorRects(1, &b.scissor);
@@ -2562,6 +2594,7 @@ private:
     ComPtr<ID3D11Buffer> m_worldVB;
     ComPtr<ID3D11RasterizerState> m_rasterScissor;
     ComPtr<ID3D11BlendState> m_blendAlpha;
+    ComPtr<ID3D11BlendState> m_blendWorldFade;  // world pass with [World] DistanceFade
     ComPtr<ID3D11SamplerState> m_samplerWrap;
     ComPtr<ID3D11SamplerState> m_samplerClamp;
     ComPtr<ID3D11SamplerState> m_samplerFilteredWrap;
