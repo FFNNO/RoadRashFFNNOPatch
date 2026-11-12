@@ -1,7 +1,13 @@
-# Road Rash 95 FFNNO Patch
+<h1 align="center">Road Rash 95 FFNNO Patch</h1>
 
-[![Download the installer](https://img.shields.io/github/v/release/FFNNO/RoadRashFFNNOPatch?label=Download%20installer&style=for-the-badge)](https://github.com/FFNNO/RoadRashFFNNOPatch/releases/latest)
-[![Build](https://img.shields.io/github/actions/workflow/status/FFNNO/RoadRashFFNNOPatch/release.yml?branch=main&style=for-the-badge)](https://github.com/FFNNO/RoadRashFFNNOPatch/actions/workflows/release.yml)
+<p align="center">
+  <a href="https://github.com/FFNNO/RoadRashFFNNOPatch/releases/latest"><img alt="Download the installer" src="https://img.shields.io/github/v/release/FFNNO/RoadRashFFNNOPatch?label=Download%20installer&amp;style=for-the-badge"></a>
+  <a href="https://github.com/FFNNO/RoadRashFFNNOPatch/actions/workflows/release.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/FFNNO/RoadRashFFNNOPatch/release.yml?branch=main&amp;style=for-the-badge"></a>
+</p>
+
+<p align="center">
+  Twitter/X: <a href="https://x.com/PagaTeamDev">@PagaTeamDev</a> &middot; Donations (Cafecito): <a href="https://cafecito.app/pagateam">cafecito.app/pagateam</a>
+</p>
 
 **Players:** download `RoadRashFFNNOPatch-Setup-<version>.exe` from the [latest release](https://github.com/FFNNO/RoadRashFFNNOPatch/releases/latest). Every release is built by GitHub Actions from the tagged commit and lists the SHA-256 of the setup.
 
@@ -229,8 +235,3 @@ Git-ignored local folders: `original/`, `patched/`, `ghidra/`, `ghidra-home/`, `
   - your GPU model and driver version;
   - whether it also happens in software mode: press Scroll Lock in race to switch between the GPU world and the original renderer and compare.
 - **Rare gap in the far ground.** Thin far rows whose 16.16 corners have zero height are still culled, so a gap can very rarely show for a moment.
-
-## Support / Contact
-
-- Twitter/X: [@PagaTeamDev](https://x.com/PagaTeamDev)
-- Donations (Cafecito): [cafecito.app/pagateam](https://cafecito.app/pagateam)
