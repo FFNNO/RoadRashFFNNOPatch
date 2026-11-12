@@ -181,6 +181,12 @@ DWORD WINAPI IatDetourGetCurrentProcessId() {
     return 0x5A5A5A5Au;
 }
 
+// Reads the IAT slot on every call: inside main() the optimizer may keep the import's address in a
+// register across InstallIatHook, so the hooked call would never look at the patched slot.
+__declspec(noinline) DWORD GetCurrentProcessIdThroughIat() {
+    return GetCurrentProcessId();
+}
+
 OPENFILENAMEA MakeOfn(char* buffer, DWORD size, const char* defExt) {
     OPENFILENAMEA ofn = {};
     ofn.lStructSize = sizeof(ofn);
@@ -752,6 +758,35 @@ std::vector<uint8_t> SnapshotAfterBlit(int param_1, const Geometry& g, const Pan
 
 // Draw distance (D3): config, patch table, layout, all-or-nothing apply/revert on a fake image,
 // reciprocal and threshold tables against an emulation of FUN_0045aa90.
+// [World] DrawSegments default 72 (rr95-draw-distance D4). Its own function: main() also tests an
+// IAT hook on GetCurrentProcessId, and MakeTestTempPath calls it.
+void TestFarViewConfig()
+{
+    Check(Config{}.drawSegments == 72, "config D4: default DrawSegments=72");
+    const std::wstring ini = MakeTestTempPath(L"rr95_d4_cfg_") + L".ini";
+    WritePrivateProfileStringW(L"World", L"SubPixel", L"1", ini.c_str());
+    Config parsed;
+    parsed.drawSegments = 0;
+    ParseConfigFile(ini, parsed);
+    Check(parsed.drawSegments == 72 && !parsed.drawSegmentsAdjusted,
+          "config D4: a missing [World] DrawSegments key gives 72");
+    WritePrivateProfileStringW(L"World", L"DrawSegments", L"48", ini.c_str());
+    ParseConfigFile(ini, parsed);
+    Check(parsed.drawSegments == 48 && !parsed.drawSegmentsAdjusted, "config D4: DrawSegments=48 keeps the engine's 48");
+    WritePrivateProfileStringW(L"World", L"DrawSegments", L"abc", ini.c_str());
+    ParseConfigFile(ini, parsed);
+    Check(parsed.drawSegments == 48 && parsed.drawSegmentsAdjusted,
+          "config D4: a DrawSegments value that is not a number falls back to 48 (off)");
+    DeleteFileW(ini.c_str());
+    // The sample next to this test's source: renderer/tests/hook_test.cpp -> renderer/rr95gpu.ini.
+    std::string samplePath = __FILE__;
+    samplePath = samplePath.substr(0, samplePath.find_last_of("\\/"));
+    samplePath = samplePath.substr(0, samplePath.find_last_of("\\/")) + "\\rr95gpu.ini";
+    const std::string sample = ReadWholeFile(std::wstring(samplePath.begin(), samplePath.end()));
+    Check(sample.find("\nDrawSegments=72") != std::string::npos,
+          "config D4: the sample rr95gpu.ini ships DrawSegments=72");
+}
+
 void TestDrawDistance() {
     using namespace rr95;
 
@@ -763,7 +798,7 @@ void TestDrawDistance() {
               !ParseDrawSegments(L"abc", seg) && seg == 48 && !ParseDrawSegments(L"60x", seg) && seg == 48 &&
               !ParseDrawSegments(L"", seg) && seg == 48 && !ParseDrawSegments(nullptr, seg) && seg == 48,
           "draw distance: DrawSegments clamps above the maximum and falls back to 48 otherwise");
-    Check(Config{}.drawSegments == 48, "draw distance: default DrawSegments=48");
+    Check(Config{}.drawSegments == 72, "draw distance: default DrawSegments=72 (far view on by default, D4)");
     {
         const std::wstring ini = MakeTestTempPath(L"rr95_draw_cfg_") + L".ini";
         WritePrivateProfileStringW(L"World", L"DrawSegments", L"200", ini.c_str());
@@ -2849,7 +2884,7 @@ int main() {
               "load success needs a valid block and a clear dirty flag");
 
         // IAT helper on this test executable's own import of KERNEL32!GetCurrentProcessId.
-        const DWORD realPid = GetCurrentProcessId();
+        const DWORD realPid = GetCurrentProcessIdThroughIat();
         Check(rr95::FindIatSlot(self, "kernel32.dll", "GetCurrentProcessId") != nullptr,
               "FindIatSlot finds a by-name import (dll name case-insensitive)");
         Check(rr95::FindIatSlot(self, "KERNEL32.dll", "NoSuchFunction") == nullptr &&
@@ -2858,12 +2893,12 @@ int main() {
         rr95::IatHook iat{"KERNEL32.dll", "GetCurrentProcessId", reinterpret_cast<void*>(&IatDetourGetCurrentProcessId),
                           reinterpret_cast<void**>(&g_iatOriginalGetCurrentProcessId), nullptr};
         Check(rr95::InstallIatHook(iat, self) && iat.slot != nullptr, "InstallIatHook patches the slot");
-        const DWORD hookedPid = GetCurrentProcessId();
+        const DWORD hookedPid = GetCurrentProcessIdThroughIat();
         Check(hookedPid == 0x5A5A5A5Au && g_iatDetourCalls == 1, "calls through the IAT reach the detour");
         Check(g_iatOriginalGetCurrentProcessId != nullptr && g_iatOriginalGetCurrentProcessId() == realPid,
               "the saved original still works");
         rr95::RemoveIatHook(iat);
-        Check(GetCurrentProcessId() == realPid && iat.slot == nullptr, "RemoveIatHook restores the original import");
+        Check(GetCurrentProcessIdThroughIat() == realPid && iat.slot == nullptr, "RemoveIatHook restores the original import");
 
         // Toast timing.
         Check(std::wcscmp(ToastText(ToastKind::Saved), L"Partida guardada") == 0 &&
@@ -3280,99 +3315,256 @@ int main() {
         WidescreenSetAppliedWidth(kEngineProjectionWidth);
     }
 
-    // Graphics options menu item (rr95-widescreen W3). The reference bytes are slots 4..6 of menu 19
-    // dumped from both exe builds (0x005a0988..0x005a0a2f, identical in original and patched).
+    // Graphics options menu 19 (rr95-widescreen W3, rr95-draw-distance D4). The reference bytes are
+    // the 8 shipped items dumped from both exe builds (0x005a08a8..0x005a0a67, identical in original
+    // and patched; handlers at the preferred base).
     {
-        static const uint8_t kSlot4[kMenuItemSize] = {
+        static const uint8_t kShippedDump[kGraphicsMenuItemsSize] = {
+            // 0
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x86, 0x00, 0x00, 0x00, 0xb4, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x01,
+            0x01, 0x06, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xc0, 0xb3, 0x45, 0x00,
+            0x49, 0x00, 0x00, 0x00, 0x52, 0x48, 0x00, 0x00,
+            // 1
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x8c, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xb6, 0x00, 0x00, 0x00, 0xb4, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x02,
+            0x02, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xb4, 0x45, 0x00,
+            0x8d, 0x01, 0x00, 0x00, 0x52, 0x48, 0x00, 0x00,
+            // 2
+            0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x52, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xe6, 0x00, 0x00, 0x00, 0xb4, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x02, 0x02, 0x01, 0x03,
+            0x03, 0x01, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x53, 0x00, 0x00, 0x00, 0x52, 0x48, 0x00, 0x00,
+            // 3
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xaf, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x16, 0x01, 0x00, 0x00, 0xb4, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x03, 0x03, 0x02, 0x04,
+            0x04, 0x02, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x80, 0xb4, 0x45, 0x00,
+            0xb0, 0x01, 0x00, 0x00, 0x52, 0x48, 0x00, 0x00,
+            // 4 "Pantalla"
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xde, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x46, 0x01, 0x00, 0x00, 0xb4, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x04, 0x04, 0x03, 0x06,
             0x06, 0x03, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xb0, 0xb4, 0x45, 0x00,
-            0xdf, 0x03, 0x00, 0x00, 0x52, 0x48, 0x00, 0x00};
-        static const uint8_t kSlot5[kMenuItemSize] = {
+            0xdf, 0x03, 0x00, 0x00, 0x52, 0x48, 0x00, 0x00,
+            // 5 empty
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x76, 0x01, 0x00, 0x00, 0xb4, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x05, 0x05, 0x04, 0x06,
             0x06, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-        static const uint8_t kSlot6[kMenuItemSize] = {
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // 6 "Ya esta"
             0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x56, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0xa6, 0x01, 0x00, 0x00, 0xb4, 0x00, 0x00, 0x00, 0x3a, 0x00, 0x00, 0x00, 0x06, 0x06, 0x05, 0x00,
             0x00, 0x05, 0x00, 0x00, 0x0c, 0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x57, 0x00, 0x00, 0x00, 0x52, 0x48, 0x00, 0x00};
-        auto dumpAt = [&](intptr_t delta) {
-            std::vector<uint8_t> v(kGraphicsMenuSlotsSize);
-            std::memcpy(v.data(), kSlot4, kMenuItemSize);
-            std::memcpy(v.data() + kMenuItemSize, kSlot5, kMenuItemSize);
-            std::memcpy(v.data() + 2 * kMenuItemSize, kSlot6, kMenuItemSize);
-            uint32_t handler = 0;
-            std::memcpy(&handler, v.data() + 0x2c, 4);
-            handler = static_cast<uint32_t>(static_cast<intptr_t>(handler) + delta);
-            std::memcpy(v.data() + 0x2c, &handler, 4);
+            0x57, 0x00, 0x00, 0x00, 0x52, 0x48, 0x00, 0x00,
+            // 7 spacer
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x72, 0x00, 0x00, 0x00, 0xb4, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        };
+        auto u32At = [](const uint8_t* p) {
+            uint32_t v = 0;
+            std::memcpy(&v, p, 4);
             return v;
         };
-        Check(kVaGraphicsMenuSlots == 0x005a0988 && kVaWidescreenMenuItem == 0x005a09c0 &&
-                  kGraphicsMenuSlotsSize == 0xa8,
-              "menu W3: slots 4..6 span 0x5a0988..0x5a0a30, slot 5 at 0x5a09c0");
+        auto putU32 = [](uint8_t* p, uint32_t v) { std::memcpy(p, &v, 4); };
+        auto dumpAt = [&](intptr_t delta) {
+            std::vector<uint8_t> v(kShippedDump, kShippedDump + kGraphicsMenuItemsSize);
+            for (size_t i = 0; i < kGraphicsMenuCount; ++i) {
+                uint8_t* h = v.data() + i * kMenuItemSize + 0x2c;
+                if (u32At(h) != 0) {
+                    putU32(h, static_cast<uint32_t>(static_cast<intptr_t>(u32At(h)) + delta));
+                }
+            }
+            return v;
+        };
+        Check(kVaGraphicsMenuItems == 0x005a08a8 && kVaGraphicsMenuCount == 0x005a0a70 &&
+                  kVaGraphicsMenuTableCount == 0x005946d4 && kVaGraphicsMenuTableItems == 0x005946d8 &&
+                  kGraphicsMenuItemsSize == 0x1c0 && kRelocatedGraphicsMenuSize == 0x1f8,
+              "menu D4: menu 19 items 0x5a08a8 (8 x 0x38), count 0x5a0a70, table entry 0x5946d4/0x5946d8");
 
-        // Slot verification.
-        std::vector<uint8_t> dump = dumpAt(0);
-        Check(GraphicsMenuSlotsAreShipped(dump.data(), 0), "menu W3: shipped slots verify at the preferred base");
+        // Shipped verification (all 8 items).
         const intptr_t delta = 0x00230000;
+        std::vector<uint8_t> dump = dumpAt(0);
         std::vector<uint8_t> rebased = dumpAt(delta);
-        Check(GraphicsMenuSlotsAreShipped(rebased.data(), delta), "menu W3: shipped slots verify when rebased");
-        Check(!GraphicsMenuSlotsAreShipped(dump.data(), delta),
-              "menu W3: an unrelocated handler does not verify against a rebased module");
+        Check(GraphicsMenuItemsAreShipped(dump.data(), 0), "menu D4: shipped items verify at the preferred base");
+        Check(GraphicsMenuItemsAreShipped(rebased.data(), delta), "menu D4: shipped items verify when rebased");
+        Check(!GraphicsMenuItemsAreShipped(dump.data(), delta),
+              "menu D4: unrelocated handlers do not verify against a rebased module");
+        std::vector<uint8_t> model(kGraphicsMenuItemsSize, 0xCD);
+        ShippedGraphicsMenuItems(delta, model.data());
+        Check(model == rebased, "menu D4: ShippedGraphicsMenuItems matches the exe dump (rebased)");
         std::vector<uint8_t> withHwnd = rebased;
-        for (int s = 0; s < 3; ++s) {
-            const uint32_t hwnd = 0x000a0b0cu + static_cast<uint32_t>(s);
-            std::memcpy(withHwnd.data() + s * kMenuItemSize, &hwnd, 4);
+        for (size_t s = 0; s < kGraphicsMenuCount; ++s) {
+            putU32(withHwnd.data() + s * kMenuItemSize, 0x000a0b00u + static_cast<uint32_t>(s));
         }
-        Check(GraphicsMenuSlotsAreShipped(withHwnd.data(), delta),
-              "menu W3: the HWND dwords the engine writes at +0x00 are ignored");
+        Check(GraphicsMenuItemsAreShipped(withHwnd.data(), delta),
+              "menu D4: the HWND dwords the engine writes at +0x00 are ignored");
         bool everyByteChecked = true;
-        for (size_t i = 0; i < kGraphicsMenuSlotsSize; ++i) {
+        for (size_t i = 0; i < kGraphicsMenuItemsSize; ++i) {
             if ((i % kMenuItemSize) < 4) {
                 continue;
             }
             std::vector<uint8_t> changed = rebased;
             changed[i] ^= 0x01;
-            everyByteChecked = everyByteChecked && !GraphicsMenuSlotsAreShipped(changed.data(), delta);
+            everyByteChecked = everyByteChecked && !GraphicsMenuItemsAreShipped(changed.data(), delta);
         }
-        Check(everyByteChecked, "menu W3: any other changed byte in slots 4..6 fails the verification");
-        std::vector<uint8_t> slot5Used = rebased;
-        slot5Used[kMenuItemSize + 0x08] = 0x56;
-        slot5Used[kMenuItemSize + 0x28] = 1;
-        Check(!GraphicsMenuSlotsAreShipped(slot5Used.data(), delta), "menu W3: a non-empty slot 5 fails the verification");
-        std::vector<uint8_t> model(kGraphicsMenuSlotsSize, 0xCD);
-        ShippedGraphicsMenuSlots(delta, model.data());
-        Check(model == rebased, "menu W3: ShippedGraphicsMenuSlots matches the exe dump (rebased)");
+        Check(everyByteChecked, "menu D4: any other changed byte in the 8 items fails the verification");
 
-        // Navigation and item rewrite.
-        const uint32_t handler = 0x10203040;
-        std::vector<uint8_t> out(kGraphicsMenuSlotsSize, 0xCD);
-        BuildWidescreenMenuSlots(withHwnd.data(), handler, out.data());
-        std::vector<uint8_t> expected = withHwnd;
-        expected[0x1f] = 5;  // slot 4 down
-        expected[0x20] = 5;  // slot 4 Tab
-        uint8_t* s5 = expected.data() + kMenuItemSize;
-        const uint32_t label = 0x3da, flags = 0x0010000c, enabled = 1, help = 0, extra = 0x4852;
-        std::memcpy(s5 + 0x08, &label, 4);
-        std::memcpy(s5 + 0x24, &flags, 4);
-        std::memcpy(s5 + 0x28, &enabled, 4);
-        std::memcpy(s5 + 0x2c, &handler, 4);
-        std::memcpy(s5 + 0x30, &help, 4);
-        std::memcpy(s5 + 0x34, &extra, 4);
-        Check(out == expected, "menu W3: slot 5 becomes an enabled on/off item, slot 4 down/Tab -> 5, rest unchanged");
-        const uint8_t* o4 = out.data();
-        const uint8_t* o5 = out.data() + kMenuItemSize;
-        const uint8_t* o6 = out.data() + 2 * kMenuItemSize;
-        Check(o4[0x1e] == 3 && o4[0x21] == 3 && o5[0x1e] == 4 && o5[0x21] == 4 && o5[0x1f] == 6 &&
-                  o5[0x20] == 6 && o6[0x1e] == 5 && o6[0x21] == 5 && o5[0x1c] == 5 && o5[0x1d] == 5,
-              "menu W3: chain 4 <-> 5 <-> 6 (up/Shift+Tab, down/Tab), left/right stay on slot 5");
-        int32_t rect[4] = {};
-        std::memcpy(rect, o5 + 0x0c, sizeof(rect));
-        Check(rect[0] == 0 && rect[1] == 374 && rect[2] == 180 && rect[3] == 48 && o5[0x00] == 0x0d,
-              "menu W3: slot 5 keeps its rect (0, 374, 180, 48) and the engine's HWND dword");
-        Check(!GraphicsMenuSlotsAreShipped(out.data(), delta), "menu W3: rewritten slots no longer verify as shipped");
+        // Relocated menu: rows, items and navigation.
+        const uint32_t wsHandler = 0x10203040, fvHandler = 0x10203080;
+        std::vector<uint8_t> out(kRelocatedGraphicsMenuSize, 0xCD);
+        BuildRelocatedGraphicsMenu(withHwnd.data(), wsHandler, fvHandler, out.data());
+        auto item = [&](int s) { return out.data() + static_cast<size_t>(s) * kMenuItemSize; };
+        auto rectOf = [&](int s, int f) { return static_cast<int32_t>(u32At(item(s) + 0x0c + 4 * f)); };
+        bool rowsOk = true;
+        for (int s = 0; s <= 6; ++s) {
+            rowsOk = rowsOk && rectOf(s, 0) == 0 && rectOf(s, 1) == 134 + 42 * s && rectOf(s, 2) == 180 &&
+                     rectOf(s, 3) == 42;
+        }
+        Check(rowsOk, "menu D4: slots 0..6 on menu 17's 42-px pitch from y 134 (x 0, width 180)");
+        Check(rectOf(8, 0) == 0 && rectOf(8, 1) == 428 && rectOf(8, 2) == 180 && rectOf(8, 3) == 52 &&
+                  rectOf(8, 1) + rectOf(8, 3) == 480,
+              "menu D4: 'Ya esta' moves to slot 8, row (0, 428, 180, 52) ending at 480");
+        Check(std::memcmp(item(7), withHwnd.data() + 7 * kMenuItemSize, kMenuItemSize) == 0,
+              "menu D4: the spacer slot 7 is copied unchanged");
+        bool keptOk = true;
+        for (int s = 0; s <= 4; ++s) {
+            const uint8_t* src = withHwnd.data() + static_cast<size_t>(s) * kMenuItemSize;
+            keptOk = keptOk && std::memcmp(item(s), src, 0x10) == 0 && std::memcmp(item(s) + 0x14, src + 0x14, 4) == 0 &&
+                     std::memcmp(item(s) + 0x24, src + 0x24, kMenuItemSize - 0x24) == 0;
+        }
+        const uint8_t* srcDone = withHwnd.data() + 6 * kMenuItemSize;
+        keptOk = keptOk && std::memcmp(item(8), srcDone, 0x0c) == 0 &&
+                 std::memcmp(item(8) + 0x24, srcDone + 0x24, kMenuItemSize - 0x24) == 0;
+        Check(keptOk, "menu D4: slots 0..4 and 'Ya esta' keep HWND, id, label, flags, enabled, handler, help");
+        auto checkModItem = [&](int s, uint32_t handler) {
+            return u32At(item(s) + 0x04) == 0 && u32At(item(s) + 0x08) == 0x3da &&
+                   u32At(item(s) + 0x24) == 0x0010000c && u32At(item(s) + 0x28) == 1 &&
+                   u32At(item(s) + 0x2c) == handler && u32At(item(s) + 0x30) == 0 && u32At(item(s) + 0x34) == 0x4852;
+        };
+        Check(checkModItem(5, wsHandler) && u32At(item(5)) == 0x000a0b05u,
+              "menu D4: slot 5 is the widescreen on/off item (label 0x3da, flags 0x10000c, its handler)");
+        Check(checkModItem(6, fvHandler), "menu D4: slot 6 is the far view on/off item with its handler");
+        auto nav = [&](int s) { return std::vector<uint8_t>(item(s) + 0x1c, item(s) + 0x22); };
+        using N = std::vector<uint8_t>;
+        Check(nav(0) == N{0, 0, 8, 1, 1, 8} && nav(1) == N{1, 1, 0, 2, 2, 0} && nav(2) == N{2, 2, 1, 3, 3, 1} &&
+                  nav(3) == N{3, 3, 2, 4, 4, 2} && nav(4) == N{4, 4, 3, 5, 5, 3} && nav(5) == N{5, 5, 4, 6, 6, 4} &&
+                  nav(6) == N{6, 6, 5, 8, 8, 5} && nav(7) == N{0, 0, 0, 0, 0, 0} && nav(8) == N{8, 8, 6, 0, 0, 6},
+              "menu D4: navigation 0 <-> 1 <-> 2 <-> 3 <-> 4 <-> 5 <-> 6 <-> 8 <-> 0, left/right stay");
+        // Following down/Tab from slot 0 visits every enabled item once and comes back to 0.
+        {
+            std::vector<int> visited;
+            int s = 0;
+            for (int step = 0; step < 12; ++step) {
+                visited.push_back(s);
+                s = item(s)[0x1f];
+                if (s == 0) {
+                    break;
+                }
+            }
+            Check(visited == std::vector<int>{0, 1, 2, 3, 4, 5, 6, 8} && s == 0,
+                  "menu D4: Tab from slot 0 walks 0,1,2,3,4,5,6,8 and wraps to 0");
+            bool upInverse = true;
+            for (int v : visited) {
+                upInverse = upInverse && item(item(v)[0x1f])[0x1e] == v && item(item(v)[0x20])[0x21] == v;
+            }
+            Check(upInverse, "menu D4: up/Shift+Tab are the inverse of down/Tab on every enabled item");
+        }
+        Check(!GraphicsMenuItemsAreShipped(out.data(), delta), "menu D4: the relocated menu no longer verifies as shipped");
+        int escapeItems = 0;
+        int lastEnabled = -1;
+        for (int s = 0; s < 9; ++s) {
+            escapeItems += (u32At(item(s) + 0x24) & 0x8000) != 0;
+            if (item(s)[0x28] != 0) {
+                lastEnabled = s;
+            }
+        }
+        Check(escapeItems == 1 && (u32At(item(8) + 0x24) & 0x8000) != 0 && lastEnabled == 8,
+              "menu D4: 'Ya esta' is the only Escape item and the last enabled one (End key)");
+
+        // Relocation on a fake image: module bytes for VAs 0x00400000..0x005a1000.
+        std::vector<uint8_t> image(0x001a1000, 0);
+        uint8_t* module = image.data();
+        const intptr_t fakeDelta = reinterpret_cast<intptr_t>(module) - 0x00400000;
+        auto at = [&](uint32_t va) { return module + (va - 0x00400000); };
+        auto resetImage = [&](uint32_t tableCount) {
+            std::vector<uint8_t> items = dumpAt(fakeDelta);
+            std::memcpy(at(kVaGraphicsMenuItems), items.data(), items.size());
+            putU32(at(kVaGraphicsMenuCount), 8);
+            putU32(at(kVaGraphicsMenuTableCount), tableCount);
+            putU32(at(kVaGraphicsMenuTableItems), static_cast<uint32_t>(static_cast<intptr_t>(kVaGraphicsMenuItems) + fakeDelta));
+        };
+        resetImage(8);
+        Check(CheckGraphicsMenu(module) == GraphicsMenuCheck::Ok, "menu D4: fake image with the shipped menu checks Ok");
+        resetImage(0);
+        Check(CheckGraphicsMenu(module) == GraphicsMenuCheck::Ok, "menu D4: table count 0 (before WM_CREATE) checks Ok");
+        resetImage(7);
+        Check(CheckGraphicsMenu(module) == GraphicsMenuCheck::TableCount, "menu D4: table count 7 is refused");
+        resetImage(8);
+        putU32(at(kVaGraphicsMenuCount), 9);
+        Check(CheckGraphicsMenu(module) == GraphicsMenuCheck::StaticCount, "menu D4: static count 9 is refused");
+        resetImage(8);
+        putU32(at(kVaGraphicsMenuTableItems), kVaGraphicsMenuItems);
+        Check(CheckGraphicsMenu(module) == GraphicsMenuCheck::TableItems,
+              "menu D4: an unrelocated table pointer is refused");
+        resetImage(8);
+        at(kVaGraphicsMenuItems + 7 * kMenuItemSize + 0x10)[0] ^= 1;
+        Check(CheckGraphicsMenu(module) == GraphicsMenuCheck::Items, "menu D4: a changed spacer byte is refused");
+        Check(std::strcmp(GraphicsMenuCheckToString(GraphicsMenuCheck::Items), "items") == 0 &&
+                  std::strcmp(GraphicsMenuCheckToString(GraphicsMenuCheck::Ok), "ok") == 0,
+              "menu D4: GraphicsMenuCheckToString names the results");
+
+        // Refused relocation writes nothing.
+        std::vector<uint8_t> newItems(kRelocatedGraphicsMenuSize, 0xEE);
+        GraphicsMenuRelocation state;
+        const std::vector<uint8_t> beforeRefused = image;
+        Check(RelocateGraphicsMenu(module, newItems.data(), wsHandler, fvHandler, state) == GraphicsMenuCheck::Items &&
+                  !state.applied && image == beforeRefused &&
+                  newItems == std::vector<uint8_t>(kRelocatedGraphicsMenuSize, 0xEE),
+              "menu D4: a refused relocation writes nothing (image and new array untouched)");
+
+        // Applied relocation: exactly three dwords change, plus the DLL array.
+        for (uint32_t tableCount : {8u, 0u}) {
+            resetImage(tableCount);
+            const std::vector<uint8_t> shippedImage = image;
+            state = GraphicsMenuRelocation{};
+            const GraphicsMenuCheck r = RelocateGraphicsMenu(module, newItems.data(), wsHandler, fvHandler, state);
+            std::vector<uint8_t> expectedItems(kRelocatedGraphicsMenuSize);
+            BuildRelocatedGraphicsMenu(at(kVaGraphicsMenuItems), wsHandler, fvHandler, expectedItems.data());
+            std::vector<size_t> changedAt;
+            for (size_t i = 0; i < image.size(); ++i) {
+                if (image[i] != shippedImage[i]) {
+                    changedAt.push_back(i);
+                }
+            }
+            const uint32_t newPtr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(newItems.data()));
+            bool onlyPatchList = true;
+            for (size_t i : changedAt) {
+                const uint32_t va = static_cast<uint32_t>(i) + 0x00400000;
+                onlyPatchList = onlyPatchList && ((va >= kVaGraphicsMenuCount && va < kVaGraphicsMenuCount + 4) ||
+                                                  (va >= kVaGraphicsMenuTableCount && va < kVaGraphicsMenuTableCount + 8));
+            }
+            const uint32_t expectedTableCount = tableCount == 8 ? 9u : 0u;
+            Check(r == GraphicsMenuCheck::Ok && state.applied && state.items == newItems.data() &&
+                      newItems == expectedItems && onlyPatchList && u32At(at(kVaGraphicsMenuCount)) == 9 &&
+                      u32At(at(kVaGraphicsMenuTableCount)) == expectedTableCount &&
+                      u32At(at(kVaGraphicsMenuTableItems)) == newPtr &&
+                      std::memcmp(at(kVaGraphicsMenuItems), shippedImage.data() + (kVaGraphicsMenuItems - 0x00400000),
+                                  kGraphicsMenuItemsSize) == 0,
+                  tableCount == 8
+                      ? "menu D4: relocation writes only 0x5a0a70 = 9, table count 9 and table pointer; items untouched"
+                      : "menu D4: before WM_CREATE the table count stays 0 (WM_CREATE copies 9 from 0x5a0a70)");
+            if (tableCount == 0) {
+                putU32(at(kVaGraphicsMenuTableCount), u32At(at(kVaGraphicsMenuCount)));  // WM_CREATE
+            }
+            RestoreGraphicsMenu(module, state);
+            std::vector<uint8_t> restoredExpected = shippedImage;
+            putU32(restoredExpected.data() + (kVaGraphicsMenuTableCount - 0x00400000), 8);
+            Check(!state.applied && image == restoredExpected,
+                  "menu D4: RestoreGraphicsMenu puts back 8 items and the engine's array pointer");
+            RestoreGraphicsMenu(module, state);
+            Check(image == restoredExpected, "menu D4: a second restore changes nothing");
+        }
 
         // Label encoding (CP-1252 like the engine's ANSI strings).
         const std::string labelBytes = WidescreenMenuLabel(kGameLanguageSpanish);
@@ -3456,7 +3648,52 @@ int main() {
         Check(std::strcmp(WidescreenSettingSourceToString(WidescreenSettingSource::Registry), "registry") == 0 &&
                   std::strcmp(WidescreenSettingSourceToString(WidescreenSettingSource::Ini), "ini") == 0,
               "menu W3: WidescreenSettingSourceToString names the sources");
+        // Far view item (rr95-draw-distance D4): labels in the game's language, CP-1252 bytes.
+        Check(FarViewMenuLabel(kGameLanguageEnglish) == "Far view" && FarViewMenuLabel(kGameLanguageFrench) == "Vue lointaine" &&
+                  FarViewMenuLabel(kGameLanguageGerman) == "Fernsicht" &&
+                  FarViewMenuLabel(kGameLanguageItalian) == "Vista lontana" &&
+                  FarViewMenuLabel(kGameLanguageSpanish) == "Vista lejana",
+              "menu D4: far view labels Far view / Vue lointaine / Fernsicht / Vista lontana / Vista lejana");
+        Check(FarViewMenuLabel(0xffffffffu) == "Far view" && FarViewMenuLabel(0x50) == "Far view" &&
+                  FarViewMenuLabel(0x41) == "Far view",
+              "menu D4: unknown language (0xffffffff, 0x50, 0x41) falls back to 'Far view'");
+        const std::string fvEs = FarViewMenuText(true, "On", "Off", kGameLanguageSpanish);
+        Check(fvEs == "Vista lejana: On" && fvEs.size() == 16 &&
+                  FarViewMenuText(false, "On", "Off", kGameLanguageSpanish) == "Vista lejana: Off" &&
+                  FarViewMenuText(false, "On", "Off", kGameLanguageFrench) == "Vue lointaine: Off" &&
+                  FarViewMenuText(true, "On", nullptr, kGameLanguageEnglish) == "Far view: On" &&
+                  FarViewMenuText(false, "On", nullptr, kGameLanguageEnglish) == "Far view: ",
+              "menu D4: far view text '<label>: On|Off' (plain ASCII bytes, null state text tolerated)");
+        bool fvShortEnough = true;
+        for (uint32_t lang : {kGameLanguageEnglish, kGameLanguageFrench, kGameLanguageGerman, kGameLanguageItalian,
+                              kGameLanguageSpanish}) {
+            fvShortEnough = fvShortEnough && FarViewMenuText(false, "On", "Off", lang).size() <=
+                                                 WidescreenMenuText(false, "On", "Off", kGameLanguageSpanish).size();
+        }
+        Check(fvShortEnough, "menu D4: every far view text is no longer than 'Pantalla panoramica: Off', which fits");
+
+        // Far view setting: registry over ini.
+        Check(std::strcmp(kFarViewRegistryValueName, "FarView") == 0 && kFarViewOnSegments == rr95::kMaxDrawSegments &&
+                  kFarViewOffSegments == rr95::kEngineDrawSegments,
+              "menu D4: registry value 'FarView', on = 72 segments, off = 48");
+        EffectiveFarViewSetting fv = ResolveEffectiveFarView(60, false, 1);
+        Check(fv.drawSegments == 72 && fv.distanceFade && fv.source == WidescreenSettingSource::Registry &&
+                  FarViewSettingIsOn(fv),
+              "menu D4: registry 1 -> 72 segments with the fade (source registry)");
+        fv = ResolveEffectiveFarView(72, true, 0);
+        Check(fv.drawSegments == 48 && !fv.distanceFade && fv.source == WidescreenSettingSource::Registry &&
+                  !FarViewSettingIsOn(fv),
+              "menu D4: registry 0 -> 48 segments, no fade (source registry)");
+        fv = ResolveEffectiveFarView(60, false, kWidescreenRegistryAbsent);
+        Check(fv.drawSegments == 60 && !fv.distanceFade && fv.source == WidescreenSettingSource::Ini &&
+                  FarViewSettingIsOn(fv),
+              "menu D4: no registry value -> the ini's DrawSegments and DistanceFade (60 shows On)");
+        fv = ResolveEffectiveFarView(48, true, kWidescreenRegistryInvalid);
+        Check(fv.drawSegments == 48 && fv.distanceFade && fv.source == WidescreenSettingSource::Ini &&
+                  !FarViewSettingIsOn(fv),
+              "menu D4: invalid registry value -> the ini (48 shows Off even with the fade on)");
     }
+
 
     // HUD key icons under GpuWorld: the icon layer is recovered from two runs of the game's
     // compositor, one over opaque black and one over opaque white.
@@ -3528,6 +3765,7 @@ int main() {
     }
 
     TestDrawDistance();
+    TestFarViewConfig();
 
     std::printf("%s (%d failure(s))\n", g_failures == 0 ? "OK" : "FAILED", g_failures);
     return g_failures == 0 ? 0 : 1;

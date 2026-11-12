@@ -9,6 +9,10 @@ the expected bytes of every site, that every base relocation into the moved
 engine arrays is either patched or on the deliberate keep list, and that every
 0x1bff / 0x1c00 immediate in the reciprocal table readers is patched.
 
+And it checks graphics menu 19, which renderer/src/options_menu.cpp relocates into the DLL: the
+shipped item table, the item count and menu table entry, that the menu table pointer is the only
+base relocation into the item array, and that the dwords the mod writes lie in a writable section.
+
 Usage: py -I check_hook_sites.py [exe ...]
 Exit code 0 when every site matches every exe.
 """
@@ -20,6 +24,7 @@ import sys
 HERE = pathlib.Path(__file__).resolve().parent
 TABLE = HERE.parent / "src" / "hook_sites.cpp"
 DRAW_TABLE = HERE.parent / "src" / "draw_distance.cpp"
+MENU_TABLE = HERE.parent / "src" / "options_menu.cpp"
 ROOT = HERE.parent.parent
 DEFAULT_EXES = [ROOT / "original" / "RoadRash95.exe", ROOT / "patched" / "RoadRash95.exe"]
 
@@ -51,6 +56,70 @@ DRAW_RECIP_READERS = [(0x0041CFC0, 795), (0x0041D3B0, 1082), (0x0044E870, 1119),
                       (0x00459CB0, 2032), (0x0045A6A0, 102), (0x004666A0, 766), (0x00466A60, 685),
                       (0x00466EB0, 793), (0x00467290, 792), (0x00467670, 706)]
 DRAW_CLAMP_PATTERNS = (bytes([0xFF, 0x1B, 0x00, 0x00]), bytes([0x00, 0x1C, 0x00, 0x00]))
+
+
+# Graphics menu 19 (options_menu.h): items, the count WM_CREATE copies, the menu table entry.
+MENU_ITEMS = 0x005A08A8
+MENU_ITEMS_SIZE = 8 * 0x38
+MENU_COUNT = 0x005A0A70
+MENU_TABLE_COUNT = 0x005946D4
+MENU_TABLE_ITEMS = 0x005946D8
+# Every base relocation into these ranges, by operand address (anything else would also need rewriting).
+MENU_RELOCATIONS = {
+    (MENU_ITEMS, MENU_ITEMS + MENU_ITEMS_SIZE): {MENU_TABLE_ITEMS},  # the table pointer, rewritten
+    (MENU_COUNT, MENU_COUNT + 4): {0x0043E579},                      # WM_CREATE reads the count
+    (MENU_TABLE_COUNT, MENU_TABLE_COUNT + 4): {0x0043E57E},          # WM_CREATE writes the table count
+}
+IMAGE_SCN_MEM_WRITE = 0x80000000
+
+
+def parse_menu_table(text):
+    m = re.search(r"kShippedGraphicsMenuItems\[kGraphicsMenuItemsSize\]\s*=\s*\{(?P<body>.*?)\};", text, re.S)
+    if not m:
+        return b""
+    body = re.sub(r"//[^\n]*", "", m.group("body"))
+    return bytes(int(b, 16) for b in re.findall(r"0x([0-9A-Fa-f]{2})\b", body))
+
+
+def section_characteristics(pe, va):
+    lfanew = struct.unpack_from("<I", pe, 0x3C)[0]
+    nsec = struct.unpack_from("<H", pe, lfanew + 6)[0]
+    opt_size = struct.unpack_from("<H", pe, lfanew + 20)[0]
+    image_base = struct.unpack_from("<I", pe, lfanew + 24 + 28)[0]
+    sec = lfanew + 24 + opt_size
+    for i in range(nsec):
+        s = sec + 40 * i
+        vsize, vaddr = struct.unpack_from("<II", pe, s + 8)
+        if vaddr <= va - image_base < vaddr + vsize:
+            return struct.unpack_from("<I", pe, s + 36)[0]
+    return 0
+
+
+def check_menu(exe, pe, items):
+    failures = 0
+    name = f"{exe.parent.name}/{exe.name}"
+    off = va_to_offset(pe, MENU_ITEMS)
+    actual = pe[off:off + MENU_ITEMS_SIZE]
+    ok = len(items) == MENU_ITEMS_SIZE and actual == items
+    failures += not ok
+    print(f"{'OK  ' if ok else 'FAIL'} {name} menu 19 items VA 0x{MENU_ITEMS:08X} ({len(items)} table bytes)")
+    dword = lambda va: struct.unpack_from("<I", pe, va_to_offset(pe, va))[0]
+    count, table_count, table_items = dword(MENU_COUNT), dword(MENU_TABLE_COUNT), dword(MENU_TABLE_ITEMS)
+    ok = count == 8 and table_count == 0 and table_items == MENU_ITEMS
+    failures += not ok
+    print(f"{'OK  ' if ok else 'FAIL'} {name} menu 19 count 0x{MENU_COUNT:08X} = {count}, table count = {table_count}, "
+          f"table items = 0x{table_items:08X}")
+    relocs = relocation_sites(pe)
+    for (lo, hi), expected in MENU_RELOCATIONS.items():
+        found = {site for site, target in relocs if lo <= target < hi}
+        ok = found == expected
+        failures += not ok
+        print(f"{'OK  ' if ok else 'FAIL'} {name} menu relocations into 0x{lo:08X}..0x{hi:08X}: "
+              f"{sorted(hex(v) for v in found)} expected {sorted(hex(v) for v in expected)}")
+    writable = all(section_characteristics(pe, va) & IMAGE_SCN_MEM_WRITE for va in (MENU_COUNT, MENU_TABLE_COUNT, MENU_TABLE_ITEMS))
+    failures += not writable
+    print(f"{'OK  ' if writable else 'FAIL'} {name} menu dwords the mod writes are in a writable section")
+    return failures
 
 
 def parse_draw_table(text):
@@ -144,6 +213,10 @@ def main(argv):
     if not draw_sites:
         print(f"FAIL no draw distance sites parsed from {DRAW_TABLE}")
         return 1
+    menu_items = parse_menu_table(MENU_TABLE.read_text(encoding="utf-8"))
+    if len(menu_items) != MENU_ITEMS_SIZE:
+        print(f"FAIL {len(menu_items)} menu item bytes parsed from {MENU_TABLE}, expected {MENU_ITEMS_SIZE}")
+        return 1
     failures = 0
     for exe in exes:
         pe = exe.read_bytes()
@@ -155,6 +228,7 @@ def main(argv):
             print(f"{'OK  ' if ok else 'FAIL'} {exe.parent.name}/{exe.name} {name} VA 0x{va:08X} "
                   f"file 0x{off:X} len {length} insn {insn} expected {expected.hex(' ')} actual {actual.hex(' ')}")
         failures += check_draw_table(exe, pe, draw_sites)
+        failures += check_menu(exe, pe, menu_items)
     return 1 if failures else 0
 
 

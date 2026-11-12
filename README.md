@@ -96,11 +96,17 @@ Start from `renderer/rr95gpu.ini` (every key is documented there) and change:
 ```ini
 [World]
 GpuWorld=1          ; GPU world at 1440x1080 (Scroll Lock toggles it in race)
+; Defaults you can keep (GpuWorld=1 only):
+; DrawSegments=72   ; road segments drawn ahead (48 = the engine's own distance, 72 = most)
+; DistanceFade=1    ; the farthest segments fade into the sky instead of popping in
+; KeepThinQuads=1   ; draw far one-scanline rows (fixes missing rows of the finish line)
 
 [TexturePack]
 MaxMiB=1536         ; the full Remacri pack needs about 1025 MiB of VRAM
 Dump=0              ; 1 = save every new texture the game draws to texture-dump/ (to grow the pack)
 ```
+
+With `GpuWorld=1` the game's "Opciones Gráficas y de Sonido" menu gets two On/Off items, labelled in the game's language: widescreen ("Pantalla panorámica") and far view ("Vista lejana": On = `DrawSegments=72` with `DistanceFade=1`, Off = the engine's 48 segments without the fade). Each choice is saved in the registry under `HKCU\SOFTWARE\Electronic Arts\RoadRash 95` (`Widescreen`, `FarView`), overrides the ini from then on, and applies at the next race start.
 
 ### Uninstall
 

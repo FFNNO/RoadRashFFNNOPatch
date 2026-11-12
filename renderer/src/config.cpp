@@ -188,7 +188,7 @@ void ParseConfigFile(const std::wstring& iniFilePath, Config& cfg) {
     ParseDistanceFadeStart(fadeStartBuf, cfg.distanceFadeStart);
 
     wchar_t drawSegmentsBuf[64] = {0};
-    GetPrivateProfileStringW(L"World", L"DrawSegments", L"48", drawSegmentsBuf, 64, iniFilePath.c_str());
+    GetPrivateProfileStringW(L"World", L"DrawSegments", L"72", drawSegmentsBuf, 64, iniFilePath.c_str());
     cfg.drawSegmentsAdjusted = !rr95::ParseDrawSegments(drawSegmentsBuf, cfg.drawSegments);
 
     wchar_t widescreenBuf[64] = {0};

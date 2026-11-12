@@ -710,6 +710,31 @@ EffectiveWidescreenSetting CurrentWidescreenSetting() {
     return ResolveEffectiveWidescreen(GetConfig().widescreen, registryValue);
 }
 
+// Far view item (D4): the state the menu shows, like g_menuWidescreenOn.
+std::atomic<bool> g_menuFarViewOn{false};
+bool g_farViewRegistryInvalidWarned = false;
+// Both slice draw hooks are installed (with the world hooks); the fade itself is switched per race.
+bool g_distanceFadeHooksInstalled = false;
+
+// [World] DrawSegments and DistanceFade from the ini, overridden by HKCU\SOFTWARE\Electronic Arts\
+// RoadRash 95\FarView (REG_BINARY 1 byte: 1 = 72 segments with the fade, 0 = 48 without it).
+EffectiveFarViewSetting CurrentFarViewSetting() {
+    const int registryValue = ReadOnOffRegistryValue(kFarViewRegistryValueName);
+    if (registryValue == kWidescreenRegistryInvalid && !g_farViewRegistryInvalidWarned) {
+        g_farViewRegistryInvalidWarned = true;
+        LOG_WARN("Registry value %s\\%s is not a 1-byte REG_BINARY or a REG_DWORD holding 0 or 1; using the ini",
+                 kGameRegistryKey, kFarViewRegistryValueName);
+    }
+    const Config& cfg = GetConfig();
+    return ResolveEffectiveFarView(cfg.drawSegments, cfg.distanceFade, registryValue);
+}
+
+// Switches the distance fade for the race about to start (or at install). Nothing fades without
+// both slice draw hooks.
+void ApplyRaceDistanceFade(const EffectiveFarViewSetting& farView) {
+    CaptureSetDistanceFadeHooks(g_distanceFadeHooksInstalled && farView.distanceFade);
+}
+
 bool g_engineWidthsRecorded = false;
 int g_engineProjectionWidth = kEngineProjectionWidth;
 int g_engineViewportWidth = kEngineProjectionWidth;
@@ -802,18 +827,25 @@ void ApplyRaceProjectionWidth() {
 // toggle during the race keeps the race's segment count (the software path draws them too).
 void ApplyRaceDrawDistance() {
     const Config& cfg = GetConfig();
+    const EffectiveFarViewSetting farView = CurrentFarViewSetting();
+    g_menuFarViewOn = FarViewSettingIsOn(farView);
     const bool gpuWorldEffective = cfg.gpuWorld && cfg.presenterEnabled && g_worldHooksInstalled &&
                                    !PresenterIsLatchedOff();
-    const int active = rr95::DrawDistanceRaceStart(g_hostModule, cfg.drawSegments, gpuWorldEffective);
-    if (cfg.drawSegments > rr95::kEngineDrawSegments && active == rr95::kEngineDrawSegments) {
-        LOG_INFO("Draw distance: race start with the engine's %d segments (DrawSegments=%d, GpuWorld=%d)",
-                 rr95::kEngineDrawSegments, cfg.drawSegments, gpuWorldEffective ? 1 : 0);
+    const int active = rr95::DrawDistanceRaceStart(g_hostModule, farView.drawSegments, gpuWorldEffective);
+    if (farView.drawSegments > rr95::kEngineDrawSegments && active == rr95::kEngineDrawSegments) {
+        LOG_INFO("Draw distance: race start with the engine's %d segments (DrawSegments=%d from %s, GpuWorld=%d)",
+                 rr95::kEngineDrawSegments, farView.drawSegments, WidescreenSettingSourceToString(farView.source),
+                 gpuWorldEffective ? 1 : 0);
+    } else if (farView.source == WidescreenSettingSource::Registry) {
+        LOG_INFO("Far view: %s from the registry (%d segments, distance fade %s)",
+                 g_menuFarViewOn.load() ? "On" : "Off", active, farView.distanceFade ? "on" : "off");
     }
+    ApplyRaceDistanceFade(farView);
 }
 
 void __cdecl Detour_FUN_00457ef0() {
     ApplyRaceProjectionWidth();
-    ApplyRaceDrawDistance();
+    ApplyRaceDrawDistance();  // also decides the distance fade for this race
     CaptureDistanceFadeRaceStart();  // a new race or track starts from its own far depth
     if (g_orig_FUN_00457ef0) {
         g_orig_FUN_00457ef0();
@@ -821,14 +853,16 @@ void __cdecl Detour_FUN_00457ef0() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Widescreen item in graphics options menu 19, slot 5, labelled in the game's language (feature
-// rr95-widescreen W3, task I4 of rr95-gpu-hud-icons; item layout and verification in options_menu.h).
+// Widescreen (slot 5) and far view (slot 6) items in graphics options menu 19, labelled in the
+// game's language (feature rr95-widescreen W3, task I4 of rr95-gpu-hud-icons, rr95-draw-distance
+// D4). The menu is relocated into g_graphicsMenuItems (9 items); layout and verification in
+// options_menu.h.
 //
 // Engine code (preferred VAs, same bytes in both exe builds):
 // 0x0045b930: const char* __fastcall FUN_0045b930(item): text of a flag-0x100000 item; its only
 //             caller is FUN_00439160 at 0x439455 (mov ecx, esi). For labels other than 0xd0/0x3da
 //             it formats a volume slider from DAT_0058e010[item id * 6], so it is hooked and returns
-//             the widescreen item's own text.
+//             the mod items' own text.
 // 0x00439160: void __fastcall FUN_00439160(item, selected): draws one item; the on/off handlers
 //             0x45b540/0x45b590 call it with ECX = EDX = item after toggling.
 // 0x0043ce30: FUN_0043ce30 calls the select handler at item+0x2c with ECX = item (call eax) and
@@ -837,19 +871,32 @@ constexpr uint32_t kVaItemRedraw = 0x00439160;
 constexpr uint8_t kItemRedrawPrologue[9] = {0x55, 0x8B, 0xEC, 0x81, 0xEC, 0x94, 0x00, 0x00, 0x00};
 using FUN_00439160_Fn = void(__fastcall*)(void* item, void* selected);
 
-bool g_widescreenMenuInstalled = false;
-uint8_t g_menuShippedSlots[kGraphicsMenuSlotsSize] = {};
+// The relocated menu 19. The engine keeps pointers to its items while the menu is open, so it lives
+// as long as the DLL; RemoveHooks points the engine back at its own array.
+alignas(4) uint8_t g_graphicsMenuItems[kRelocatedGraphicsMenuSize] = {};
+GraphicsMenuRelocation g_graphicsMenu;
 std::string g_menuOnText;
 std::string g_menuOffText;
 char g_widescreenMenuText[96] = {};
+char g_farViewMenuText[96] = {};
+
+const void* GraphicsMenuItem(int slot) {
+    return g_graphicsMenuItems + static_cast<size_t>(slot) * kMenuItemSize;
+}
 
 const char* __fastcall Detour_FUN_0045b930(void* item) {
-    if (g_widescreenMenuInstalled && item == GlobalPtr<void>(kVaWidescreenMenuItem)) {
+    if (g_graphicsMenu.applied && item == GraphicsMenuItem(kGraphicsMenuWidescreenSlot)) {
         // The language is read on every draw: the game sets it at startup, before any menu opens.
         const std::string text = WidescreenMenuText(g_menuWidescreenOn.load(), g_menuOnText.c_str(),
                                                     g_menuOffText.c_str(), *GlobalPtr<const uint32_t>(kVaGameLanguage));
         strncpy_s(g_widescreenMenuText, text.c_str(), _TRUNCATE);
         return g_widescreenMenuText;
+    }
+    if (g_graphicsMenu.applied && item == GraphicsMenuItem(kGraphicsMenuFarViewSlot)) {
+        const std::string text = FarViewMenuText(g_menuFarViewOn.load(), g_menuOnText.c_str(), g_menuOffText.c_str(),
+                                                 *GlobalPtr<const uint32_t>(kVaGameLanguage));
+        strncpy_s(g_farViewMenuText, text.c_str(), _TRUNCATE);
+        return g_farViewMenuText;
     }
     return g_orig_FUN_0045b930(item);
 }
@@ -866,6 +913,25 @@ int __fastcall WidescreenMenuSelect(void* item) {
     } else {
         LOG_WARN("Options menu: could not write HKCU\\%s\\%s; Widescreen stays %s", kGameRegistryKey,
                  kWidescreenRegistryValueName, newOn ? "Off" : "On");
+    }
+    auto fnRedraw = reinterpret_cast<FUN_00439160_Fn>(Rebase(kVaItemRedraw));
+    fnRedraw(item, item);
+    return 0;
+}
+
+// Select handler of the far view item: same pattern with the FarView value. Draw distance and fade
+// change at the next race start (ApplyRaceDrawDistance).
+int __fastcall FarViewMenuSelect(void* item) {
+    const bool newOn = !g_menuFarViewOn.load();
+    if (WriteOnOffRegistryValue(kFarViewRegistryValueName, newOn)) {
+        g_menuFarViewOn = newOn;
+        LOG_INFO("Options menu: Far view set to %s (HKCU\\%s\\%s = %d, REG_BINARY: %d segments, distance fade %s); "
+                 "applied at the next race start",
+                 newOn ? "On" : "Off", kGameRegistryKey, kFarViewRegistryValueName, newOn ? 1 : 0,
+                 newOn ? kFarViewOnSegments : kFarViewOffSegments, newOn ? "on" : "off");
+    } else {
+        LOG_WARN("Options menu: could not write HKCU\\%s\\%s; Far view stays %s", kGameRegistryKey,
+                 kFarViewRegistryValueName, newOn ? "Off" : "On");
     }
     auto fnRedraw = reinterpret_cast<FUN_00439160_Fn>(Rebase(kVaItemRedraw));
     fnRedraw(item, item);
@@ -1026,11 +1092,10 @@ static rr95::HookSite g_site_FUN_0045a870{
 };
 
 // Distance fade needs both slice draw hooks; without them no quad carries a depth and nothing fades.
+// They are installed with the world hooks whatever [World] DistanceFade says, because the far view
+// menu item can turn the fade on for a later race; the fade itself is switched at every race start
+// (ApplyRaceDistanceFade). While it is off the detours only call the engine.
 static void InstallDistanceFadeHooks() {
-    if (!GetConfig().distanceFade) {
-        LOG_INFO("[World] DistanceFade=0: farthest road slices are not faded");
-        return;
-    }
     if (!rr95::InstallHook(g_site_FUN_0045a790, g_hostModule)) {
         LOG_WARN("Failed to install slice draw hook on FUN_0045a790; distance fade unavailable");
         return;
@@ -1040,41 +1105,34 @@ static void InstallDistanceFadeHooks() {
         rr95::RemoveHook(g_site_FUN_0045a790, g_hostModule);
         return;
     }
-    CaptureSetDistanceFadeHooks(true);
-    LOG_INFO("[World] DistanceFade=1 (start at %.2f of the far depth): slice draw hooks installed",
-             static_cast<double>(GetConfig().distanceFadeStart));
+    g_distanceFadeHooksInstalled = true;
+    const EffectiveFarViewSetting farView = CurrentFarViewSetting();
+    ApplyRaceDistanceFade(farView);
+    LOG_INFO("Slice draw hooks installed; distance fade %s (DistanceFade=%d in the ini, start at %.2f of the far "
+             "depth, setting from %s; decided again at each race start)",
+             farView.distanceFade ? "on" : "off", GetConfig().distanceFade ? 1 : 0,
+             static_cast<double>(GetConfig().distanceFadeStart), WidescreenSettingSourceToString(farView.source));
 }
 
-// Copies bytes [4, kMenuItemSize) of each slot (never the HWND dword the engine owns), slot 5 and 6
-// before slot 4 so slot 4 never leads to a half-written item.
-static void WriteGraphicsMenuSlots(uint8_t* slots, const uint8_t* bytes) {
-    for (int s = 2; s >= 0; --s) {
-        const size_t base = static_cast<size_t>(s) * kMenuItemSize;
-        std::memcpy(slots + base + 4, bytes + base + 4, kMenuItemSize - 4);
-    }
-}
-
-// Adds the item when GpuWorld is configured on and the world and race-init hooks are installed
-// (the caller checks the hooks). Any unexpected byte leaves the menu exactly as shipped.
-static void InstallWidescreenMenuItem() {
+// Relocates graphics menu 19 with the widescreen and far view items when GpuWorld is configured on
+// and the world and race-init hooks are installed (the caller checks the hooks). Any unexpected byte
+// leaves the menu exactly as shipped.
+static void InstallGraphicsMenuItems() {
     const Config& cfg = GetConfig();
     if (!cfg.gpuWorld || !cfg.presenterEnabled) {
-        LOG_INFO("Options menu: GpuWorld is off; the Widescreen item is not added");
+        LOG_INFO("Options menu: GpuWorld is off; the Widescreen and Far view items are not added");
         return;
     }
-    const intptr_t delta = reinterpret_cast<intptr_t>(g_hostModule) - static_cast<intptr_t>(rr95::kPreferredImageBase);
-    const uint32_t count = *GlobalPtr<const uint32_t>(kVaGraphicsMenuCount);
-    uint8_t* slots = GlobalPtr<uint8_t>(kVaGraphicsMenuSlots);
+    uint8_t* module = reinterpret_cast<uint8_t*>(g_hostModule);
     const uint8_t* onOff = GlobalPtr<const uint8_t>(kVaOnOffStrings);
     const uint8_t* redraw = GlobalPtr<const uint8_t>(kVaItemRedraw);
-    const bool countOk = count == kGraphicsMenuCount;
-    const bool slotsOk = GraphicsMenuSlotsAreShipped(slots, delta);
+    const GraphicsMenuCheck menu = CheckGraphicsMenu(module);
     const bool stringsOk = std::memcmp(onOff, kShippedOnOffStrings, sizeof(kShippedOnOffStrings)) == 0;
     const bool redrawOk = std::memcmp(redraw, kItemRedrawPrologue, sizeof(kItemRedrawPrologue)) == 0;
-    if (!countOk || !slotsOk || !stringsOk || !redrawOk) {
-        LOG_WARN("Options menu: unexpected engine bytes (item count %u ok=%d, slots 4..6 ok=%d, On/Off strings ok=%d, "
-                 "FUN_00439160 ok=%d); the graphics menu is left unchanged",
-                 count, countOk ? 1 : 0, slotsOk ? 1 : 0, stringsOk ? 1 : 0, redrawOk ? 1 : 0);
+    if (menu != GraphicsMenuCheck::Ok || !stringsOk || !redrawOk) {
+        LOG_WARN("Options menu: unexpected engine bytes (menu 19: %s, On/Off strings ok=%d, FUN_00439160 ok=%d); "
+                 "the graphics menu is left unchanged",
+                 GraphicsMenuCheckToString(menu), stringsOk ? 1 : 0, redrawOk ? 1 : 0);
         return;
     }
     g_menuOnText.assign(reinterpret_cast<const char*>(onOff));
@@ -1083,29 +1141,30 @@ static void InstallWidescreenMenuItem() {
         LOG_WARN("Options menu: failed to install the hook on FUN_0045b930; the graphics menu is left unchanged");
         return;
     }
-    const EffectiveWidescreenSetting effective = CurrentWidescreenSetting();
-    g_menuWidescreenOn = effective.setting.mode != WidescreenMode::Off;
-    std::memcpy(g_menuShippedSlots, slots, kGraphicsMenuSlotsSize);
-    uint8_t rewritten[kGraphicsMenuSlotsSize];
-    BuildWidescreenMenuSlots(slots, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&WidescreenMenuSelect)),
-                             rewritten);
-    g_widescreenMenuInstalled = true;
-    WriteGraphicsMenuSlots(slots, rewritten);
-    LOG_INFO("Options menu: Widescreen added to the graphics menu (slot 5 at 0x%08X), showing %s "
-             "(setting %s from %s)",
-             static_cast<unsigned>(reinterpret_cast<uintptr_t>(slots + kMenuItemSize)),
-             g_menuWidescreenOn.load() ? "On" : "Off", DescribeWidescreenSetting(effective.setting).c_str(),
-             WidescreenSettingSourceToString(effective.source));
+    const EffectiveWidescreenSetting widescreen = CurrentWidescreenSetting();
+    const EffectiveFarViewSetting farView = CurrentFarViewSetting();
+    g_menuWidescreenOn = widescreen.setting.mode != WidescreenMode::Off;
+    g_menuFarViewOn = FarViewSettingIsOn(farView);
+    const GraphicsMenuCheck relocated = RelocateGraphicsMenu(
+        module, g_graphicsMenuItems, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&WidescreenMenuSelect)),
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&FarViewMenuSelect)), g_graphicsMenu);
+    if (relocated != GraphicsMenuCheck::Ok || !g_graphicsMenu.applied) {
+        LOG_WARN("Options menu: menu 19 changed during the install (%s); the graphics menu is left unchanged",
+                 GraphicsMenuCheckToString(relocated));
+        rr95::RemoveHook(g_site_FUN_0045b930, g_hostModule);
+        g_orig_FUN_0045b930 = nullptr;
+        return;
+    }
+    LOG_INFO("Options menu: graphics menu relocated to 0x%08X with %u items (Widescreen in slot 5 showing %s, "
+             "setting %s from %s; Far view in slot 6 showing %s, %d segments and distance fade %s from %s)",
+             static_cast<unsigned>(reinterpret_cast<uintptr_t>(g_graphicsMenuItems)), kRelocatedGraphicsMenuCount,
+             g_menuWidescreenOn.load() ? "On" : "Off", DescribeWidescreenSetting(widescreen.setting).c_str(),
+             WidescreenSettingSourceToString(widescreen.source), g_menuFarViewOn.load() ? "On" : "Off",
+             farView.drawSegments, farView.distanceFade ? "on" : "off", WidescreenSettingSourceToString(farView.source));
 }
 
-static void RemoveWidescreenMenuItem(HMODULE hostModule) {
-    if (g_widescreenMenuInstalled) {
-        WriteGraphicsMenuSlots(
-            reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(hostModule) +
-                                       (kVaGraphicsMenuSlots - rr95::kPreferredImageBase)),
-            g_menuShippedSlots);
-        g_widescreenMenuInstalled = false;
-    }
+static void RemoveGraphicsMenuItems(HMODULE hostModule) {
+    RestoreGraphicsMenu(reinterpret_cast<uint8_t*>(hostModule), g_graphicsMenu);
     rr95::RemoveHook(g_site_FUN_0045b930, hostModule);
     g_orig_FUN_0045b930 = nullptr;
 }
@@ -1230,7 +1289,7 @@ bool InstallHooks(ExeBuild build) {
             LOG_INFO("Widescreen: effective setting %s (source: %s)",
                      DescribeWidescreenSetting(effective.setting).c_str(),
                      WidescreenSettingSourceToString(effective.source));
-            InstallWidescreenMenuItem();
+            InstallGraphicsMenuItems();
             if (cfg.drawSegmentsAdjusted) {
                 LOG_WARN("[World] DrawSegments is outside %d..%d or not a number; using %d",
                          rr95::kEngineDrawSegments, rr95::kMaxDrawSegments, cfg.drawSegments);
@@ -1263,11 +1322,12 @@ void RemoveHooks() {
     rr95::RemoveIatHook(g_iatGetSaveFileNameA);
     rr95::RemoveHook(g_site_FUN_0043f580, hostModule);
     rr95::RemoveHook(g_site_FUN_0043f7c0, hostModule);
-    RemoveWidescreenMenuItem(hostModule);
+    RemoveGraphicsMenuItems(hostModule);
     rr95::DrawDistanceShutdown();  // the moved arrays live in this DLL
     rr95::RemoveHook(g_site_FUN_00457ef0, hostModule);
     g_worldHooksInstalled = false;
     CaptureSetDistanceFadeHooks(false);
+    g_distanceFadeHooksInstalled = false;
     rr95::RemoveHook(g_site_FUN_0045a870, hostModule);
     rr95::RemoveHook(g_site_FUN_0045a790, hostModule);
     rr95::RemoveHook(g_site_FUN_00467cb0, hostModule);
