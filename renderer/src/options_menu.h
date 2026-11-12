@@ -37,6 +37,7 @@
 // The relocated menu (9 items) restacks the visible rows on the 42-px pitch of the game's own sound
 // menu 17 (rows from y 134, the last one 52 high, ending at 480), so one more row fits:
 //   0..4 as shipped, at y 134 + 42 i, height 42
+//   every visible slot (all but the spacer) 230 px wide instead of 180, see kRelocatedMenuItemWidth
 //   5 widescreen (y 344): label 0x3da, flag 0x100000 (text from the hooked FUN_0045b930), mod handler
 //   6 far view (y 386): the same kind of item
 //   7 the shipped spacer, unchanged
@@ -62,6 +63,24 @@ inline constexpr int kShippedGraphicsMenuDoneSlot = 6;   // "Ya esta" as shipped
 inline constexpr int kRelocatedMenuFirstY = 134;
 inline constexpr int kRelocatedMenuRowHeight = 42;       // menu 17's pitch
 inline constexpr int kRelocatedMenuDoneHeight = 52;      // menu 17's last row
+
+// Label width. FUN_00439160 draws an item's text with FUN_004388c0, which takes the item rect (the
+// RRrect window properties FUN_00439de0 sets from +0x0c..+0x18), moves its left edge right by 0x19
+// and calls DrawTextExA with DT_WORDBREAK and the DRAWTEXTPARAMS at 0x00594dc4 (both margins 0) in
+// font DAT_005c3f2c, CreateFontA(24, ..., "Futura Condensed Bold") from Text/FUTB.DLL. So a label
+// wraps when it is wider than width - 25 px and nothing else limits it; a second line (24 px) does
+// not fit a 42-px row: the next row covers it. The shipped 180 px (155 px of text) wraps "Resolucion
+// de Carrera" (165 px), "Resolucion del motorista" (187) and "Pantalla panoramica: Off" (190). 230 px
+// (205 px of text) keeps the longest label of the five languages, 190 px, on one line with 15 px to
+// spare, and ends at x 230, well left of the help panel (x ~315). The button window, hit test and
+// highlight all use the same rect.
+inline constexpr int kRelocatedMenuItemWidth = 230;
+inline constexpr int kMenuItemTextInset = 0x19;         // FUN_004388c0: left + 0x19
+inline constexpr int kMenuItemTextWidth = kRelocatedMenuItemWidth - kMenuItemTextInset;
+
+// Width in pixels of a CP-1252 label in the menu font (the sum of the glyph advances GDI reports for
+// Futura Condensed Bold at height 24, which is what DrawTextExA measures; no kerning).
+int MenuLabelPixelWidth(const std::string& cp1252);
 
 // Select handlers of the shipped items at the preferred base (relocated by the loader), 0 = none.
 inline constexpr uint32_t kGraphicsMenuHandlerVas[kGraphicsMenuCount] = {
@@ -137,10 +156,10 @@ inline constexpr uint32_t kGameLanguageSpanish = 0x40;
 
 // Item label in the game's language, CP-1252: "Widescreen" (English and unknown values),
 // "Ecran large" (E acute), "Breitbild", "Schermo panoramico", "Pantalla panoramica" (a acute).
-// Kept short: the 180 px button clips longer text.
+// The relocated menu's buttons are kRelocatedMenuItemWidth wide; every label must stay on one line.
 std::string WidescreenMenuLabel(uint32_t gameLanguage);
 
-// The item text. Menu 19 buttons are 180 px wide and FUN_00439680 draws the "\x01" value part at
+// The item text. Menu 19 buttons are narrow and FUN_00439680 draws the "\x01" value part at
 // x = 300, outside them, so the state goes in the single label part: "<label>: <on|off>".
 std::string WidescreenMenuText(bool on, const char* onText, const char* offText, uint32_t gameLanguage);
 

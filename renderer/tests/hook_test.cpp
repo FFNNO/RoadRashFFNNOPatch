@@ -3418,19 +3418,21 @@ int main() {
         auto rectOf = [&](int s, int f) { return static_cast<int32_t>(u32At(item(s) + 0x0c + 4 * f)); };
         bool rowsOk = true;
         for (int s = 0; s <= 6; ++s) {
-            rowsOk = rowsOk && rectOf(s, 0) == 0 && rectOf(s, 1) == 134 + 42 * s && rectOf(s, 2) == 180 &&
+            rowsOk = rowsOk && rectOf(s, 0) == 0 && rectOf(s, 1) == 134 + 42 * s && rectOf(s, 2) == 230 &&
                      rectOf(s, 3) == 42;
         }
-        Check(rowsOk, "menu D4: slots 0..6 on menu 17's 42-px pitch from y 134 (x 0, width 180)");
-        Check(rectOf(8, 0) == 0 && rectOf(8, 1) == 428 && rectOf(8, 2) == 180 && rectOf(8, 3) == 52 &&
+        Check(kRelocatedMenuItemWidth == 230 && kMenuItemTextInset == 0x19 && kMenuItemTextWidth == 205,
+              "menu D4: relocated items are 230 px wide, 205 px of text after FUN_004388c0's 0x19 inset");
+        Check(rowsOk, "menu D4: slots 0..6 on menu 17's 42-px pitch from y 134 (x 0, width 230)");
+        Check(rectOf(8, 0) == 0 && rectOf(8, 1) == 428 && rectOf(8, 2) == 230 && rectOf(8, 3) == 52 &&
                   rectOf(8, 1) + rectOf(8, 3) == 480,
-              "menu D4: 'Ya esta' moves to slot 8, row (0, 428, 180, 52) ending at 480");
+              "menu D4: 'Ya esta' moves to slot 8, row (0, 428, 230, 52) ending at 480");
         Check(std::memcmp(item(7), withHwnd.data() + 7 * kMenuItemSize, kMenuItemSize) == 0,
               "menu D4: the spacer slot 7 is copied unchanged");
         bool keptOk = true;
         for (int s = 0; s <= 4; ++s) {
             const uint8_t* src = withHwnd.data() + static_cast<size_t>(s) * kMenuItemSize;
-            keptOk = keptOk && std::memcmp(item(s), src, 0x10) == 0 && std::memcmp(item(s) + 0x14, src + 0x14, 4) == 0 &&
+            keptOk = keptOk && std::memcmp(item(s), src, 0x10) == 0 &&
                      std::memcmp(item(s) + 0x24, src + 0x24, kMenuItemSize - 0x24) == 0;
         }
         const uint8_t* srcDone = withHwnd.data() + 6 * kMenuItemSize;
@@ -3481,6 +3483,51 @@ int main() {
         }
         Check(escapeItems == 1 && (u32At(item(8) + 0x24) & 0x8000) != 0 && lastEnabled == 8,
               "menu D4: 'Ya esta' is the only Escape item and the last enabled one (End key)");
+
+        // Every label of the relocated menu fits on one line in every language. Widths are the game
+        // font's (Futura Condensed Bold, height 24, from Text/FUTB.DLL), measured with GDI.
+        Check(MenuLabelPixelWidth("Race Resolution") == 120 && MenuLabelPixelWidth("Mezclador de Sonido") == 154 &&
+                  MenuLabelPixelWidth(EncodeCp1252(L"Resolución de Carrera")) == 165 &&
+                  MenuLabelPixelWidth(EncodeCp1252(L"Pantalla panorámica: Off")) == 190 &&
+                  MenuLabelPixelWidth("") == 0,
+              "menu D4: label widths match GDI's measurements of the game font");
+        Check(MenuLabelPixelWidth(EncodeCp1252(L"Resolución de Carrera")) > 180 - kMenuItemTextInset &&
+                  MenuLabelPixelWidth("Mezclador de Sonido") <= 180 - kMenuItemTextInset,
+              "menu D4: the shipped 180 px wraps 'Resolucion de Carrera' but not 'Mezclador de Sonido' (as seen)");
+        {
+            // The game's labels 0x48, 0x18c, 0x52, 0x1af, 0x3de, 0x56 from Text/ENU, FRA, DEU, ITA, ESP.DLL.
+            const wchar_t* gameLabels[][6] = {
+                {L"Race Resolution", L"Biker Resolution", L"Sound Mix", L"Videos", L"Display", L"Done"},
+                {L"Résolution course", L"Résolution du motard", L"Mixage du son", L"Vidéos",
+                 L"Affichage", L"Terminé"},
+                {L"Auflösung", L"Fahrer-Auflösung", L"Geräuschemix", L"Videos", L"Anzeige",
+                 L"Erledigt"},
+                {L"Risoluzione Corsa", L"Risoluzione motociclisti", L"Mix Sonoro", L"Filmati", L"Schermo", L"Fatto"},
+                {L"Resolución de Carrera", L"Resolución del motorista", L"Mezclador de Sonido", L"Videos",
+                 L"Pantalla", L"Ya está"},
+            };
+            const uint32_t languages[] = {kGameLanguageEnglish, kGameLanguageFrench, kGameLanguageGerman,
+                                          kGameLanguageItalian, kGameLanguageSpanish};
+            bool allFit = true;
+            int widest = 0;
+            for (int l = 0; l < 5; ++l) {
+                std::vector<std::string> labels;
+                for (const wchar_t* g : gameLabels[l]) {
+                    labels.push_back(EncodeCp1252(g));
+                }
+                for (bool on : {false, true}) {
+                    labels.push_back(WidescreenMenuText(on, "On", "Off", languages[l]));
+                    labels.push_back(FarViewMenuText(on, "On", "Off", languages[l]));
+                }
+                for (const std::string& text : labels) {
+                    const int w = MenuLabelPixelWidth(text);
+                    widest = std::max(widest, w);
+                    allFit = allFit && !text.empty() && w > 0 && w <= kMenuItemTextWidth;
+                }
+            }
+            Check(allFit && widest == 190,
+                  "menu D4: every label (game and mod, On and Off, 5 languages) fits 205 px; the widest is 190");
+        }
 
         // Relocation on a fake image: module bytes for VAs 0x00400000..0x005a1000.
         std::vector<uint8_t> image(0x001a1000, 0);

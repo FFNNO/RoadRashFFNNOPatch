@@ -13,6 +13,7 @@ namespace {
 constexpr size_t kOffId = 0x04;
 constexpr size_t kOffLabel = 0x08;
 constexpr size_t kOffY = 0x10;
+constexpr size_t kOffWidth = 0x14;
 constexpr size_t kOffHeight = 0x18;
 constexpr size_t kOffNav = 0x1c;  // left, right, up, down, Tab, Shift+Tab
 constexpr size_t kOffFlags = 0x24;
@@ -66,6 +67,27 @@ constexpr uint8_t kShippedGraphicsMenuItems[kGraphicsMenuItemsSize] = {
     0x72, 0x00, 0x00, 0x00, 0xb4, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
+// Advance widths in pixels of CP-1252 bytes 0x20..0xff in the menu font, Futura Condensed Bold from
+// Text/FUTB.DLL created like the game does (CreateFontA(24, 0, ..., 4, "Futura Condensed Bold")),
+// measured with GetTextExtentPoint32A one byte at a time. The sum over a label equals GDI's extent
+// of the whole label for every menu 19 label in the five languages (no kerning).
+constexpr uint8_t kMenuFontAdvance[0x100 - 0x20] = {
+    4, 6, 8, 10, 10, 17, 13, 5, 6, 6, 8, 10, 7, 7, 6, 11,
+    10, 6, 10, 10, 10, 9, 10, 10, 10, 10, 6, 7, 11, 10, 10, 10,
+    16, 11, 9, 10, 10, 8, 8, 12, 10, 5, 7, 10, 8, 14, 11, 12,
+    10, 12, 10, 9, 9, 10, 11, 16, 10, 10, 10, 7, 11, 7, 7, 12,
+    6, 9, 9, 7, 9, 9, 7, 9, 9, 6, 6, 9, 5, 13, 9, 9,
+    9, 9, 7, 8, 7, 9, 9, 13, 9, 9, 8, 7, 4, 7, 9, 14,
+    14, 0, 7, 10, 10, 17, 9, 6, 6, 14, 14, 14, 15, 0, 14, 0,
+    0, 7, 7, 10, 10, 9, 9, 16, 6, 14, 14, 14, 14, 0, 14, 11,
+    8, 6, 7, 11, 14, 11, 14, 10, 9, 16, 7, 11, 16, 14, 16, 14,
+    6, 10, 14, 14, 5, 12, 11, 6, 14, 14, 8, 11, 14, 14, 14, 10,
+    11, 11, 11, 11, 11, 11, 14, 10, 8, 8, 8, 8, 6, 6, 6, 6,
+    14, 11, 12, 12, 12, 12, 12, 0, 12, 10, 10, 10, 10, 14, 14, 9,
+    9, 9, 9, 9, 9, 9, 14, 7, 9, 8, 9, 9, 6, 6, 6, 6,
+    14, 8, 9, 9, 9, 9, 9, 14, 9, 8, 8, 8, 9, 0, 14, 9,
 };
 
 // Relocated navigation (left, right, up, down, Tab, Shift+Tab) per slot; slot 7 (the spacer) keeps
@@ -157,10 +179,22 @@ void BuildRelocatedGraphicsMenu(const uint8_t* shipped, uint32_t widescreenHandl
         const bool done = s == kGraphicsMenuDoneSlot;
         const int row = done ? kGraphicsMenuFarViewSlot + 1 : s;
         PutU32(item + kOffY, static_cast<uint32_t>(kRelocatedMenuFirstY + kRelocatedMenuRowHeight * row));
+        PutU32(item + kOffWidth, static_cast<uint32_t>(kRelocatedMenuItemWidth));
         PutU32(item + kOffHeight, static_cast<uint32_t>(done ? kRelocatedMenuDoneHeight : kRelocatedMenuRowHeight));
         std::memcpy(item + kOffNav, kRelocatedNav[s], 6);
     }
     std::memcpy(out, items, kRelocatedGraphicsMenuSize);
+}
+
+int MenuLabelPixelWidth(const std::string& cp1252) {
+    int width = 0;
+    for (const char c : cp1252) {
+        const uint8_t b = static_cast<uint8_t>(c);
+        if (b >= 0x20) {
+            width += kMenuFontAdvance[b - 0x20];
+        }
+    }
+    return width;
 }
 
 const char* GraphicsMenuCheckToString(GraphicsMenuCheck check) {
