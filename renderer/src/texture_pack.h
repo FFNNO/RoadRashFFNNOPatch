@@ -18,6 +18,14 @@ std::string FormatTextureId(int32_t width, int32_t height, uint32_t level0Crc32)
 // and fits (width >> level) x (height >> level) texels.
 bool ValidateMipLevelPointer(const void* ptr, int32_t width, int32_t height, int32_t level);
 
+// True when every byte of [ptr, ptr + bytes) is committed, readable memory. Walks every
+// VirtualQuery region the span touches, so a span across regions with different protection passes.
+bool IsReadableMemoryRange(const void* ptr, size_t bytes);
+
+// Bytes from the first texel of a width x height rect with the given row pitch to one past its
+// last texel: (height - 1) * rowPitch + width. Zero for an empty rect or a pitch narrower than it.
+size_t TexelRectSpanBytes(int32_t width, int32_t height, int32_t rowPitch);
+
 // Saves RGBA8 pixels (stride width * 4) as a PNG using WIC.
 bool SaveRgbaPngWithWic(const std::wstring& path, int32_t width, int32_t height, const uint32_t* rgbaPixels);
 

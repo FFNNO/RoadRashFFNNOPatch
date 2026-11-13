@@ -47,28 +47,50 @@ bool ValidateMipLevelPointer(const void* ptr, int32_t width, int32_t height, int
         return false;
     }
     const size_t bytes = static_cast<size_t>(w) * static_cast<size_t>(h);
+    return IsReadableMemoryRange(ptr, bytes);
+}
 
-    MEMORY_BASIC_INFORMATION mbi = {};
-    if (VirtualQuery(ptr, &mbi, sizeof(mbi)) == 0) {
-        return false;
-    }
-    if (mbi.State != MEM_COMMIT) {
-        return false;
-    }
-    if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) {
+bool IsReadableMemoryRange(const void* ptr, size_t bytes) {
+    if (!ptr) {
         return false;
     }
     const DWORD readableMask = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
                                PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-    if ((mbi.Protect & readableMask) == 0) {
+    const uintptr_t start = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t span = bytes > 0 ? bytes : 1;
+    if (start + span < start) {
         return false;
     }
-    const uintptr_t start = reinterpret_cast<uintptr_t>(ptr);
-    const uintptr_t allocEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-    if (start + bytes > allocEnd) {
-        return false;
+    const uintptr_t end = start + span;
+    uintptr_t cursor = start;
+    while (cursor < end) {
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &mbi, sizeof(mbi)) == 0) {
+            return false;
+        }
+        if (mbi.State != MEM_COMMIT) {
+            return false;
+        }
+        if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) {
+            return false;
+        }
+        if ((mbi.Protect & readableMask) == 0) {
+            return false;
+        }
+        const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        if (regionEnd <= cursor) {
+            return false;
+        }
+        cursor = regionEnd;
     }
     return true;
+}
+
+size_t TexelRectSpanBytes(int32_t width, int32_t height, int32_t rowPitch) {
+    if (width <= 0 || height <= 0 || rowPitch < width) {
+        return 0;
+    }
+    return static_cast<size_t>(height - 1) * static_cast<size_t>(rowPitch) + static_cast<size_t>(width);
 }
 
 bool SaveRgbaPngWithWic(const std::wstring& path, int32_t width, int32_t height, const uint32_t* rgbaPixels) {

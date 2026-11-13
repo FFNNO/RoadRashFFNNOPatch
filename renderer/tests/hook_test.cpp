@@ -1981,6 +1981,37 @@ int main() {
               "ValidateMipLevelPointer rejects level where dimension shifts to zero (32 >> 6 == 0)");
     }
 
+    // 2b. Texel reads are range-checked before the CRC and the pixel cache touch them: a PDAT whose
+    // level-0 rect runs past committed memory crashed the game mid-race (fault in the CRC loop).
+    {
+        SYSTEM_INFO si = {};
+        GetSystemInfo(&si);
+        const size_t page = si.dwPageSize;
+        uint8_t* base = static_cast<uint8_t*>(VirtualAlloc(nullptr, page * 3, MEM_RESERVE, PAGE_NOACCESS));
+        Check(base != nullptr, "texel guard test reserved three pages");
+        VirtualAlloc(base, page, MEM_COMMIT, PAGE_READWRITE);
+        VirtualAlloc(base + page, page, MEM_COMMIT, PAGE_READONLY);
+        // The third page stays reserved but not committed.
+        Check(IsReadableMemoryRange(base, page), "readable range accepts one committed page");
+        Check(IsReadableMemoryRange(base + 16, page * 2 - 16),
+              "readable range accepts a span across two committed regions with different protection");
+        Check(!IsReadableMemoryRange(base + page, page + 1),
+              "readable range rejects a span that runs one byte into reserved memory");
+        Check(!IsReadableMemoryRange(base + page * 2, 1), "readable range rejects reserved memory");
+        Check(!IsReadableMemoryRange(nullptr, 1), "readable range rejects null");
+        Check(IsReadableMemoryRange(base, 0), "readable range accepts an empty span at a valid pointer");
+        DWORD oldProtect = 0;
+        Check(VirtualProtect(base + page, page, PAGE_NOACCESS, &oldProtect) != FALSE,
+              "texel guard test made the second page no-access");
+        Check(!IsReadableMemoryRange(base + page - 4, 8), "readable range rejects a span into a no-access page");
+        VirtualFree(base, 0, MEM_RELEASE);
+
+        Check(TexelRectSpanBytes(256, 32, 256) == 256u * 32u, "texel span of a packed 256x32 texture");
+        Check(TexelRectSpanBytes(54, 24, 256) == 23u * 256u + 54u, "texel span of a 54x24 sprite with pitch 256");
+        Check(TexelRectSpanBytes(0, 24, 256) == 0u, "texel span of an empty rect is zero");
+        Check(TexelRectSpanBytes(64, 64, 32) == 0u, "texel span is zero when the pitch is narrower than the rect");
+    }
+
     // 3. SaveRgbaPngWithWic test
     {
         wchar_t tempPath[MAX_PATH] = {0};

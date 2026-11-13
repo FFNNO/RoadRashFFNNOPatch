@@ -92,6 +92,9 @@ std::wstring& g_dumpDir = *new std::wstring();
 CapturedQuad g_capturedQuads[kMaxCapturedQuads];
 uint32_t g_capturedCount = 0;
 uint32_t g_overflowCount = 0;
+// Textured quads whose PDAT header or level-0 texels were not readable memory; they are dropped
+// instead of hashed (hashing them faulted in the CRC loop and closed the game mid-race).
+uint32_t g_unreadableTexelQuads = 0;
 uint32_t g_batchIndex = 0;
 // Set when the level state changed after the first batch of a frame; the texel cache is cleared
 // before the first batch of the next frame (see DecideCacheInvalidation).
@@ -1493,6 +1496,25 @@ void CaptureOnBatchEnd() {
     SnapshotHorizonAndClearSurfaceIfNeeded();
 }
 
+// Checks that a texel read stays inside committed, readable memory. When it does not, the quad
+// loses its texture (q.pdatPtr = 0, so the GPU path culls it) and the first few cases are logged.
+static bool TexelReadIsSafe(CapturedQuad& q, const void* ptr, size_t bytes, int32_t width, int32_t height,
+                            int32_t rowPitch) {
+    if (IsReadableMemoryRange(ptr, bytes)) {
+        return true;
+    }
+    ++g_unreadableTexelQuads;
+    if (g_unreadableTexelQuads <= 8) {
+        LOG_WARN("PDAT 0x%08X: %zu bytes at %p (%dx%d, pitch %d) are not readable memory; quad dropped (%u so far)",
+                 q.pdatPtr, bytes, ptr, width, height, rowPitch, g_unreadableTexelQuads);
+    }
+    q.pdatPtr = 0;
+    q.texWidth = 0;
+    q.texHeight = 0;
+    q.level0Crc32 = 0;
+    return false;
+}
+
 int CaptureTexturedQuadBefore() {
     if (!g_hostModule) {
         return -1;
@@ -1556,6 +1578,16 @@ int CaptureTexturedQuadBefore() {
 
     if (pdat) {
         q.pdatPtr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pdat));
+        // Header through the level count at +0x28, then the level table (+0x38 + 12 * i) that
+        // CaptureTexturedQuadAfter walks for up to that many levels.
+        if (!TexelReadIsSafe(q, pdat, 0x2C, 0, 0, 0)) {
+            return static_cast<int>(slot);
+        }
+        const int32_t headerMips = *reinterpret_cast<const int32_t*>(pdat + 0x28);
+        const int32_t tableMips = (headerMips > 0 && headerMips <= kMaxTextureMipLevels) ? headerMips : 1;
+        if (!TexelReadIsSafe(q, pdat, 0x3C + 12 * static_cast<size_t>(tableMips - 1), 0, 0, 0)) {
+            return static_cast<int>(slot);
+        }
         q.pdatMagic = *reinterpret_cast<const uint32_t*>(pdat + 0x00);
         q.pdatFlags = *reinterpret_cast<const uint32_t*>(pdat + 0x0c);
         const int32_t pdatPitch = *reinterpret_cast<const int32_t*>(pdat + 0x20);
@@ -1570,6 +1602,11 @@ int CaptureTexturedQuadBefore() {
             ClampSpriteDimensions(q.uvBox, pdatPitch, pdatHeight, spriteW, spriteH);
             q.texWidth = spriteW;
             q.texHeight = spriteH;
+            if (spriteW > 0 && spriteH > 0 &&
+                !TexelReadIsSafe(q, level0Ptr, TexelRectSpanBytes(spriteW, spriteH, pdatPitch), spriteW, spriteH,
+                                 pdatPitch)) {
+                return static_cast<int>(slot);
+            }
 
             uint8_t clutDescriptor[257];
             clutDescriptor[0] = q.spriteClut;
@@ -1593,6 +1630,11 @@ int CaptureTexturedQuadBefore() {
         } else {
             q.texWidth = pdatPitch;
             q.texHeight = pdatHeight;
+            if (pdatPitch > 0 && pdatHeight > 0 &&
+                !TexelReadIsSafe(q, level0Ptr, TexelRectSpanBytes(pdatPitch, pdatHeight, pdatPitch), pdatPitch,
+                                 pdatHeight, pdatPitch)) {
+                return static_cast<int>(slot);
+            }
             const uint32_t keyB = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(level0Ptr));
             q.level0Crc32 = LookupOrComputeLevel0Crc32(
                 q.pdatPtr, keyB, level0Ptr, pdatPitch, pdatHeight, pdatPitch, nullptr, 0);
@@ -1747,7 +1789,7 @@ int CaptureFlatQuadBefore(const int32_t* polyVerts, int edxArg) {
         q.clipRect[i] = clipRect[i];
     }
 
-    if (pdat) {
+    if (pdat && IsReadableMemoryRange(pdat, 0x10)) {
         q.pdatPtr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pdat));
         q.pdatMagic = *reinterpret_cast<const uint32_t*>(pdat + 0x00);
         q.pdatFlags = *reinterpret_cast<const uint32_t*>(pdat + 0x0c);
