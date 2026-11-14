@@ -77,7 +77,10 @@ static LONG CALLBACK CrashLogHandler(EXCEPTION_POINTERS* info) {
     }
     const unsigned faultAddr = rec.NumberParameters >= 2 ? static_cast<unsigned>(rec.ExceptionInformation[1]) : 0u;
     const char* op = (rec.NumberParameters >= 1 && rec.ExceptionInformation[0] == 1) ? "write" : "read";
-    LOG_ERROR("Crash: access violation (%s of 0x%08x) at %s", op, faultAddr, where);
+    // Vectored handlers see first-chance exceptions: if the game handles this one it keeps running,
+    // so a crash is the last of these lines before the log ends.
+    LOG_ERROR("Crash: access violation (%s of 0x%08x) at %s (fatal unless the game handles it)", op, faultAddr,
+              where);
     LOG_ERROR("Crash: eax=%08x ebx=%08x ecx=%08x edx=%08x esi=%08x edi=%08x ebp=%08x esp=%08x",
               static_cast<unsigned>(ctx.Eax), static_cast<unsigned>(ctx.Ebx), static_cast<unsigned>(ctx.Ecx),
               static_cast<unsigned>(ctx.Edx), static_cast<unsigned>(ctx.Esi), static_cast<unsigned>(ctx.Edi),

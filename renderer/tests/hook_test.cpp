@@ -841,8 +841,9 @@ void TestDrawDistance() {
         Check(kSpriteCacheKeyInvalid >= 0, "draw distance: the invalid key is not negative (negative keys skip the reset)");
         *reinterpret_cast<int32_t**>(rowB + 0xfc) = nullptr;
         *reinterpret_cast<uint8_t**>(slice + 0x14) = nullptr;
+        slotA[0] = 77;
         InvalidateSliceSpriteCacheKeys(slice);
-        Check(true, "draw distance: null rows and null cache tables are skipped");
+        Check(slotA[0] == 77, "draw distance: null rows and null cache tables are skipped without writing");
     }
 
     int seg = 0;
