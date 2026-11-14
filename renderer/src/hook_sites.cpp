@@ -80,6 +80,12 @@ FUN_00457ef0_Fn g_orig_FUN_00457ef0 = nullptr;
 FUN_0045b930_Fn g_orig_FUN_0045b930 = nullptr;
 FUN_0045a790_Fn g_orig_FUN_0045a790 = nullptr;
 FUN_0045a870_Fn g_orig_FUN_0045a870 = nullptr;
+// FUN_004655b0(ecx = sprite, edx, one stack argument; ret 4): validates the sprite and dispatches.
+using FUN_004655b0_Fn = int(__fastcall*)(const void* sprite, int edxArg, int stackArg);
+FUN_004655b0_Fn g_orig_FUN_004655b0 = nullptr;
+uint32_t g_refusedSprites = 0;
+// Advanced at every race frame end; sprites validated in an earlier frame are checked again.
+uint32_t g_spriteCheckFrame = 1;
 
 // FUN_004688e0, FUN_0042e850 and FUN_00467cb0 are all hooked; widescreen depends on it, because
 // those detours are what keep the software world rasterizers from running.
@@ -412,6 +418,7 @@ void FinishRaceFrameAndPollHotkeys() {
     const RaceFrameActions actions = AdvanceRaceFrame(s_hotkeyState, cfg.captureEnabled, cfg.gpuWorld, vk, keyDown);
     if (actions.endCaptureFrame) {
         CaptureEndFrame();
+        ++g_spriteCheckFrame;
     }
     // Distance fade: the end-of-frame flush FUN_0046c7c0 goes through FUN_004227f0, which always ends
     // in the hooked FUN_004688e0, so every entry was drawn by now; no tag survives into the next frame.
@@ -651,6 +658,39 @@ void __fastcall Detour_FUN_0045a870(uint8_t* slice, int edxArg) {
     if (!rr95::DrawDistanceSliceIsWithinEngineRange(slice)) {
         rr95::InvalidateSliceSpriteCacheKeys(slice);
     }
+}
+
+// Far view: a cached roadside sprite pointer can be garbage (0x28: an unrelocated offset of a sprite
+// bank being loaded for the next track section). The engine already maps 0 to its default sprite.
+// Sprites already validated this frame (one slot per hash, valid for the frame it was set in).
+struct SpriteCheckEntry {
+    const void* sprite;
+    uint32_t frame;
+};
+SpriteCheckEntry g_spriteCheckCache[256] = {};
+
+static bool SpriteIsValidCached(const void* sprite) {
+    SpriteCheckEntry& seen = g_spriteCheckCache[(reinterpret_cast<uintptr_t>(sprite) >> 4) & 255u];
+    if (seen.frame == g_spriteCheckFrame && seen.sprite == sprite) {
+        return true;
+    }
+    if (!rr95::IsEngineSpriteObject(sprite)) {
+        return false;
+    }
+    seen = SpriteCheckEntry{sprite, g_spriteCheckFrame};
+    return true;
+}
+
+int __fastcall Detour_FUN_004655b0(const void* sprite, int edxArg, int stackArg) {
+    if (sprite && !SpriteIsValidCached(sprite)) {
+        ++g_refusedSprites;
+        if (g_refusedSprites <= 8) {
+            LOG_WARN("Sprite object %p is not a readable PGLC sprite; drawn as the default sprite (%u so far)",
+                     sprite, g_refusedSprites);
+        }
+        return 0;
+    }
+    return g_orig_FUN_004655b0 ? g_orig_FUN_004655b0(sprite, edxArg, stackArg) : 0;
 }
 
 void __cdecl Detour_FUN_0042e850() {
@@ -1090,6 +1130,18 @@ static rr95::HookSite g_site_FUN_0045a790{
     {2}
 };
 
+// First 5 bytes at 0x004655b0 (sprite validate/dispatch) in both exes: push ebp; mov ebp, esp; test ecx, ecx.
+static rr95::HookSite g_site_FUN_004655b0{
+    "FUN_004655b0",
+    0x004655b0,
+    {0x55, 0x8B, 0xEC, 0x85, 0xC9},
+    5,
+    {1, 2, 2},
+    reinterpret_cast<void*>(&Detour_FUN_004655b0),
+    reinterpret_cast<void**>(&g_orig_FUN_004655b0),
+    false,
+};
+
 static rr95::HookSite g_site_FUN_0045a870{
     "FUN_0045a870",
     0x0045a870,
@@ -1113,6 +1165,12 @@ static void InstallDistanceFadeHooks() {
     }
     if (!rr95::InstallHook(g_site_FUN_0045a870, g_hostModule)) {
         LOG_WARN("Failed to install slice draw hook on FUN_0045a870; distance fade unavailable");
+        rr95::RemoveHook(g_site_FUN_0045a790, g_hostModule);
+        return;
+    }
+    if (!rr95::InstallHook(g_site_FUN_004655b0, g_hostModule)) {
+        LOG_WARN("Failed to install sprite guard hook on FUN_004655b0; far view unavailable");
+        rr95::RemoveHook(g_site_FUN_0045a870, g_hostModule);
         rr95::RemoveHook(g_site_FUN_0045a790, g_hostModule);
         return;
     }
@@ -1340,6 +1398,7 @@ void RemoveHooks() {
     CaptureSetDistanceFadeHooks(false);
     g_distanceFadeHooksInstalled = false;
     rr95::RemoveHook(g_site_FUN_0045a870, hostModule);
+    rr95::RemoveHook(g_site_FUN_004655b0, hostModule);
     rr95::RemoveHook(g_site_FUN_0045a790, hostModule);
     rr95::RemoveHook(g_site_FUN_00467cb0, hostModule);
     rr95::RemoveHook(g_site_FUN_0042e850, hostModule);
@@ -1351,6 +1410,7 @@ void RemoveHooks() {
     g_orig_FUN_0043f7c0 = nullptr;
     g_orig_FUN_00457ef0 = nullptr;
     g_orig_FUN_0045a870 = nullptr;
+    g_orig_FUN_004655b0 = nullptr;
     g_orig_FUN_0045a790 = nullptr;
     g_orig_FUN_00467cb0 = nullptr;
     g_orig_FUN_0042e850 = nullptr;

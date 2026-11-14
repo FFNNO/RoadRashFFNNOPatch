@@ -467,6 +467,13 @@ bool DrawDistanceSliceIsWithinEngineRange(const uint8_t* slice) {
     return SliceIsWithinEngineRange(g_sliceOverride, slice);
 }
 
+bool IsEngineSpriteObject(const void* p) {
+    if (reinterpret_cast<uintptr_t>(p) < 0x10000u || !IsReadableMemoryRange(p, 0x18)) {
+        return false;
+    }
+    return *static_cast<const uint32_t*>(p) == kEngineSpriteMagic;
+}
+
 void InvalidateSliceSpriteCacheKeys(uint8_t* slice) {
     if (!slice || !IsReadableMemoryRange(slice + 0x14, 8)) {
         return;

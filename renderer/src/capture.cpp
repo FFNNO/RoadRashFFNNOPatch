@@ -1498,9 +1498,25 @@ void CaptureOnBatchEnd() {
 
 // Checks that a texel read stays inside committed, readable memory. When it does not, the quad
 // loses its texture (q.pdatPtr = 0, so the GPU path culls it) and the first few cases are logged.
+// Spans already found readable this frame (VirtualQuery for every quad cost frames): one entry
+// per hash slot, valid only for the frame it was checked in (g_texelCheckFrame, CaptureEndFrame).
+struct TexelCheckEntry {
+    const void* ptr;
+    size_t bytes;
+    uint32_t frame;
+};
+static TexelCheckEntry g_texelCheckCache[512] = {};
+static uint32_t g_texelCheckFrame = 1;
+
 static bool TexelReadIsSafe(CapturedQuad& q, const void* ptr, size_t bytes, int32_t width, int32_t height,
                             int32_t rowPitch) {
+    TexelCheckEntry& seen =
+        g_texelCheckCache[((reinterpret_cast<uintptr_t>(ptr) >> 4) ^ bytes) & 511u];
+    if (seen.frame == g_texelCheckFrame && seen.ptr == ptr && seen.bytes == bytes) {
+        return true;
+    }
     if (IsReadableMemoryRange(ptr, bytes)) {
+        seen = TexelCheckEntry{ptr, bytes, g_texelCheckFrame};
         return true;
     }
     ++g_unreadableTexelQuads;
@@ -1958,6 +1974,7 @@ ThinQuadStats CaptureTakeThinQuadStats() {
 }
 
 void CaptureEndFrame() {
+    ++g_texelCheckFrame;
     if (g_thinQuadFrameActive) {
         AccumulateThinQuadFrame(g_thinQuadStats, g_thinQuadFrame);
         g_thinQuadFrame = ThinQuadFrameCounts{};

@@ -804,6 +804,20 @@ void TestDrawDistance() {
               "draw distance: a slice before the relocated array counts as in range");
     }
 
+    // FUN_004655b0 only checks for null before reading the 'PGLC' magic; a cached sprite pointer of
+    // 0x28 (an unrelocated bank offset) crashed it. The detour refuses anything that is not a
+    // readable object with that magic, and the engine treats the 0 it returns as "no sprite".
+    {
+        alignas(4) uint32_t sprite[8] = {0x434c4750u, 0, 0, 0, 0, 1, 0, 0};
+        alignas(4) uint32_t other[8] = {0x12345678u};
+        Check(IsEngineSpriteObject(sprite), "sprite guard: a readable PGLC object passes");
+        Check(!IsEngineSpriteObject(other), "sprite guard: wrong magic is refused");
+        Check(!IsEngineSpriteObject(reinterpret_cast<const void*>(0x28)), "sprite guard: 0x28 is refused");
+        Check(!IsEngineSpriteObject(nullptr), "sprite guard: null is refused");
+        Check(!IsEngineSpriteObject(reinterpret_cast<const void*>(0xDEADBEE0)),
+              "sprite guard: an uncommitted pointer is refused");
+    }
+
     // Far slices' roadside sprite caches are invalidated after drawing: FUN_00459170 resets a cache
     // slot (row+0xfc, key in dword 0) only when its key differs from the segment id, so entries
     // filled from a sprite bank that is later reloaded stayed dangling (crash in FUN_004655b0).

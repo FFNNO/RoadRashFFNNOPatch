@@ -151,4 +151,11 @@ inline constexpr int32_t kSpriteCacheKeyInvalid = 0x7fffffff;
 // slice; null rows or tables and unreadable memory are skipped. Entries are left as they are.
 void InvalidateSliceSpriteCacheKeys(uint8_t* slice);
 
+// FUN_004655b0 (fastcall, ecx = sprite object) returns 0 for null or a missing 'PGLC' magic, but
+// reads the magic of any other pointer. With far view a cached sprite pointer can be an unrelocated
+// bank offset (0x28 seen), which crashed it. True when p is committed readable memory holding a
+// sprite header (0x18 bytes) with that magic.
+inline constexpr uint32_t kEngineSpriteMagic = 0x434c4750u;  // "PGLC"
+bool IsEngineSpriteObject(const void* p);
+
 }  // namespace rr95
