@@ -1505,8 +1505,8 @@ static bool TexelReadIsSafe(CapturedQuad& q, const void* ptr, size_t bytes, int3
     }
     ++g_unreadableTexelQuads;
     if (g_unreadableTexelQuads <= 8) {
-        LOG_WARN("PDAT 0x%08X: %zu bytes at %p (%dx%d, pitch %d) are not readable memory; quad dropped (%u so far)",
-                 q.pdatPtr, bytes, ptr, width, height, rowPitch, g_unreadableTexelQuads);
+        LOG_WARN("PDAT 0x%08X: %zu bytes at %p (%dx%d, pitch %d) are not readable memory; quad dropped (%u so far, depth %d)",
+                 q.pdatPtr, bytes, ptr, width, height, rowPitch, g_unreadableTexelQuads, q.depthZ);
     }
     q.pdatPtr = 0;
     q.texWidth = 0;

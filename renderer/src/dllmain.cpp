@@ -1,4 +1,6 @@
 #include <windows.h>
+#include <cstdint>
+#include <cstdio>
 #include <ddraw.h>
 #include <mutex>
 #include <string>
@@ -25,6 +27,87 @@ static std::wstring GetModuleDir(HMODULE hMod) {
         return s.substr(0, slash);
     }
     return L"";
+}
+
+// Crash diagnostics: an access violation in the game or in this DLL is written to the log
+// (address, registers, likely return addresses on the stack) before the process dies, so a
+// player's rr95gpu.log says where it crashed. Observation only: the exception keeps going.
+static uintptr_t ModuleEnd(HMODULE mod) {
+    const auto base = reinterpret_cast<uintptr_t>(mod);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    return base + nt->OptionalHeader.SizeOfImage;
+}
+
+static uintptr_t g_exeBase = 0;
+static uintptr_t g_exeEnd = 0;
+static uintptr_t g_selfBase = 0;
+static uintptr_t g_selfEnd = 0;
+
+// "exe+0x655b7" / "ddraw+0x15f60" for addresses in either module, empty otherwise.
+static bool DescribeCodeAddress(uintptr_t addr, char* out, size_t outLen) {
+    if (addr >= g_exeBase && addr < g_exeEnd) {
+        std::snprintf(out, outLen, "exe+0x%x (VA 0x%08x)", static_cast<unsigned>(addr - g_exeBase),
+                      static_cast<unsigned>(addr - g_exeBase + 0x400000u));
+        return true;
+    }
+    if (addr >= g_selfBase && addr < g_selfEnd) {
+        std::snprintf(out, outLen, "ddraw+0x%x", static_cast<unsigned>(addr - g_selfBase));
+        return true;
+    }
+    return false;
+}
+
+static LONG CALLBACK CrashLogHandler(EXCEPTION_POINTERS* info) {
+    static LONG s_logged = 0;
+    if (!info || !info->ExceptionRecord || !info->ContextRecord) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const EXCEPTION_RECORD& rec = *info->ExceptionRecord;
+    if (rec.ExceptionCode != EXCEPTION_ACCESS_VIOLATION) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const CONTEXT& ctx = *info->ContextRecord;
+    char where[64] = {};
+    if (!DescribeCodeAddress(static_cast<uintptr_t>(ctx.Eip), where, sizeof(where))) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (InterlockedIncrement(&s_logged) > 3) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const unsigned faultAddr = rec.NumberParameters >= 2 ? static_cast<unsigned>(rec.ExceptionInformation[1]) : 0u;
+    const char* op = (rec.NumberParameters >= 1 && rec.ExceptionInformation[0] == 1) ? "write" : "read";
+    LOG_ERROR("Crash: access violation (%s of 0x%08x) at %s", op, faultAddr, where);
+    LOG_ERROR("Crash: eax=%08x ebx=%08x ecx=%08x edx=%08x esi=%08x edi=%08x ebp=%08x esp=%08x",
+              static_cast<unsigned>(ctx.Eax), static_cast<unsigned>(ctx.Ebx), static_cast<unsigned>(ctx.Ecx),
+              static_cast<unsigned>(ctx.Edx), static_cast<unsigned>(ctx.Esi), static_cast<unsigned>(ctx.Edi),
+              static_cast<unsigned>(ctx.Ebp), static_cast<unsigned>(ctx.Esp));
+    // Stack words that point into either module are likely return addresses (newest first).
+    const auto* stack = reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(ctx.Esp));
+    int found = 0;
+    for (int i = 0; i < 256 && found < 16; ++i) {
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (VirtualQuery(stack + i, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+            break;
+        }
+        char ret[64] = {};
+        if (DescribeCodeAddress(stack[i], ret, sizeof(ret))) {
+            LOG_ERROR("Crash: stack[%d] -> %s", i, ret);
+            ++found;
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void InstallCrashLog() {
+    g_exeBase = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    g_exeEnd = ModuleEnd(GetModuleHandleW(nullptr));
+    g_selfBase = reinterpret_cast<uintptr_t>(g_hModule);
+    g_selfEnd = ModuleEnd(g_hModule);
+    if (AddVectoredExceptionHandler(0, CrashLogHandler)) {
+        LOG_INFO("Crash log armed (access violations in the game or this DLL are logged)");
+    }
 }
 
 static bool LoadSystemDirectDraw() {
@@ -63,6 +146,7 @@ static void InitializeProxy() {
         LogInit(logPath, cfg.logLevel);
 
         LOG_INFO("rr95gpu proxy ddraw.dll loaded");
+        InstallCrashLog();
         if (cfg.unknownFilterWarning) {
             LOG_WARN("Unknown Filter value '%ls' in rr95gpu.ini; defaulting to bilinear",
                      cfg.rawFilterString.c_str());
