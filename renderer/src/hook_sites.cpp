@@ -49,6 +49,10 @@ constexpr uint32_t kVaBufferWidth    = 0x005ce85c;
 constexpr uint32_t kVaBufferHeight   = 0x005ce860;
 constexpr uint32_t kVaDibBuffer      = 0x005ce864;
 constexpr uint32_t kVaCachedClientW  = 0x005ce8a4;
+// FUN_0044ac60's object cursor: it reads DAT_005c55e8 and writes the next start to DAT_005c55ec,
+// which FUN_00401e5b copies back after every slice. A row beyond z 0x1fff only copies e8 to ec.
+constexpr uint32_t kVaObjectCursor     = 0x005c55e8;
+constexpr uint32_t kVaObjectCursorNext = 0x005c55ec;
 constexpr uint32_t kVaCachedClientH  = 0x005ce8a8;
 constexpr uint32_t kVaOverlayCount   = 0x005ce068;
 
@@ -640,6 +644,10 @@ void __fastcall Detour_FUN_0045a790(uint8_t* slice, int edxArg) {
 void __fastcall Detour_FUN_0045a870(uint8_t* slice, int edxArg) {
     // Far view: slices past the engine's 48 draw road only (their objects reference unloaded scenery).
     if (!rr95::DrawDistanceSliceDrawsObjects(slice)) {
+        // Every row of these slices is beyond z 0x1fff, where FUN_0044ac60 draws nothing and only
+        // copies the cursor; keep that copy (skipping it left ec stale and hid every object). What
+        // is skipped is FUN_0045a970's building draws (FUN_00433b30), which have no distance cap.
+        *GlobalPtr<int32_t>(kVaObjectCursorNext) = *GlobalPtr<const int32_t>(kVaObjectCursor);
         return;
     }
     CaptureDepthBeginSlice(slice);
