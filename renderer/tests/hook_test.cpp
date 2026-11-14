@@ -790,19 +790,45 @@ void TestFarViewConfig()
 void TestDrawDistance() {
     using namespace rr95;
 
-    // Slices past the engine's 48 draw road only: their roadside objects reference scenery the
-    // engine has not loaded (garbage PDATs, then a crash in FUN_004655b0 from FUN_004341e0).
+    // Slices 48 and beyond in the relocated array are the far view's extra slices.
     {
         static uint8_t slices[72 * kDrawSliceStride];
-        Check(SliceIndexDrawsObjects(nullptr, slices), "draw distance: objects drawn when the engine array is in use");
-        Check(SliceIndexDrawsObjects(slices, slices), "draw distance: nearest slice draws objects");
-        Check(SliceIndexDrawsObjects(slices, slices + 47 * kDrawSliceStride), "draw distance: slice 47 draws objects");
-        Check(!SliceIndexDrawsObjects(slices, slices + 48 * kDrawSliceStride),
-              "draw distance: slice 48 draws road only");
-        Check(!SliceIndexDrawsObjects(slices, slices + 71 * kDrawSliceStride),
-              "draw distance: slice 71 draws road only");
-        Check(SliceIndexDrawsObjects(slices + kDrawSliceStride, slices),
-              "draw distance: a slice outside the relocated array is left to the engine");
+        Check(SliceIsWithinEngineRange(nullptr, slices), "draw distance: every slice is in range when the engine array is in use");
+        Check(SliceIsWithinEngineRange(slices, slices), "draw distance: nearest slice is in engine range");
+        Check(SliceIsWithinEngineRange(slices, slices + 47 * kDrawSliceStride), "draw distance: slice 47 is in engine range");
+        Check(!SliceIsWithinEngineRange(slices, slices + 48 * kDrawSliceStride),
+              "draw distance: slice 48 is a far view slice");
+        Check(!SliceIsWithinEngineRange(slices, slices + 71 * kDrawSliceStride),
+              "draw distance: slice 71 is a far view slice");
+        Check(SliceIsWithinEngineRange(slices + kDrawSliceStride, slices),
+              "draw distance: a slice before the relocated array counts as in range");
+    }
+
+    // Far slices' roadside sprite caches are invalidated after drawing: FUN_00459170 resets a cache
+    // slot (row+0xfc, key in dword 0) only when its key differs from the segment id, so entries
+    // filled from a sprite bank that is later reloaded stayed dangling (crash in FUN_004655b0).
+    {
+        alignas(4) uint8_t slice[kDrawSliceStride] = {};
+        alignas(4) uint8_t rowA[0x104] = {};
+        alignas(4) uint8_t rowB[0x104] = {};
+        int32_t slotA[0x24] = {};
+        int32_t slotB[0x24] = {};
+        slotA[0] = 1234;
+        slotA[1] = 0x5555;
+        slotB[0] = 0;
+        *reinterpret_cast<uint8_t**>(slice + 0x14) = rowA;
+        *reinterpret_cast<uint8_t**>(slice + 0x18) = rowB;
+        *reinterpret_cast<int32_t**>(rowA + 0xfc) = slotA;
+        *reinterpret_cast<int32_t**>(rowB + 0xfc) = slotB;
+        InvalidateSliceSpriteCacheKeys(slice);
+        Check(slotA[0] == kSpriteCacheKeyInvalid && slotB[0] == kSpriteCacheKeyInvalid,
+              "draw distance: both row cache slots of a far slice get the invalid key");
+        Check(slotA[1] == 0x5555, "draw distance: cache entries stay usable for the rest of the frame");
+        Check(kSpriteCacheKeyInvalid >= 0, "draw distance: the invalid key is not negative (negative keys skip the reset)");
+        *reinterpret_cast<int32_t**>(rowB + 0xfc) = nullptr;
+        *reinterpret_cast<uint8_t**>(slice + 0x14) = nullptr;
+        InvalidateSliceSpriteCacheKeys(slice);
+        Check(true, "draw distance: null rows and null cache tables are skipped");
     }
 
     int seg = 0;

@@ -1,5 +1,7 @@
 #include "draw_distance.h"
 #include "log.h"
+#include "texture_pack.h"
+#include <initializer_list>
 #include <algorithm>
 #include <cstring>
 #include <cwchar>
@@ -453,7 +455,7 @@ int32_t DrawDistanceSliceMax() {
     return g_appliedSegments;
 }
 
-bool SliceIndexDrawsObjects(const uint8_t* sliceArray, const uint8_t* slice) {
+bool SliceIsWithinEngineRange(const uint8_t* sliceArray, const uint8_t* slice) {
     if (!sliceArray || !slice || slice < sliceArray) {
         return true;
     }
@@ -461,8 +463,25 @@ bool SliceIndexDrawsObjects(const uint8_t* sliceArray, const uint8_t* slice) {
     return index < static_cast<size_t>(kEngineDrawSegments);
 }
 
-bool DrawDistanceSliceDrawsObjects(const uint8_t* slice) {
-    return SliceIndexDrawsObjects(g_sliceOverride, slice);
+bool DrawDistanceSliceIsWithinEngineRange(const uint8_t* slice) {
+    return SliceIsWithinEngineRange(g_sliceOverride, slice);
+}
+
+void InvalidateSliceSpriteCacheKeys(uint8_t* slice) {
+    if (!slice || !IsReadableMemoryRange(slice + 0x14, 8)) {
+        return;
+    }
+    for (const size_t rowOffset : {size_t{0x14}, size_t{0x18}}) {
+        uint8_t* row = *reinterpret_cast<uint8_t**>(slice + rowOffset);
+        if (!row || !IsReadableMemoryRange(row + 0xfc, 4)) {
+            continue;
+        }
+        int32_t* slot = *reinterpret_cast<int32_t**>(row + 0xfc);
+        if (!slot || !IsReadableMemoryRange(slot, 4)) {
+            continue;
+        }
+        *slot = kSpriteCacheKeyInvalid;
+    }
 }
 
 }  // namespace rr95

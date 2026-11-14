@@ -131,13 +131,24 @@ const uint8_t* DrawDistanceSliceArrayOverride();
 // The active count cap: 48 or the applied segments.
 int32_t DrawDistanceSliceMax();
 
-// Whether FUN_0045a870 may draw the roadside objects of `slice`. Slice i is i segments ahead
-// (FUN_0045ac50 draws count-1 down to 0). Past the engine's 48 the scenery those objects reference
-// is not loaded (garbage PDATs, then a crash in FUN_004655b0 called from FUN_004341e0), so slices
-// 48 and beyond in the relocated array draw road only. True with no relocated array (nullptr) or a
-// slice outside it.
-bool SliceIndexDrawsObjects(const uint8_t* sliceArray, const uint8_t* slice);
-// SliceIndexDrawsObjects with the live relocated array.
-bool DrawDistanceSliceDrawsObjects(const uint8_t* slice);
+// Whether `slice` is one of the engine's own 48 (slice i is i segments ahead; FUN_0045ac50 draws
+// count-1 down to 0). The far view's extra slices are 48 and beyond in the relocated array; their
+// sprite caches are invalidated after drawing (InvalidateSliceSpriteCacheKeys). True with no
+// relocated array (nullptr) or a slice before its start.
+bool SliceIsWithinEngineRange(const uint8_t* sliceArray, const uint8_t* slice);
+// SliceIsWithinEngineRange with the live relocated array.
+bool DrawDistanceSliceIsWithinEngineRange(const uint8_t* slice);
+
+// Roadside sprite caches. FUN_00459cb0 points each row's +0xfc at a 0x90-byte slot of the
+// DAT_006084a0 / DAT_0060a0c0 rings (segment % slot count); dword 0 is the owner key and the rest
+// caches sprite pointers that FUN_00465850 looks up in the loaded sprite banks. FUN_00459170 resets
+// a slot (copy of the DAT_00608400 template) only when the key differs from the segment id and the
+// key is not negative. Past 48 segments the engine fills slots for segments whose bank is not loaded
+// yet; the bank reload then leaves those pointers dangling. Giving the slot an impossible key after
+// a far slice is drawn makes the next frame's projection reset it, so far entries live one frame.
+inline constexpr int32_t kSpriteCacheKeyInvalid = 0x7fffffff;
+// Writes kSpriteCacheKeyInvalid to the key of the cache slot of both rows (slice+0x14, +0x18) of a
+// slice; null rows or tables and unreadable memory are skipped. Entries are left as they are.
+void InvalidateSliceSpriteCacheKeys(uint8_t* slice);
 
 }  // namespace rr95
