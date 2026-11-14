@@ -36,6 +36,7 @@ The engine projects at most 48 track segments ahead (`DAT_0059ec90`, cap `0x30`,
 Branch `feat/draw-distance` from `main` (worktree, because another session edits the main checkout). Push and release stay the user's decision. Strategy: ask-on-risk.
 
 ## Progress
+- 2026-11-13: v0.1.3 crash fixes on branch fix/texture-read-guard (b6c335e..223202b). With far view on, Peninsula crashed in FUN_004655b0 on a cached roadside sprite pointer of 0x28. Chain: FUN_0045a790 -> FUN_0044efe0 / FUN_0044f5b0 -> FUN_004341e0 -> FUN_004335e0 -> FUN_004655b0. Row+0xfc points to a 0x90-byte slot (owner key in dword 0) that FUN_00459170 resets only when the key changes. Fix: far slices' slots get key 0x7fffffff after drawing, and a FUN_004655b0 hook returns 0 for anything that is not a readable PGLC object. The earlier note "the new far rows carry road only" was wrong: buildings are drawn by the ground pass. Evidence: user raced a full Peninsula race at 72 with no crash (8 sprites refused).
 - 2026-11-12: User confirmed in game: D2a reduced the missing far rows, D1 fade looked fine on mountain tracks, D3 ran a full Valle Napa race at 72 segments at 60 fps, D4 menu looked right after the 230-px width fix. D2 dropped as not needed. Open: a report of missing roadside ground textures on some PCs (not reproduced), and rare gaps from zero-height thin rows.
 - 2026-11-12: D4 fix (delegated writer), in-game check pending, box stays open. Seen in game (Spanish): at the 42-px pitch, labels the game wraps onto two lines inside the 180-px buttons had their second line covered by the next row ("Resolución de / Carrera", "Resolución del / motorista", "Pantalla / panorámica: On"); single-line labels were fine.
   - Wrap source: FUN_00439160 draws the label with FUN_004388c0, whose rect is the item rect stored as the RRrect window properties by FUN_00439de0 (x, y, x + w, y + h from item +0x0c..+0x18); it adds 0x19 to the left edge and calls DrawTextExA with DT_WORDBREAK and the DRAWTEXTPARAMS at 0x594dc4 (cbSize 20, tab 4, left and right margins 0), font DAT_005c3f2c = CreateFontA(24, ..., "Futura Condensed Bold") loaded from Text/FUTB.DLL. So the wrap width is item width - 25 and nothing else; the button window (mouse hit test) and the highlight use the same rect.
@@ -74,4 +75,4 @@ Branch `feat/draw-distance` from `main` (worktree, because another session edits
 - 2026-11-11: Feature document created. Steps 1 to 3 approved by the user in order, stopping when the result is good enough.
 
 ## Next step
-Merge and release v0.1.2.
+Investigate the sky bands between far road rows over city crests (seen on Peninsula after v0.1.3).

@@ -58,7 +58,7 @@ Existing `ddraw.dll`, `rr95gpu.ini` and `texture-pack\` are kept as `*.pre-ffnno
 
 Some antivirus tools may flag the proxy `ddraw.dll`, because it patches the game's code in memory. It does not modify any game file.
 
-Silent install, for example: `RoadRashFFNNOPatch-Setup-0.1.2.exe /VERYSILENT /CURRENTUSER /DIR="<game folder>" /TASKS="gpuworld,save,texturepack" /PACKDIR="<pack folder>"`. To test the installer without touching your game, run `python -I installer/tests/test_installer.py`. It installs into temporary fake game folders and uninstalls again.
+Silent install, for example: `RoadRashFFNNOPatch-Setup-0.1.3.exe /VERYSILENT /CURRENTUSER /DIR="<game folder>" /TASKS="gpuworld,save,texturepack" /PACKDIR="<pack folder>"`. To test the installer without touching your game, run `python -I installer/tests/test_installer.py`. It installs into temporary fake game folders and uninstalls again.
 
 ## 1. Requirements
 
@@ -228,6 +228,7 @@ Git-ignored local folders: `original/`, `patched/`, `ghidra/`, `ghidra-home/`, `
 - **`MaxMiB ... reached` in the log:** raise `[TexturePack] MaxMiB` (up to 2048).
 - **The game hangs when the window is closed mid-race:** this is the original game's behaviour too; quit from the menu.
 - **Diagnostic log lines:** with `GpuWorld=1`, `rr95gpu.log` writes `ThinQuads:` (why thin far rows were kept or culled) and `RoadSlices:` (road slices dropped by the engine's horizon rule) every 5 seconds during a race, and `Draw distance: <n> segments for this race` at race start.
+- **The game closes by itself:** the last lines of `rr95gpu.log` start with `Crash:` and give the address and the code that called it. Please attach the log to an issue.
 
 ## Known issues
 
@@ -235,4 +236,4 @@ Git-ignored local folders: `original/`, `patched/`, `ghidra/`, `ghidra-home/`, `
   - `rr95gpu.log` from the game folder, after a race where it happened;
   - your GPU model and driver version;
   - whether it also happens in software mode: press Scroll Lock in race to switch between the GPU world and the original renderer and compare.
-- **Rare gap in the far ground.** Thin far rows whose 16.16 corners have zero height are still culled, so a gap can very rarely show for a moment.
+- **Gaps in the far road over crests.** On some hills, mostly in city sections, thin bands of sky can show between far road rows for a moment. This is under investigation.
