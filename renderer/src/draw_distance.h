@@ -131,4 +131,13 @@ const uint8_t* DrawDistanceSliceArrayOverride();
 // The active count cap: 48 or the applied segments.
 int32_t DrawDistanceSliceMax();
 
+// Whether FUN_0045a870 may draw the roadside objects of `slice`. Slice i is i segments ahead
+// (FUN_0045ac50 draws count-1 down to 0). Past the engine's 48 the scenery those objects reference
+// is not loaded (garbage PDATs, then a crash in FUN_004655b0 called from FUN_004341e0), so slices
+// 48 and beyond in the relocated array draw road only. True with no relocated array (nullptr) or a
+// slice outside it.
+bool SliceIndexDrawsObjects(const uint8_t* sliceArray, const uint8_t* slice);
+// SliceIndexDrawsObjects with the live relocated array.
+bool DrawDistanceSliceDrawsObjects(const uint8_t* slice);
+
 }  // namespace rr95

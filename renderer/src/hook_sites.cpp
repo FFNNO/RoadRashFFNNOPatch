@@ -638,6 +638,10 @@ void __fastcall Detour_FUN_0045a790(uint8_t* slice, int edxArg) {
 }
 
 void __fastcall Detour_FUN_0045a870(uint8_t* slice, int edxArg) {
+    // Far view: slices past the engine's 48 draw road only (their objects reference unloaded scenery).
+    if (!rr95::DrawDistanceSliceDrawsObjects(slice)) {
+        return;
+    }
     CaptureDepthBeginSlice(slice);
     if (g_orig_FUN_0045a870) {
         g_orig_FUN_0045a870(slice, edxArg);
@@ -831,7 +835,10 @@ void ApplyRaceDrawDistance() {
     g_menuFarViewOn = FarViewSettingIsOn(farView);
     const bool gpuWorldEffective = cfg.gpuWorld && cfg.presenterEnabled && g_worldHooksInstalled &&
                                    !PresenterIsLatchedOff();
-    const int active = rr95::DrawDistanceRaceStart(g_hostModule, farView.drawSegments, gpuWorldEffective);
+    // The slice object hook keeps slices past 48 to road only; without it the far slices would draw
+    // objects over unloaded scenery and crash, so more than 48 segments needs it installed.
+    const bool farSlicesSafe = gpuWorldEffective && g_distanceFadeHooksInstalled;
+    const int active = rr95::DrawDistanceRaceStart(g_hostModule, farView.drawSegments, farSlicesSafe);
     if (farView.drawSegments > rr95::kEngineDrawSegments && active == rr95::kEngineDrawSegments) {
         LOG_INFO("Draw distance: race start with the engine's %d segments (DrawSegments=%d from %s, GpuWorld=%d)",
                  rr95::kEngineDrawSegments, farView.drawSegments, WidescreenSettingSourceToString(farView.source),

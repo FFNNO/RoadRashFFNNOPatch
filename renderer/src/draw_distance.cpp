@@ -453,4 +453,16 @@ int32_t DrawDistanceSliceMax() {
     return g_appliedSegments;
 }
 
+bool SliceIndexDrawsObjects(const uint8_t* sliceArray, const uint8_t* slice) {
+    if (!sliceArray || !slice || slice < sliceArray) {
+        return true;
+    }
+    const size_t index = static_cast<size_t>(slice - sliceArray) / kDrawSliceStride;
+    return index < static_cast<size_t>(kEngineDrawSegments);
+}
+
+bool DrawDistanceSliceDrawsObjects(const uint8_t* slice) {
+    return SliceIndexDrawsObjects(g_sliceOverride, slice);
+}
+
 }  // namespace rr95

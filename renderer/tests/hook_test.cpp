@@ -790,6 +790,21 @@ void TestFarViewConfig()
 void TestDrawDistance() {
     using namespace rr95;
 
+    // Slices past the engine's 48 draw road only: their roadside objects reference scenery the
+    // engine has not loaded (garbage PDATs, then a crash in FUN_004655b0 from FUN_004341e0).
+    {
+        static uint8_t slices[72 * kDrawSliceStride];
+        Check(SliceIndexDrawsObjects(nullptr, slices), "draw distance: objects drawn when the engine array is in use");
+        Check(SliceIndexDrawsObjects(slices, slices), "draw distance: nearest slice draws objects");
+        Check(SliceIndexDrawsObjects(slices, slices + 47 * kDrawSliceStride), "draw distance: slice 47 draws objects");
+        Check(!SliceIndexDrawsObjects(slices, slices + 48 * kDrawSliceStride),
+              "draw distance: slice 48 draws road only");
+        Check(!SliceIndexDrawsObjects(slices, slices + 71 * kDrawSliceStride),
+              "draw distance: slice 71 draws road only");
+        Check(SliceIndexDrawsObjects(slices + kDrawSliceStride, slices),
+              "draw distance: a slice outside the relocated array is left to the engine");
+    }
+
     int seg = 0;
     Check(ParseDrawSegments(L"48", seg) && seg == 48 && ParseDrawSegments(L" 60 ", seg) && seg == 60 &&
               ParseDrawSegments(L"72", seg) && seg == 72,
