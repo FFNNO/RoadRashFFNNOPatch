@@ -1,6 +1,7 @@
 #include "log.h"
 #include <cstdio>
 #include <cstdarg>
+#include <cwctype>
 #include <share.h>
 
 namespace {
@@ -27,6 +28,32 @@ void LogInit(const std::wstring& logFilePath, LogLevel level) {
     }
     g_logFile = _wfsopen(logFilePath.c_str(), L"a+", _SH_DENYNO);
     LeaveCriticalSection(&g_logLock.cs);
+}
+
+LogLevel ParseLogLevelName(const wchar_t* str) {
+    std::wstring value = str ? str : L"";
+    size_t start = 0;
+    while (start < value.size() && iswspace(value[start])) {
+        ++start;
+    }
+    size_t end = value.size();
+    while (end > start && iswspace(value[end - 1])) {
+        --end;
+    }
+    value = value.substr(start, end - start);
+    for (auto& c : value) {
+        c = static_cast<wchar_t>(towlower(c));
+    }
+    if (value == L"debug") {
+        return LogLevel::Debug;
+    }
+    if (value == L"warn" || value == L"warning") {
+        return LogLevel::Warn;
+    }
+    if (value == L"error") {
+        return LogLevel::Error;
+    }
+    return LogLevel::Info;
 }
 
 void LogClose() {

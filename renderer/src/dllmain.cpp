@@ -9,6 +9,7 @@
 #include "exe_identity.h"
 #include "hook_sites.h"
 #include "capture.h"
+#include "mod_api.h"
 
 static HMODULE g_hModule = nullptr;
 static HMODULE g_systemDDraw = nullptr;
@@ -174,12 +175,16 @@ static void InitializeProxy() {
 
         if (!cfg.enabled) {
             LOG_INFO("rr95gpu disabled by config, hooks skipped");
+            rr95::modapi::SetHookState(RR95_HOOK_STATE_FAILED);
+            rr95::modapi::CloseGraphicsMenuRowSlot();
             return;
         }
 
         ExeIdentity id = IdentifyCurrentExe();
         if (id.build == ExeBuild::Unknown) {
             LOG_INFO("Host unknown (hash: %s), hooks skipped", id.sha256Hex.c_str());
+            rr95::modapi::SetHookState(RR95_HOOK_STATE_FAILED);
+            rr95::modapi::CloseGraphicsMenuRowSlot();
             return;
         }
 
@@ -191,6 +196,7 @@ static void InitializeProxy() {
         }
 
         if (InstallHooks(id.build)) {
+            rr95::modapi::SetHookState(RR95_HOOK_STATE_ACTIVE);
             HMODULE pinned = nullptr;
             GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                                reinterpret_cast<LPCWSTR>(&InitializeProxy),
@@ -198,6 +204,8 @@ static void InitializeProxy() {
             LOG_INFO("All hooks installed successfully (proxy module pinned)");
         } else {
             LOG_WARN("Hook installation failed, running in unhooked mode");
+            rr95::modapi::SetHookState(RR95_HOOK_STATE_FAILED);
+            rr95::modapi::CloseGraphicsMenuRowSlot();
         }
     });
 }
@@ -218,6 +226,8 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         DisableThreadLibraryCalls(hinstDLL);
         g_hModule = hinstDLL;
     } else if (fdwReason == DLL_PROCESS_DETACH) {
+        // No client callback may run from here on, including during process exit.
+        rr95::modapi::SetDetached();
         // Never call FreeLibrary or unpatch code under the loader lock, and do no cleanup here.
         // At process exit (lpvReserved != nullptr) the OS has already killed every other thread,
         // possibly while they held locks, and the static destructors run under the loader lock.

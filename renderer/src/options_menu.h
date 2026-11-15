@@ -45,6 +45,13 @@
 //     on it
 // Navigation: 0 <-> 1 <-> 2 <-> 3 <-> 4 <-> 5 <-> 6 <-> 8, and 8 -> 0 / 0 -> 8 wrapping like the
 // shipped menu (down/Tab forward, up/Shift+Tab back); left/right stay on the item.
+//
+// With one mod API client row the menu grows to 10 items: the client row takes slot 8 (y 386, the
+// same kind of value-text item, its handler at +0x2c) and "Ya esta" moves to slot 9, still at y 428
+// with its 52-px height. Eight rows must then fit between y 134 and 428, so the pitch is the even
+// 36 px (rows 134..422, a 6-px gap above "Ya esta"); the width stays 230. Navigation runs
+// 0 <-> ... <-> 6 <-> 8 <-> 9 with the same wrap, so every row is reachable and the last enabled
+// item is still "Ya esta".
 
 inline constexpr uint32_t kVaGraphicsMenuItems = 0x005a08a8;
 inline constexpr uint32_t kVaGraphicsMenuCount = 0x005a0a70;       // copied into the table at WM_CREATE
@@ -52,17 +59,31 @@ inline constexpr uint32_t kVaGraphicsMenuTableCount = 0x005946d4;  // DAT_005945
 inline constexpr uint32_t kVaGraphicsMenuTableItems = 0x005946d8;  // the array's only relocation
 inline constexpr uint32_t kGraphicsMenuCount = 8;
 inline constexpr uint32_t kRelocatedGraphicsMenuCount = 9;
+// Mod API (rr95-music-standalone S1): one client row grows the relocated menu by one item.
+inline constexpr uint32_t kRelocatedGraphicsMenuMaxCount = 10;
 inline constexpr size_t kMenuItemSize = 0x38;
 inline constexpr size_t kGraphicsMenuItemsSize = kGraphicsMenuCount * kMenuItemSize;
 inline constexpr size_t kRelocatedGraphicsMenuSize = kRelocatedGraphicsMenuCount * kMenuItemSize;
+inline constexpr size_t kRelocatedGraphicsMenuMaxSize = kRelocatedGraphicsMenuMaxCount * kMenuItemSize;
 inline constexpr int kGraphicsMenuWidescreenSlot = 5;
 inline constexpr int kGraphicsMenuFarViewSlot = 6;
 inline constexpr int kGraphicsMenuSpacerSlot = 7;
 inline constexpr int kGraphicsMenuDoneSlot = 8;          // "Ya esta" in the relocated menu
+inline constexpr int kGraphicsMenuClientSlot = 8;        // the client row, only with a client
+inline constexpr int kGraphicsMenuClientDoneSlot = 9;    // "Ya esta" once the client row exists
 inline constexpr int kShippedGraphicsMenuDoneSlot = 6;   // "Ya esta" as shipped
 inline constexpr int kRelocatedMenuFirstY = 134;
 inline constexpr int kRelocatedMenuRowHeight = 42;       // menu 17's pitch
 inline constexpr int kRelocatedMenuDoneHeight = 52;      // menu 17's last row
+// With the client row there are 8 rows between y 134 and "Ya esta" at y 428, so the pitch drops
+// from 42 to the even 36 (8 * 36 = 288, ending at 422) and leaves a 6-px gap above "Ya esta".
+inline constexpr int kRelocatedMenuClientRowHeight = 36;
+
+// Items and row pitch of the relocated menu: 9 items on the 42-px pitch without a client row,
+// 10 items on the 36-px pitch with it.
+int RelocatedGraphicsMenuCount(bool withClientRow);
+int RelocatedMenuPitch(bool withClientRow);
+int RelocatedGraphicsMenuDoneSlot(bool withClientRow);
 
 // Label width. FUN_00439160 draws an item's text with FUN_004388c0, which takes the item rect (the
 // RRrect window properties FUN_00439de0 sets from +0x0c..+0x18), moves its left edge right by 0x19
@@ -98,10 +119,20 @@ void ShippedGraphicsMenuItems(intptr_t rebaseDelta, uint8_t* out);
 // HWND dword at +0x00 of each item (the engine fills it when a menu opens).
 bool GraphicsMenuItemsAreShipped(const uint8_t* items, intptr_t rebaseDelta);
 
-// Writes the relocated menu (kRelocatedGraphicsMenuSize bytes, layout above) built from the live
-// shipped items (their HWND dwords are copied as they are).
-void BuildRelocatedGraphicsMenu(const uint8_t* shipped, uint32_t widescreenHandler, uint32_t farViewHandler,
-                                uint8_t* out);
+// Result of building the relocated array into a destination the caller owns.
+enum class GraphicsMenuBuild {
+    Ok = 0,
+    NotEnoughSpace  // the destination is smaller than the menu the build would write
+};
+
+// Writes the relocated menu (RelocatedGraphicsMenuCount(withClientRow) items, layout above) built
+// from the live shipped items (their HWND dwords are copied as they are) into out, which must hold
+// capacity bytes. withClientRow adds the mod API client row in slot kGraphicsMenuClientSlot, using
+// clientHandler at +0x2c; "Ya esta" then moves to kGraphicsMenuClientDoneSlot. A destination smaller
+// than the menu is refused with NotEnoughSpace, without writing a byte.
+GraphicsMenuBuild BuildRelocatedGraphicsMenu(const uint8_t* shipped, uint32_t widescreenHandler,
+                                             uint32_t farViewHandler, uint8_t* out, size_t capacity,
+                                             bool withClientRow = false, uint32_t clientHandler = 0);
 
 // Result of checking the engine's menu 19 before relocating it.
 enum class GraphicsMenuCheck {
@@ -109,7 +140,8 @@ enum class GraphicsMenuCheck {
     StaticCount,  // 0x005a0a70 is not 8
     TableCount,   // the table count is neither 0 (before WM_CREATE) nor 8
     TableItems,   // the table pointer is not the relocated 0x005a08a8
-    Items         // the item bytes differ from the shipped ones
+    Items,        // the item bytes differ from the shipped ones
+    Capacity      // the destination cannot hold the menu the relocation would write
 };
 const char* GraphicsMenuCheckToString(GraphicsMenuCheck check);
 
@@ -120,19 +152,52 @@ GraphicsMenuCheck CheckGraphicsMenu(const uint8_t* module);
 struct GraphicsMenuRelocation {
     bool applied = false;
     uint32_t savedTableItems = 0;  // the engine's pointer, written back on restore
-    uint8_t* items = nullptr;      // the relocated array (caller-owned, kRelocatedGraphicsMenuSize)
+    uint8_t* items = nullptr;      // the relocated array (caller-owned, kRelocatedGraphicsMenuMaxSize)
 };
 
-// Checks the menu and, when it is the shipped one, builds the relocated array into newItems and
-// points the engine at it: table pointer first, then the counts (the table count only when WM_CREATE
-// has already copied it, 0x005a0a70 always), so a menu opening in between never reads 9 items from
-// the 8-item array. Nothing is written unless the check is Ok.
-GraphicsMenuCheck RelocateGraphicsMenu(uint8_t* module, uint8_t* newItems, uint32_t widescreenHandler,
-                                       uint32_t farViewHandler, GraphicsMenuRelocation& state);
+// Checks the menu and, when it is the shipped one, builds the relocated array into newItems (which
+// holds newItemsCapacity bytes) and points the engine at it: table pointer first, then the counts
+// (the table count only when WM_CREATE has already copied it, 0x005a0a70 always), so a menu opening
+// in between never reads more items than the array has. Nothing is written unless the check is Ok
+// and the destination is large enough (Capacity).
+GraphicsMenuCheck RelocateGraphicsMenu(uint8_t* module, uint8_t* newItems, size_t newItemsCapacity,
+                                       uint32_t widescreenHandler, uint32_t farViewHandler,
+                                       GraphicsMenuRelocation& state, bool withClientRow = false,
+                                       uint32_t clientHandler = 0);
 
-// Restores the shipped menu: counts back to 8 first (the table count only while it is 9), then the
-// engine's pointer. No-op unless applied.
+// Restores the shipped menu: counts back to 8 first (the table count only while it is 9 or 10), then
+// the engine's pointer. No-op unless applied.
 void RestoreGraphicsMenu(uint8_t* module, GraphicsMenuRelocation& state);
+
+// Deferred install of the graphics menu (rr95-music-standalone S1): the menu and its item text hook
+// are built at the game's first menu frame, not in InstallHooks, so a mod API client can still
+// register its row. The pending request is consumed exactly once; a failed build closes the row
+// slot for good until the hooks are removed.
+enum class GraphicsMenuPhase {
+    Idle = 0,  // no build requested (the hooks are not installed)
+    Pending,   // requested by InstallHooks, not consumed yet
+    Building,  // consumed; the build is running
+    Applied,   // the relocated menu is installed
+    Failed     // the build refused; the client row slot stays closed
+};
+
+struct GraphicsMenuInstall {
+    GraphicsMenuPhase phase = GraphicsMenuPhase::Idle;
+};
+
+// Idle -> Pending. A request after the build (Pending, Building, Applied or Failed) does nothing.
+void RequestGraphicsMenuInstall(GraphicsMenuInstall& state);
+// Takes the pending request: true exactly once per request, Pending -> Building. Every other phase
+// returns false and changes nothing.
+bool TakeGraphicsMenuInstallRequest(GraphicsMenuInstall& state);
+// Building -> Applied or Failed. A failed build keeps the client row slot closed.
+void FinishGraphicsMenuInstall(GraphicsMenuInstall& state, bool applied);
+// Any phase -> Idle, used when the hooks are removed. It does not reopen a Failed state by itself;
+// the next InstallHooks request is a new build.
+void ResetGraphicsMenuInstall(GraphicsMenuInstall& state);
+// True while the requested build may still consume a client row: Pending or Building. False with no
+// request (Idle) and after the build, applied or failed, so the caller closes the row slot then.
+bool GraphicsMenuRowSlotOpen(const GraphicsMenuInstall& state);
 
 // The game's own on/off strings, "On" and "Off" (.rdata 0x005064a8 / 0x005064ac, not localized; the
 // sound menu shows them for "Intercambiar altavoces" in the Spanish build).

@@ -1,3 +1,4 @@
 LIBRARY ddraw
 EXPORTS
     DirectDrawCreate
+    RR95_GetModApi

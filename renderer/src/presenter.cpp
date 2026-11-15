@@ -5,6 +5,7 @@
 #include "quad_mapping.h"
 #include "texture_pack.h"
 #include "widescreen.h"
+#include "mod_api.h"
 
 #include <d3d11.h>
 #include <dxgi.h>
@@ -42,6 +43,15 @@ LetterboxViewport ComputeLetterboxViewport(int srcW, int srcH, int clientW, int 
     const int vpX = (clientW - vpW) / 2;
     const int vpY = (clientH - vpH) / 2;
     return {vpX, vpY, vpW, vpH};
+}
+
+OverlayRect MapOverlayRectToClient(const LetterboxViewport& viewport, int x, int y, int width, int height) {
+    const int64_t vpW = viewport.width;
+    const int64_t vpH = viewport.height;
+    return {viewport.x + static_cast<int>(static_cast<int64_t>(x) * vpW / kOverlayGameWidth),
+            viewport.y + static_cast<int>(static_cast<int64_t>(y) * vpH / kOverlayGameHeight),
+            static_cast<int>(static_cast<int64_t>(width) * vpW / kOverlayGameWidth),
+            static_cast<int>(static_cast<int64_t>(height) * vpH / kOverlayGameHeight)};
 }
 
 bool PresenterCanAttempt(const PresenterFailureState& state, uint64_t nowMs) {
@@ -652,6 +662,16 @@ public:
         m_overlayPS.Reset();
         m_overlayVS.Reset();
         m_overlayFailed = false;
+        m_srvApiOverlay.Reset();
+        m_texApiOverlay.Reset();
+        m_apiOverlayTexW = 0;
+        m_apiOverlayTexH = 0;
+        m_apiOverlayUpload = rr95::modapi::OverlayUploadState{};
+        m_apiOverlayFailed = false;
+        m_apiOverlayMapFailLogged = false;
+        m_apiOverlayProblemsLogged = 0;
+        m_apiOverlayRetry = rr95::modapi::OverlayRetryState{};
+        m_apiOverlayFailureLog = rr95::modapi::OverlayFailureLog{};
         m_srvWorld.Reset();
         m_rtvWorld.Reset();
         m_texWorld.Reset();
@@ -2309,6 +2329,154 @@ private:
         return true;
     }
 
+    // Mod API overlay layer (rr95-music-standalone S1): premultiplied BGRA texture of the client's
+    // own size, created once per size. A texture creation failure skips the frame and is retried
+    // only when the client's change counter or frame size changes; it never disables the layer.
+    bool EnsureApiOverlayResources(int width, int height) {
+        if (m_apiOverlayFailed) {
+            return false;
+        }
+        if (m_texApiOverlay && m_srvApiOverlay && m_apiOverlayTexW == width && m_apiOverlayTexH == height) {
+            return true;
+        }
+        if (!m_blendPremul) {
+            D3D11_BLEND_DESC bd = {};
+            bd.RenderTarget[0].BlendEnable = TRUE;
+            bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+            bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+            bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+            bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+            bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+            bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+            bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+            const HRESULT hr = m_device->CreateBlendState(&bd, &m_blendPremul);
+            if (FAILED(hr)) {
+                LOG_ERROR("Mod API overlay blend state creation failed (0x%08lX); layer skipped",
+                          static_cast<unsigned long>(hr));
+                m_apiOverlayFailed = true;
+                return false;
+            }
+        }
+        m_srvApiOverlay.Reset();
+        m_texApiOverlay.Reset();
+        m_apiOverlayTexW = 0;
+        m_apiOverlayTexH = 0;
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = static_cast<UINT>(width);
+        td.Height = static_cast<UINT>(height);
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DYNAMIC;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        HRESULT hr = m_device->CreateTexture2D(&td, nullptr, &m_texApiOverlay);
+        if (SUCCEEDED(hr)) {
+            hr = m_device->CreateShaderResourceView(m_texApiOverlay.Get(), nullptr, &m_srvApiOverlay);
+        }
+        if (FAILED(hr)) {
+            m_srvApiOverlay.Reset();
+            m_texApiOverlay.Reset();
+            // fdaae4f follow-up: one log line per distinct failure code, like the Map path; a client
+            // that bumps its change counter every frame must not log every frame.
+            if (rr95::modapi::ShouldLogOverlayFailure(m_apiOverlayFailureLog,
+                                                      static_cast<uint32_t>(hr))) {
+                LOG_ERROR("Mod API overlay texture creation failed (0x%08lX); this frame is skipped",
+                          static_cast<unsigned long>(hr));
+            }
+            return false;  // retried on the overlay retry backoff, see DrawApiOverlay
+        }
+        m_apiOverlayTexW = width;
+        m_apiOverlayTexH = height;
+        return true;
+    }
+
+    // Draws the client layer over the presented image, before the save/load toast. The client's
+    // 640x480 coordinates map into the letterboxed image; the texture is uploaded only when the
+    // change counter or the size changes. No source, a null frame, an invalid frame or a draw
+    // failure draws nothing; only the blend state failure disables the layer for the device.
+    void DrawApiOverlay(int clientW, int clientH, const LetterboxViewport& lvp) {
+        if (!rr95::modapi::OverlayRegistered()) {
+            return;
+        }
+        const RR95OverlayFrame* frame = rr95::modapi::OverlayFrame();
+        if (frame == nullptr) {
+            return;
+        }
+        const rr95::modapi::OverlayFrameProblem problem = rr95::modapi::CheckOverlayFrame(*frame);
+        if (problem != rr95::modapi::OverlayFrameProblem::None) {
+            if (rr95::modapi::ShouldLogOverlayProblem(m_apiOverlayProblemsLogged, problem)) {
+                LOG_WARN("mod API overlay frame skipped: %s (width %d, height %d)",
+                         rr95::modapi::OverlayFrameProblemToString(problem), frame->width, frame->height);
+            }
+            return;  // that frame only; the layer stays registered
+        }
+        if (rr95::modapi::OverlayNeedsUpload(m_apiOverlayUpload, frame->changeCounter, frame->width, frame->height)) {
+            // fdaae4f follow-up: a client may bump its change counter every frame. After repeated
+            // consecutive texture failures, retry at most once per second; a success resets it.
+            const uint64_t nowMs = GetTickCount64();
+            if (!rr95::modapi::OverlayRetryDue(m_apiOverlayRetry, nowMs)) {
+                return;
+            }
+            if (!EnsureOverlayResources() || !m_samplerClamp ||
+                !EnsureApiOverlayResources(frame->width, frame->height)) {
+                rr95::modapi::RecordOverlayRetryFailure(m_apiOverlayRetry, nowMs);
+                rr95::modapi::RecordOverlayUploadFailure(m_apiOverlayUpload, frame->changeCounter, frame->width,
+                                                         frame->height);
+                return;
+            }
+            rr95::modapi::RecordOverlayRetrySuccess(m_apiOverlayRetry);
+            D3D11_MAPPED_SUBRESOURCE mapped = {};
+            if (FAILED(m_context->Map(m_texApiOverlay.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+                if (!m_apiOverlayMapFailLogged) {
+                    m_apiOverlayMapFailLogged = true;
+                    LOG_ERROR("D3D11 Map(texApiOverlay) failed; mod API overlay skipped");
+                }
+                rr95::modapi::RecordOverlayUploadFailure(m_apiOverlayUpload, frame->changeCounter, frame->width,
+                                                         frame->height);
+                return;
+            }
+            for (int y = 0; y < frame->height; ++y) {
+                std::memcpy(static_cast<uint8_t*>(mapped.pData) + static_cast<size_t>(y) * mapped.RowPitch,
+                            frame->pixels + static_cast<size_t>(y) * static_cast<size_t>(frame->width),
+                            static_cast<size_t>(frame->width) * sizeof(uint32_t));
+            }
+            m_context->Unmap(m_texApiOverlay.Get(), 0);
+            rr95::modapi::RecordOverlayUpload(m_apiOverlayUpload, frame->changeCounter, frame->width, frame->height);
+        } else if (!m_apiOverlayUpload.uploaded || !m_texApiOverlay || !m_srvApiOverlay ||
+                   m_apiOverlayTexW != frame->width || m_apiOverlayTexH != frame->height) {
+            return;  // this frame failed before; wait for a new counter or size
+        }
+        const OverlayRect rect = MapOverlayRectToClient(lvp, frame->x, frame->y, frame->width, frame->height);
+        if (rect.width <= 0 || rect.height <= 0) {
+            return;
+        }
+        D3D11_VIEWPORT vp = {};
+        vp.Width = static_cast<FLOAT>(clientW);
+        vp.Height = static_cast<FLOAT>(clientH);
+        vp.MaxDepth = 1.0f;
+        m_context->RSSetViewports(1, &vp);
+        m_context->IASetInputLayout(nullptr);
+        m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        m_context->VSSetShader(m_overlayVS.Get(), nullptr, 0);
+        m_context->PSSetShader(m_overlayPS.Get(), nullptr, 0);
+        m_context->VSSetConstantBuffers(0, 1, m_overlayCB.GetAddressOf());
+        m_context->PSSetConstantBuffers(0, 1, m_overlayCB.GetAddressOf());
+        m_context->PSSetSamplers(0, 1, m_samplerClamp.GetAddressOf());
+        const float blendFactor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        m_context->OMSetBlendState(m_blendPremul.Get(), blendFactor, 0xFFFFFFFFu);
+        DrawOverlayQuad(ToastRect{rect.x, rect.y, rect.width, rect.height}, clientW, clientH,
+                        m_srvApiOverlay.Get(), 1.0f, 1.0f, 1.0f, 1.0f);
+        ID3D11ShaderResourceView* nullSrv = nullptr;
+        ID3D11Buffer* nullCb = nullptr;
+        m_context->PSSetShaderResources(0, 1, &nullSrv);
+        m_context->VSSetConstantBuffers(0, 1, &nullCb);
+        m_context->PSSetConstantBuffers(0, 1, &nullCb);
+        m_context->OMSetBlendState(nullptr, blendFactor, 0xFFFFFFFFu);
+        m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    }
+
     // Text texture for kind at fontH, rasterized with GDI once per string and size.
     bool EnsureToastTexture(ToastKind kind, int fontH) {
         if (m_toastSrv && m_toastTexKind == kind && m_toastTexFontH == fontH) {
@@ -2528,6 +2696,7 @@ private:
 
         // Save/load toast over the final image (pillarbox margin or image corner). Remember what was
         // presented so the toast can re-present this frame without the game.
+        DrawApiOverlay(clientW, clientH, lvp);
         const bool toastDrawn = DrawToastOverlay(clientW, clientH, lvp, nowMs);
         m_lastFrame.valid = true;
         m_lastFrame.srcW = srcW;
@@ -2619,6 +2788,17 @@ private:
     int m_hudIconsTexH = 0;
     bool m_hudIconsFailed = false;
     bool m_hudIconsMapFailLogged = false;
+    // Mod API overlay layer: the client's own size, uploaded when its counter or size changes.
+    ComPtr<ID3D11Texture2D> m_texApiOverlay;
+    ComPtr<ID3D11ShaderResourceView> m_srvApiOverlay;
+    int m_apiOverlayTexW = 0;
+    int m_apiOverlayTexH = 0;
+    bool m_apiOverlayFailed = false;  // the premultiplied blend state failed; the layer is off
+    bool m_apiOverlayMapFailLogged = false;
+    uint32_t m_apiOverlayProblemsLogged = 0;  // one log line per distinct invalid frame
+    rr95::modapi::OverlayUploadState m_apiOverlayUpload;
+    rr95::modapi::OverlayRetryState m_apiOverlayRetry;
+    rr95::modapi::OverlayFailureLog m_apiOverlayFailureLog;
     ComPtr<ID3D11Texture2D> m_texWorld;
     ComPtr<ID3D11RenderTargetView> m_rtvWorld;
     ComPtr<ID3D11ShaderResourceView> m_srvWorld;

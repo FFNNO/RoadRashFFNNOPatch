@@ -90,12 +90,25 @@ constexpr uint8_t kMenuFontAdvance[0x100 - 0x20] = {
     14, 8, 9, 9, 9, 9, 9, 14, 9, 8, 8, 8, 9, 0, 14, 9,
 };
 
-// Relocated navigation (left, right, up, down, Tab, Shift+Tab) per slot; slot 7 (the spacer) keeps
-// its zero bytes.
-constexpr uint8_t kRelocatedNav[kRelocatedGraphicsMenuCount][6] = {
-    {0, 0, 8, 1, 1, 8}, {1, 1, 0, 2, 2, 0}, {2, 2, 1, 3, 3, 1}, {3, 3, 2, 4, 4, 2}, {4, 4, 3, 5, 5, 3},
-    {5, 5, 4, 6, 6, 4}, {6, 6, 5, 8, 8, 5}, {0, 0, 0, 0, 0, 0}, {8, 8, 6, 0, 0, 6},
-};
+// "Ya esta" keeps the shipped y 428 and 52-px height at both pitches: the 42-px rows 0..6 put it
+// there without a client row, and the client row's 36-px pitch leaves the 6-px gap above it.
+constexpr int kRelocatedMenuDoneY = kRelocatedMenuFirstY + kRelocatedMenuRowHeight * (kGraphicsMenuFarViewSlot + 1);
+
+// Visible order 0..6, [client row], "Ya esta"; the spacer (slot 7) keeps its zero bytes. Navigation
+// (left, right, up, down, Tab, Shift+Tab) follows this order with the shipped wrap.
+int RelocatedVisibleSlotCount(bool withClientRow) {
+    return withClientRow ? 9 : 8;
+}
+
+int RelocatedVisibleSlotAt(int index, bool withClientRow) {
+    if (index < kGraphicsMenuSpacerSlot) {
+        return index;
+    }
+    if (withClientRow && index == kGraphicsMenuSpacerSlot) {
+        return kGraphicsMenuClientSlot;
+    }
+    return RelocatedGraphicsMenuDoneSlot(withClientRow);
+}
 
 void PutU32(uint8_t* p, uint32_t v) {
     std::memcpy(p, &v, sizeof(v));
@@ -158,32 +171,64 @@ bool GraphicsMenuItemsAreShipped(const uint8_t* items, intptr_t rebaseDelta) {
     return true;
 }
 
-void BuildRelocatedGraphicsMenu(const uint8_t* shipped, uint32_t widescreenHandler, uint32_t farViewHandler,
-                                uint8_t* out) {
-    uint8_t items[kRelocatedGraphicsMenuSize];
-    // Slots 0..5 and 7 keep their index; "Ya esta" moves from 6 to 8; slot 6 starts as a copy of
-    // the empty slot 5 (rect width and x) and becomes the far view item.
+int RelocatedGraphicsMenuCount(bool withClientRow) {
+    return withClientRow ? static_cast<int>(kRelocatedGraphicsMenuMaxCount)
+                         : static_cast<int>(kRelocatedGraphicsMenuCount);
+}
+
+int RelocatedMenuPitch(bool withClientRow) {
+    return withClientRow ? kRelocatedMenuClientRowHeight : kRelocatedMenuRowHeight;
+}
+
+int RelocatedGraphicsMenuDoneSlot(bool withClientRow) {
+    return withClientRow ? kGraphicsMenuClientDoneSlot : kGraphicsMenuDoneSlot;
+}
+
+GraphicsMenuBuild BuildRelocatedGraphicsMenu(const uint8_t* shipped, uint32_t widescreenHandler,
+                                             uint32_t farViewHandler, uint8_t* out, size_t capacity,
+                                             bool withClientRow, uint32_t clientHandler) {
+    const size_t needed = static_cast<size_t>(RelocatedGraphicsMenuCount(withClientRow)) * kMenuItemSize;
+    if (out == nullptr || capacity < needed) {
+        return GraphicsMenuBuild::NotEnoughSpace;
+    }
+    uint8_t items[kRelocatedGraphicsMenuMaxSize];
+    std::memset(items, 0, sizeof(items));
+    // Slots 0..5 and 7 keep their index; "Ya esta" moves past the far view row (and past the client
+    // row when there is one); slot 6 starts as a copy of the empty slot 5 (rect width and x) and
+    // becomes the far view item.
     std::memcpy(items, shipped, kGraphicsMenuItemsSize);
-    std::memcpy(items + kGraphicsMenuDoneSlot * kMenuItemSize, shipped + kShippedGraphicsMenuDoneSlot * kMenuItemSize,
-                kMenuItemSize);
+    std::memcpy(items + RelocatedGraphicsMenuDoneSlot(withClientRow) * kMenuItemSize,
+                shipped + kShippedGraphicsMenuDoneSlot * kMenuItemSize, kMenuItemSize);
     std::memcpy(items + kGraphicsMenuFarViewSlot * kMenuItemSize, shipped + kGraphicsMenuWidescreenSlot * kMenuItemSize,
                 kMenuItemSize);
     PutU32(items + kGraphicsMenuFarViewSlot * kMenuItemSize, 0);  // no HWND until the menu opens
     MakeModItem(items + kGraphicsMenuWidescreenSlot * kMenuItemSize, widescreenHandler);
     MakeModItem(items + kGraphicsMenuFarViewSlot * kMenuItemSize, farViewHandler);
-    for (int s = 0; s < static_cast<int>(kRelocatedGraphicsMenuCount); ++s) {
-        uint8_t* item = items + static_cast<size_t>(s) * kMenuItemSize;
-        if (s == kGraphicsMenuSpacerSlot) {
+    if (withClientRow) {
+        PutU32(items + kGraphicsMenuClientSlot * kMenuItemSize, 0);  // no HWND until the menu opens
+        MakeModItem(items + kGraphicsMenuClientSlot * kMenuItemSize, clientHandler);
+    }
+    const int pitch = RelocatedMenuPitch(withClientRow);
+    const int doneSlot = RelocatedGraphicsMenuDoneSlot(withClientRow);
+    const int visibleCount = RelocatedVisibleSlotCount(withClientRow);
+    for (int i = 0; i < visibleCount; ++i) {
+        const int slot = RelocatedVisibleSlotAt(i, withClientRow);
+        if (slot == kGraphicsMenuSpacerSlot) {
             continue;
         }
-        const bool done = s == kGraphicsMenuDoneSlot;
-        const int row = done ? kGraphicsMenuFarViewSlot + 1 : s;
-        PutU32(item + kOffY, static_cast<uint32_t>(kRelocatedMenuFirstY + kRelocatedMenuRowHeight * row));
+        uint8_t* item = items + static_cast<size_t>(slot) * kMenuItemSize;
+        const bool done = slot == doneSlot;
+        PutU32(item + kOffY, static_cast<uint32_t>(done ? kRelocatedMenuDoneY : kRelocatedMenuFirstY + pitch * i));
         PutU32(item + kOffWidth, static_cast<uint32_t>(kRelocatedMenuItemWidth));
-        PutU32(item + kOffHeight, static_cast<uint32_t>(done ? kRelocatedMenuDoneHeight : kRelocatedMenuRowHeight));
-        std::memcpy(item + kOffNav, kRelocatedNav[s], 6);
+        PutU32(item + kOffHeight, static_cast<uint32_t>(done ? kRelocatedMenuDoneHeight : pitch));
+        const uint8_t prev = static_cast<uint8_t>(RelocatedVisibleSlotAt((i + visibleCount - 1) % visibleCount, withClientRow));
+        const uint8_t next = static_cast<uint8_t>(RelocatedVisibleSlotAt((i + 1) % visibleCount, withClientRow));
+        const uint8_t slotByte = static_cast<uint8_t>(slot);
+        const uint8_t nav[6] = {slotByte, slotByte, prev, next, next, prev};
+        std::memcpy(item + kOffNav, nav, sizeof(nav));
     }
-    std::memcpy(out, items, kRelocatedGraphicsMenuSize);
+    std::memcpy(out, items, needed);
+    return GraphicsMenuBuild::Ok;
 }
 
 int MenuLabelPixelWidth(const std::string& cp1252) {
@@ -207,6 +252,8 @@ const char* GraphicsMenuCheckToString(GraphicsMenuCheck check) {
         return "menu table count";
     case GraphicsMenuCheck::TableItems:
         return "menu table item pointer";
+    case GraphicsMenuCheck::Capacity:
+        return "destination capacity";
     case GraphicsMenuCheck::Items:
     default:
         return "items";
@@ -232,21 +279,26 @@ GraphicsMenuCheck CheckGraphicsMenu(const uint8_t* module) {
     return GraphicsMenuCheck::Ok;
 }
 
-GraphicsMenuCheck RelocateGraphicsMenu(uint8_t* module, uint8_t* newItems, uint32_t widescreenHandler,
-                                       uint32_t farViewHandler, GraphicsMenuRelocation& state) {
+GraphicsMenuCheck RelocateGraphicsMenu(uint8_t* module, uint8_t* newItems, size_t newItemsCapacity,
+                                       uint32_t widescreenHandler, uint32_t farViewHandler,
+                                       GraphicsMenuRelocation& state, bool withClientRow, uint32_t clientHandler) {
     const GraphicsMenuCheck check = CheckGraphicsMenu(module);
     if (check != GraphicsMenuCheck::Ok || state.applied) {
         return check;
     }
-    BuildRelocatedGraphicsMenu(At(module, kVaGraphicsMenuItems), widescreenHandler, farViewHandler, newItems);
+    if (BuildRelocatedGraphicsMenu(At(module, kVaGraphicsMenuItems), widescreenHandler, farViewHandler, newItems,
+                                   newItemsCapacity, withClientRow,
+                                   clientHandler) != GraphicsMenuBuild::Ok) {
+        return GraphicsMenuCheck::Capacity;
+    }
     state.savedTableItems = GetU32(At(module, kVaGraphicsMenuTableItems));
     state.items = newItems;
     state.applied = true;
     PutU32(At(module, kVaGraphicsMenuTableItems), static_cast<uint32_t>(reinterpret_cast<uintptr_t>(newItems)));
     if (GetU32(At(module, kVaGraphicsMenuTableCount)) == kGraphicsMenuCount) {
-        PutU32(At(module, kVaGraphicsMenuTableCount), kRelocatedGraphicsMenuCount);
+        PutU32(At(module, kVaGraphicsMenuTableCount), static_cast<uint32_t>(RelocatedGraphicsMenuCount(withClientRow)));
     }
-    PutU32(At(module, kVaGraphicsMenuCount), kRelocatedGraphicsMenuCount);
+    PutU32(At(module, kVaGraphicsMenuCount), static_cast<uint32_t>(RelocatedGraphicsMenuCount(withClientRow)));
     return GraphicsMenuCheck::Ok;
 }
 
@@ -255,12 +307,42 @@ void RestoreGraphicsMenu(uint8_t* module, GraphicsMenuRelocation& state) {
         return;
     }
     PutU32(At(module, kVaGraphicsMenuCount), kGraphicsMenuCount);
-    if (GetU32(At(module, kVaGraphicsMenuTableCount)) == kRelocatedGraphicsMenuCount) {
+    const uint32_t tableCount = GetU32(At(module, kVaGraphicsMenuTableCount));
+    if (tableCount == kRelocatedGraphicsMenuCount || tableCount == kRelocatedGraphicsMenuMaxCount) {
         PutU32(At(module, kVaGraphicsMenuTableCount), kGraphicsMenuCount);
     }
     PutU32(At(module, kVaGraphicsMenuTableItems), state.savedTableItems);
     state.applied = false;
     state.items = nullptr;
+}
+
+void RequestGraphicsMenuInstall(GraphicsMenuInstall& state) {
+    if (state.phase == GraphicsMenuPhase::Idle) {
+        state.phase = GraphicsMenuPhase::Pending;
+    }
+}
+
+bool TakeGraphicsMenuInstallRequest(GraphicsMenuInstall& state) {
+    if (state.phase != GraphicsMenuPhase::Pending) {
+        return false;
+    }
+    state.phase = GraphicsMenuPhase::Building;
+    return true;
+}
+
+void FinishGraphicsMenuInstall(GraphicsMenuInstall& state, bool applied) {
+    if (state.phase != GraphicsMenuPhase::Building) {
+        return;
+    }
+    state.phase = applied ? GraphicsMenuPhase::Applied : GraphicsMenuPhase::Failed;
+}
+
+void ResetGraphicsMenuInstall(GraphicsMenuInstall& state) {
+    state.phase = GraphicsMenuPhase::Idle;
+}
+
+bool GraphicsMenuRowSlotOpen(const GraphicsMenuInstall& state) {
+    return state.phase == GraphicsMenuPhase::Pending || state.phase == GraphicsMenuPhase::Building;
 }
 
 std::string EncodeCp1252(const wchar_t* text) {
