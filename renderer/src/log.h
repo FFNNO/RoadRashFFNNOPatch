@@ -13,9 +13,6 @@ void LogInit(const std::wstring& logFilePath, LogLevel level);
 void LogClose();
 void LogWrite(LogLevel level, const char* fmt, ...);
 
-// "debug", "info", "warn" or "error", case-insensitive and trimmed; anything else is Info.
-LogLevel ParseLogLevelName(const wchar_t* str);
-
 #define LOG_DEBUG(fmt, ...) LogWrite(LogLevel::Debug, fmt, ##__VA_ARGS__)
 #define LOG_INFO(fmt, ...)  LogWrite(LogLevel::Info,  fmt, ##__VA_ARGS__)
 #define LOG_WARN(fmt, ...)  LogWrite(LogLevel::Warn,  fmt, ##__VA_ARGS__)

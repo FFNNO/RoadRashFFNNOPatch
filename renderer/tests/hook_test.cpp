@@ -28,7 +28,6 @@
 #include "../src/options_menu.h"
 #include "../src/hud_icons.h"
 #include "../src/draw_distance.h"
-#include "../src/mod_api.h"
 
 namespace {
 
@@ -1080,39 +1079,6 @@ void TestDrawDistance() {
           "draw distance: slice depth uses the active cap");
     Check(DrawDistanceSliceArrayOverride() == nullptr && DrawDistanceSliceMax() == kEngineDrawSegments,
           "draw distance: nothing applied at runtime means the engine's array and 48");
-}
-
-// Mod API callbacks and providers (rr95-music-standalone S1). Plain functions because the API
-// stores C function pointers; the context carries the call counter.
-int g_modApiRaceCalls = 0;
-int g_modApiMenuCalls = 0;
-int g_modApiTextCalls = 0;
-int g_modApiOverlayCalls = 0;
-const char* g_modApiText = "client row";
-RR95OverlayFrame g_modApiOverlayFrame = {};
-
-void ModApiRaceCallback(void* ctx) {
-    ++*static_cast<int*>(ctx);
-}
-
-void ModApiMenuCallback(void* ctx) {
-    ++*static_cast<int*>(ctx);
-}
-
-const char* ModApiItemTextProvider(const void* item, void* ctx) {
-    (void)item;
-    ++*static_cast<int*>(ctx);
-    return g_modApiText;
-}
-
-const char* ModApiRowText(void* ctx) {
-    ++*static_cast<int*>(ctx);
-    return g_modApiText;
-}
-
-const RR95OverlayFrame* ModApiOverlaySource(void* ctx) {
-    ++*static_cast<int*>(ctx);
-    return &g_modApiOverlayFrame;
 }
 
 }  // namespace
@@ -3534,7 +3500,7 @@ int main() {
         // Relocated menu: rows, items and navigation.
         const uint32_t wsHandler = 0x10203040, fvHandler = 0x10203080;
         std::vector<uint8_t> out(kRelocatedGraphicsMenuSize, 0xCD);
-        BuildRelocatedGraphicsMenu(withHwnd.data(), wsHandler, fvHandler, out.data(), out.size());
+        BuildRelocatedGraphicsMenu(withHwnd.data(), wsHandler, fvHandler, out.data());
         auto item = [&](int s) { return out.data() + static_cast<size_t>(s) * kMenuItemSize; };
         auto rectOf = [&](int s, int f) { return static_cast<int32_t>(u32At(item(s) + 0x0c + 4 * f)); };
         bool rowsOk = true;
@@ -3686,8 +3652,7 @@ int main() {
         std::vector<uint8_t> newItems(kRelocatedGraphicsMenuSize, 0xEE);
         GraphicsMenuRelocation state;
         const std::vector<uint8_t> beforeRefused = image;
-        Check(RelocateGraphicsMenu(module, newItems.data(), newItems.size(), wsHandler, fvHandler, state) ==
-                      GraphicsMenuCheck::Items &&
+        Check(RelocateGraphicsMenu(module, newItems.data(), wsHandler, fvHandler, state) == GraphicsMenuCheck::Items &&
                   !state.applied && image == beforeRefused &&
                   newItems == std::vector<uint8_t>(kRelocatedGraphicsMenuSize, 0xEE),
               "menu D4: a refused relocation writes nothing (image and new array untouched)");
@@ -3697,11 +3662,9 @@ int main() {
             resetImage(tableCount);
             const std::vector<uint8_t> shippedImage = image;
             state = GraphicsMenuRelocation{};
-            const GraphicsMenuCheck r =
-                RelocateGraphicsMenu(module, newItems.data(), newItems.size(), wsHandler, fvHandler, state);
+            const GraphicsMenuCheck r = RelocateGraphicsMenu(module, newItems.data(), wsHandler, fvHandler, state);
             std::vector<uint8_t> expectedItems(kRelocatedGraphicsMenuSize);
-            BuildRelocatedGraphicsMenu(at(kVaGraphicsMenuItems), wsHandler, fvHandler, expectedItems.data(),
-                                       expectedItems.size());
+            BuildRelocatedGraphicsMenu(at(kVaGraphicsMenuItems), wsHandler, fvHandler, expectedItems.data());
             std::vector<size_t> changedAt;
             for (size_t i = 0; i < image.size(); ++i) {
                 if (image[i] != shippedImage[i]) {
@@ -3863,166 +3826,6 @@ int main() {
         Check(fv.drawSegments == 48 && fv.distanceFade && fv.source == WidescreenSettingSource::Ini &&
                   !FarViewSettingIsOn(fv),
               "menu D4: invalid registry value -> the ini (48 shows Off even with the fade on)");
-
-        // Mod API client row (rr95-music-standalone S1): the menu grows to 10 items on the even
-        // 36-px pitch, so eight rows fit above "Ya esta" at y 428.
-        Check(RelocatedGraphicsMenuCount(false) == 9 && RelocatedGraphicsMenuCount(true) == 10 &&
-                  RelocatedMenuPitch(false) == 42 && RelocatedMenuPitch(true) == 36 &&
-                  RelocatedGraphicsMenuDoneSlot(false) == 8 && RelocatedGraphicsMenuDoneSlot(true) == 9,
-              "menu S1: 9 items on the 42-px pitch without a client, 10 on 36 with it");
-        const uint32_t clientHandler = 0x102030c0;
-        std::vector<uint8_t> clientOut(kRelocatedGraphicsMenuMaxSize, 0xCD);
-        BuildRelocatedGraphicsMenu(withHwnd.data(), wsHandler, fvHandler, clientOut.data(), clientOut.size(), true,
-                                   clientHandler);
-        auto cItem = [&](int s) { return clientOut.data() + static_cast<size_t>(s) * kMenuItemSize; };
-        auto cRect = [&](int s, int f) { return static_cast<int32_t>(u32At(cItem(s) + 0x0c + 4 * f)); };
-        bool clientRowsOk = true;
-        for (int s = 0; s <= 6; ++s) {
-            clientRowsOk = clientRowsOk && cRect(s, 0) == 0 && cRect(s, 1) == 134 + 36 * s &&
-                           cRect(s, 2) == 230 && cRect(s, 3) == 36;
-        }
-        Check(clientRowsOk, "menu S1: slots 0..6 use the 36-px pitch on the 10-item menu");
-        Check(cRect(8, 0) == 0 && cRect(8, 1) == 386 && cRect(8, 2) == 230 && cRect(8, 3) == 36,
-              "menu S1: the client row is slot 8 at (0, 386, 230, 36)");
-        Check(cRect(9, 0) == 0 && cRect(9, 1) == 428 && cRect(9, 2) == 230 && cRect(9, 3) == 52 &&
-                  cRect(9, 1) + cRect(9, 3) == 480,
-              "menu S1: 'Ya esta' moves to slot 9, still (0, 428, 230, 52)");
-        Check(std::memcmp(cItem(7), withHwnd.data() + 7 * kMenuItemSize, kMenuItemSize) == 0,
-              "menu S1: the spacer stays slot 7 unchanged");
-        Check(u32At(cItem(8)) == 0 && u32At(cItem(8) + 0x04) == 0 && u32At(cItem(8) + 0x08) == 0x3da &&
-                  u32At(cItem(8) + 0x24) == 0x0010000c && u32At(cItem(8) + 0x28) == 1 &&
-                  u32At(cItem(8) + 0x2c) == clientHandler && u32At(cItem(8) + 0x30) == 0 &&
-                  u32At(cItem(8) + 0x34) == 0x4852,
-              "menu S1: the client row is a value-text item with the client's handler");
-        auto cNav = [&](int s) { return std::vector<uint8_t>(cItem(s) + 0x1c, cItem(s) + 0x22); };
-        Check(cNav(0) == N{0, 0, 9, 1, 1, 9} && cNav(6) == N{6, 6, 5, 8, 8, 5} &&
-                  cNav(7) == N{0, 0, 0, 0, 0, 0} && cNav(8) == N{8, 8, 6, 9, 9, 6} &&
-                  cNav(9) == N{9, 9, 8, 0, 0, 8},
-              "menu S1: navigation 0 <-> ... <-> 6 <-> 8 <-> 9 <-> 0, left/right stay");
-        {
-            std::vector<int> visited;
-            int s = 0;
-            for (int step = 0; step < 12; ++step) {
-                visited.push_back(s);
-                s = cItem(s)[0x1f];
-                if (s == 0) {
-                    break;
-                }
-            }
-            Check(visited == std::vector<int>{0, 1, 2, 3, 4, 5, 6, 8, 9} && s == 0,
-                  "menu S1: Tab from slot 0 walks every row including the client's and wraps");
-            bool upInverse = true;
-            for (int v : visited) {
-                upInverse = upInverse && cItem(cItem(v)[0x1f])[0x1e] == v && cItem(cItem(v)[0x20])[0x21] == v;
-            }
-            Check(upInverse, "menu S1: up/Shift+Tab are the inverse of down/Tab with the client row");
-        }
-        int clientEscape = 0;
-        int clientLastEnabled = -1;
-        for (int s = 0; s < static_cast<int>(kRelocatedGraphicsMenuMaxCount); ++s) {
-            clientEscape += (u32At(cItem(s) + 0x24) & 0x8000) != 0;
-            if (cItem(s)[0x28] != 0) {
-                clientLastEnabled = s;
-            }
-        }
-        Check(clientEscape == 1 && (u32At(cItem(9) + 0x24) & 0x8000) != 0 && clientLastEnabled == 9,
-              "menu S1: 'Ya esta' stays the only Escape item and the last enabled one");
-
-        // The same relocation on the fake image grows the counts to 10 and restores them.
-        for (uint32_t tableCount : {8u, 0u}) {
-            resetImage(tableCount);
-            state = GraphicsMenuRelocation{};
-            std::vector<uint8_t> clientItems(kRelocatedGraphicsMenuMaxSize, 0xEE);
-            const GraphicsMenuCheck r = RelocateGraphicsMenu(module, clientItems.data(), clientItems.size(), wsHandler,
-                                                             fvHandler, state, true, clientHandler);
-            std::vector<uint8_t> expectedClientItems(kRelocatedGraphicsMenuMaxSize);
-            BuildRelocatedGraphicsMenu(at(kVaGraphicsMenuItems), wsHandler, fvHandler, expectedClientItems.data(),
-                                       expectedClientItems.size(), true, clientHandler);
-            const uint32_t expectedTableCount = tableCount == 8 ? 10u : 0u;
-            Check(r == GraphicsMenuCheck::Ok && state.applied && clientItems == expectedClientItems &&
-                      u32At(at(kVaGraphicsMenuCount)) == 10 && u32At(at(kVaGraphicsMenuTableCount)) == expectedTableCount &&
-                      u32At(at(kVaGraphicsMenuTableItems)) == static_cast<uint32_t>(reinterpret_cast<uintptr_t>(clientItems.data())),
-                  tableCount == 8 ? "menu S1: relocation with a client writes count 10 in both places"
-                                  : "menu S1: before WM_CREATE the table count stays 0 for the 10-item menu");
-            if (tableCount == 0) {
-                putU32(at(kVaGraphicsMenuTableCount), u32At(at(kVaGraphicsMenuCount)));  // WM_CREATE copies 10
-            }
-            RestoreGraphicsMenu(module, state);
-            Check(!state.applied && u32At(at(kVaGraphicsMenuCount)) == 8 &&
-                      u32At(at(kVaGraphicsMenuTableCount)) == 8 &&
-                      u32At(at(kVaGraphicsMenuTableItems)) ==
-                          static_cast<uint32_t>(static_cast<intptr_t>(kVaGraphicsMenuItems) + fakeDelta),
-                  "menu S1: restore accepts a 10-item table count and puts back 8");
-        }
-
-        // The builder owns its destination bounds (R3-001): the array must hold the largest menu,
-        // and a smaller destination is refused without a single byte written.
-        Check(kRelocatedGraphicsMenuMaxSize == kRelocatedGraphicsMenuMaxCount * kMenuItemSize &&
-                  kRelocatedGraphicsMenuMaxSize == 10 * 0x38,
-              "menu S1: kRelocatedGraphicsMenuMaxSize holds the 10-item menu");
-        std::vector<uint8_t> exactMax(kRelocatedGraphicsMenuMaxSize, 0xCD);
-        Check(BuildRelocatedGraphicsMenu(withHwnd.data(), wsHandler, fvHandler, exactMax.data(), exactMax.size(),
-                                         true, clientHandler) == GraphicsMenuBuild::Ok &&
-                  exactMax == clientOut,
-              "menu S1: a destination of exactly the maximum size takes the 10-item menu");
-        for (size_t capacity : {kRelocatedGraphicsMenuMaxSize - 1, kRelocatedGraphicsMenuSize, size_t{0}}) {
-            std::vector<uint8_t> tiny(exactMax.size(), 0x5A);
-            Check(BuildRelocatedGraphicsMenu(withHwnd.data(), wsHandler, fvHandler, tiny.data(), capacity, true,
-                                             clientHandler) == GraphicsMenuBuild::NotEnoughSpace &&
-                      tiny == std::vector<uint8_t>(exactMax.size(), 0x5A),
-                  "menu S1: the builder refuses a destination smaller than the 10-item menu");
-        }
-        std::vector<uint8_t> nineOnly(kRelocatedGraphicsMenuSize, 0xCD);
-        Check(BuildRelocatedGraphicsMenu(withHwnd.data(), wsHandler, fvHandler, nineOnly.data(), nineOnly.size()) ==
-                  GraphicsMenuBuild::Ok,
-              "menu S1: the 9-item menu still fits the 9-item destination");
-
-        // A relocation into a destination that cannot hold the client menu refuses before writing.
-        // The vector is the maximum size so the expected refusal, not a real overflow, is what the
-        // test observes.
-        resetImage(8);
-        state = GraphicsMenuRelocation{};
-        std::vector<uint8_t> shortItems(kRelocatedGraphicsMenuMaxSize, 0xEE);
-        const std::vector<uint8_t> beforeShort = image;
-        Check(RelocateGraphicsMenu(module, shortItems.data(), kRelocatedGraphicsMenuSize, wsHandler, fvHandler,
-                                   state, true, clientHandler) == GraphicsMenuCheck::Capacity &&
-                  !state.applied && image == beforeShort &&
-                  shortItems == std::vector<uint8_t>(kRelocatedGraphicsMenuMaxSize, 0xEE),
-              "menu S1: relocation refuses a destination that cannot hold the client menu");
-
-        // The deferred build (R3-003): pending, then applied or failed, and the request is taken once.
-        GraphicsMenuInstall install;
-        Check(!GraphicsMenuRowSlotOpen(install),
-              "menu S1: no client row slot is open before InstallHooks requests the build");
-        Check(!TakeGraphicsMenuInstallRequest(install), "menu S1: nothing is built before InstallHooks requests it");
-        RequestGraphicsMenuInstall(install);
-        Check(install.phase == GraphicsMenuPhase::Pending && GraphicsMenuRowSlotOpen(install) &&
-                  TakeGraphicsMenuInstallRequest(install) && install.phase == GraphicsMenuPhase::Building &&
-                  GraphicsMenuRowSlotOpen(install),
-              "menu S1: the first menu frame takes the pending build while the row slot stays open");
-        Check(!TakeGraphicsMenuInstallRequest(install),
-              "menu S1: the pending flag is consumed exactly once");
-        FinishGraphicsMenuInstall(install, true);
-        Check(install.phase == GraphicsMenuPhase::Applied && !GraphicsMenuRowSlotOpen(install) &&
-                  !TakeGraphicsMenuInstallRequest(install),
-              "menu S1: an applied build closes the row slot and is never built twice");
-        RequestGraphicsMenuInstall(install);
-        Check(install.phase == GraphicsMenuPhase::Applied && !TakeGraphicsMenuInstallRequest(install),
-              "menu S1: a request after the build does not reopen it");
-
-        GraphicsMenuInstall failedInstall;
-        RequestGraphicsMenuInstall(failedInstall);
-        Check(TakeGraphicsMenuInstallRequest(failedInstall), "menu S1: the failed path also takes the request once");
-        FinishGraphicsMenuInstall(failedInstall, false);
-        Check(failedInstall.phase == GraphicsMenuPhase::Failed && !GraphicsMenuRowSlotOpen(failedInstall) &&
-                  !TakeGraphicsMenuInstallRequest(failedInstall),
-              "menu S1: a failed relocation closes the row slot and is never retried");
-        RequestGraphicsMenuInstall(failedInstall);
-        Check(failedInstall.phase == GraphicsMenuPhase::Failed,
-              "menu S1: a failed install stays failed until the hooks are removed");
-        ResetGraphicsMenuInstall(failedInstall);
-        Check(failedInstall.phase == GraphicsMenuPhase::Idle && !GraphicsMenuRowSlotOpen(failedInstall),
-              "menu S1: removing the hooks puts the install back to idle with the row slot closed");
     }
 
 
@@ -4093,290 +3896,6 @@ int main() {
         Check(visible == 1 && badOut[0] == 0xFF808080u,
               "hud icons: white darker than black is clamped to an opaque pixel");
         Check(RecoverHudIconLayer(nullptr, nullptr, nullptr, 0) == 0, "hud icons: zero pixels is a no-op");
-    }
-
-    // Mod API for add-on DLLs (rr95-music-standalone S1): the versioned table, one slot per
-    // capability, the item text dispatch, the overlay upload rule and the detach rule.
-    {
-        using namespace rr95::modapi;
-
-        const RR95ModApi* api = RR95_GetModApi(RR95_MOD_API_VERSION);
-        Check(api != nullptr && api->version == RR95_MOD_API_VERSION && api->size == sizeof(RR95ModApi),
-              "mod API: version 1 returns a table whose size matches the header");
-        Check(RR95_GetModApi(0) == nullptr && RR95_GetModApi(RR95_MOD_API_VERSION + 1) == nullptr,
-              "mod API: other versions return null");
-        Check(api != nullptr && api->registerRaceFrameCallback && api->registerMenuFrameCallback &&
-                  api->addGraphicsMenuRow && api->registerItemTextProvider && api->setOverlayLayer &&
-                  api->getHookState && api->getMenuState && api->isItemTextDetourInstalled,
-              "mod API: version 1 fills every function pointer");
-
-        // One registration per capability; a null callback clears the slot while it is open.
-        State state;
-        int calls = 0;
-        Check(RegisterRaceFrameCallback(state, nullptr, nullptr) == RR95_STATUS_OK &&
-                  state.raceFrameCallback == nullptr && state.raceFrameCtx == nullptr,
-              "mod API: a null race callback clears the slot (and a free slot stays clear)");
-        Check(RegisterRaceFrameCallback(state, ModApiRaceCallback, &calls) == RR95_STATUS_OK,
-              "mod API: the race slot takes a registration again after a clear");
-
-        Check(RegisterMenuFrameCallback(state, nullptr, nullptr) == RR95_STATUS_OK &&
-                  RegisterMenuFrameCallback(state, ModApiMenuCallback, &calls) == RR95_STATUS_OK &&
-                  state.menuFrameCallback == ModApiMenuCallback &&
-                  RegisterMenuFrameCallback(state, ModApiMenuCallback, &calls) == RR95_STATUS_REJECTED,
-              "mod API: the menu frame callback follows the same slot rules");
-
-        Check(RegisterItemTextProvider(state, nullptr, nullptr) == RR95_STATUS_OK &&
-                  RegisterItemTextProvider(state, ModApiItemTextProvider, &calls) == RR95_STATUS_OK &&
-                  state.itemTextProvider == ModApiItemTextProvider &&
-                  RegisterItemTextProvider(state, ModApiItemTextProvider, &calls) == RR95_STATUS_REJECTED &&
-                  RegisterItemTextProvider(state, nullptr, nullptr) == RR95_STATUS_OK &&
-                  state.itemTextProvider == nullptr,
-              "mod API: the item text provider follows the same slot rules");
-
-        Check(SetOverlayLayer(state, nullptr, nullptr) == RR95_STATUS_OK &&
-                  SetOverlayLayer(state, ModApiOverlaySource, &calls) == RR95_STATUS_OK &&
-                  state.overlaySource == ModApiOverlaySource &&
-                  SetOverlayLayer(state, ModApiOverlaySource, &calls) == RR95_STATUS_REJECTED,
-              "mod API: the overlay layer follows the same slot rules");
-
-        // The graphics menu row: descriptor validation, one slot, clear, and already-built.
-        RR95MenuRowDesc row = {0x10203040u, ModApiRowText, &calls};
-        State menuState;
-        Check(AddGraphicsMenuRow(menuState, nullptr) == RR95_STATUS_OK && !menuState.menuRowRegistered,
-              "mod API: a null menu row descriptor clears the slot (and a free slot stays clear)");
-        RR95MenuRowDesc missingText = row;
-        missingText.text = nullptr;
-        Check(AddGraphicsMenuRow(menuState, &missingText) == RR95_STATUS_INVALID_ARGUMENT,
-              "mod API: a menu row without a text callback is invalid");
-        RR95MenuRowDesc missingHandler = row;
-        missingHandler.selectHandler = 0;
-        Check(AddGraphicsMenuRow(menuState, &missingHandler) == RR95_STATUS_INVALID_ARGUMENT,
-              "mod API: a menu row without a select handler is invalid");
-        Check(AddGraphicsMenuRow(menuState, &row) == RR95_STATUS_OK && menuState.menuRowRegistered &&
-                  menuState.menuRow.selectHandler == row.selectHandler && menuState.menuRow.text == row.text &&
-                  menuState.menuRow.ctx == row.ctx,
-              "mod API: the first graphics menu row registers");
-        const int rowTextCallsBefore = calls;
-        Check(GraphicsMenuRowText(menuState, false) == g_modApiText && calls == rowTextCallsBefore + 1,
-              "mod API: the client row text comes from the row's text callback");
-        Check(std::strcmp(GraphicsMenuRowText(menuState, true), "") == 0 && calls == rowTextCallsBefore + 1,
-              "mod API: the client row text is detach-gated like every other client entry point");
-        Check(AddGraphicsMenuRow(menuState, &row) == RR95_STATUS_REJECTED,
-              "mod API: a second graphics menu row is rejected");
-        Check(AddGraphicsMenuRow(menuState, nullptr) == RR95_STATUS_OK && !menuState.menuRowRegistered,
-              "mod API: a null row clears the pending row");
-        Check(AddGraphicsMenuRow(menuState, &row) == RR95_STATUS_OK,
-              "mod API: the row slot takes a registration again after a clear");
-        CloseGraphicsMenuRowSlot(menuState);
-        Check(AddGraphicsMenuRow(menuState, &row) == RR95_STATUS_TOO_LATE,
-              "mod API: adding a row after the menu was built is too late");
-
-        // Item text order (R3-002): the general mod's own items, then the client row, then the client
-        // provider, then the game's own function. The menu must be applied for any of them.
-        Check(DecideItemTextSource(true, true, true, true) == ItemTextSource::Owned &&
-                  DecideItemTextSource(true, false, true, false) == ItemTextSource::Owned,
-              "mod API: the general mod's own items keep their text, before every client source");
-        Check(DecideItemTextSource(false, true, true, true) == ItemTextSource::ClientRow &&
-                  DecideItemTextSource(false, true, true, false) == ItemTextSource::ClientRow,
-              "mod API: the client row slot takes the client row text before the item provider");
-        Check(DecideItemTextSource(false, false, true, true) == ItemTextSource::Client,
-              "mod API: a registered provider supplies every other applied item");
-        Check(DecideItemTextSource(false, false, true, false) == ItemTextSource::Original,
-              "mod API: without a provider the game's own function supplies the text");
-        Check(DecideItemTextSource(false, true, false, true) == ItemTextSource::Original,
-              "mod API: the client row slot is never matched while the menu is not applied");
-        Check(DecideItemTextSource(false, false, false, true) == ItemTextSource::Original &&
-                  DecideItemTextSource(true, false, false, true) == ItemTextSource::Original,
-              "mod API: without the applied menu no client text is used for any item");
-
-        // Overlay frame validity (R3-005): non-null pixels, width 1..640 and height 1..480. An
-        // invalid frame is skipped for that frame only, and each distinct failure is logged once.
-        const uint32_t overlayPixels[4] = {0, 0, 0, 0};
-        RR95OverlayFrame frame = {overlayPixels, 640, 480, 0, 0, 1};
-        Check(IsValidOverlayFrame(frame) && CheckOverlayFrame(frame) == OverlayFrameProblem::None,
-              "mod API: a 640x480 frame with pixels is valid");
-        frame.width = 1;
-        frame.height = 1;
-        Check(IsValidOverlayFrame(frame), "mod API: the smallest 1x1 overlay frame is valid");
-        frame = RR95OverlayFrame{nullptr, 640, 480, 0, 0, 1};
-        Check(!IsValidOverlayFrame(frame) && CheckOverlayFrame(frame) == OverlayFrameProblem::NoPixels,
-              "mod API: a frame without pixels is invalid");
-        frame = RR95OverlayFrame{overlayPixels, 0, 480, 0, 0, 1};
-        Check(!IsValidOverlayFrame(frame) && CheckOverlayFrame(frame) == OverlayFrameProblem::Width,
-              "mod API: width 0 is invalid");
-        frame.width = 641;
-        Check(!IsValidOverlayFrame(frame) && CheckOverlayFrame(frame) == OverlayFrameProblem::Width,
-              "mod API: width 641 is outside the 640x480 game image");
-        frame = RR95OverlayFrame{overlayPixels, 640, 0, 0, 0, 1};
-        Check(!IsValidOverlayFrame(frame) && CheckOverlayFrame(frame) == OverlayFrameProblem::Height,
-              "mod API: height 0 is invalid");
-        frame.height = 481;
-        Check(!IsValidOverlayFrame(frame) && CheckOverlayFrame(frame) == OverlayFrameProblem::Height,
-              "mod API: height 481 is outside the 640x480 game image");
-
-        uint32_t loggedProblems = 0;
-        Check(ShouldLogOverlayProblem(loggedProblems, OverlayFrameProblem::NoPixels),
-              "mod API: the first invalid overlay frame is logged");
-        Check(!ShouldLogOverlayProblem(loggedProblems, OverlayFrameProblem::NoPixels),
-              "mod API: the same overlay failure is logged once");
-        Check(ShouldLogOverlayProblem(loggedProblems, OverlayFrameProblem::Width) &&
-                  ShouldLogOverlayProblem(loggedProblems, OverlayFrameProblem::Height) &&
-                  !ShouldLogOverlayProblem(loggedProblems, OverlayFrameProblem::None) &&
-                  !ShouldLogOverlayProblem(loggedProblems, OverlayFrameProblem::Width),
-              "mod API: each distinct overlay failure is logged once and a valid frame never logs");
-
-        // The overlay texture is uploaded on the first frame, a counter change or a size change; a
-        // failed attempt is retried only when the counter or the size changes (R3-005).
-        OverlayUploadState upload;
-        Check(OverlayNeedsUpload(upload, 5, 64, 32), "mod API: the first overlay frame is uploaded");
-        RecordOverlayUpload(upload, 5, 64, 32);
-        Check(!OverlayNeedsUpload(upload, 5, 64, 32), "mod API: an unchanged overlay is not uploaded again");
-        Check(OverlayNeedsUpload(upload, 6, 64, 32), "mod API: a new change counter uploads the overlay");
-        Check(OverlayNeedsUpload(upload, 5, 65, 32) && OverlayNeedsUpload(upload, 5, 64, 33),
-              "mod API: a new overlay size uploads it");
-        RecordOverlayUploadFailure(upload, 7, 64, 32);
-        Check(!OverlayNeedsUpload(upload, 7, 64, 32),
-              "mod API: a failed overlay texture is not created again for the same frame");
-        Check(OverlayNeedsUpload(upload, 8, 64, 32),
-              "mod API: a new change counter retries the failed overlay texture");
-        RecordOverlayUploadFailure(upload, 8, 64, 32);
-        Check(!OverlayNeedsUpload(upload, 8, 64, 32) && OverlayNeedsUpload(upload, 8, 65, 32),
-              "mod API: a failed overlay texture is retried when its size changes");
-        RecordOverlayUpload(upload, 9, 64, 32);
-        Check(!OverlayNeedsUpload(upload, 9, 64, 32),
-              "mod API: a successful upload after a failure stops the retries");
-
-        // fdaae4f follow-up: a client that bumps its change counter every frame must not retry a
-        // persistent CreateTexture2D failure every frame, and the log stays one line per code.
-        OverlayRetryState retry;
-        Check(OverlayRetryDue(retry, 1000), "mod API: the first overlay texture attempt is due");
-        RecordOverlayRetryFailure(retry, 1000);
-        Check(!OverlayRetryDue(retry, 1500), "mod API: a failed texture is not retried within a second");
-        Check(OverlayRetryDue(retry, 2000), "mod API: the failed texture is retried after one second");
-        RecordOverlayRetryFailure(retry, 2000);
-        Check(!OverlayRetryDue(retry, 2999) && OverlayRetryDue(retry, 3000),
-              "mod API: repeated failures keep the one-second backoff");
-        RecordOverlayRetrySuccess(retry);
-        Check(OverlayRetryDue(retry, 3000), "mod API: a success resets the overlay retry backoff");
-
-        OverlayFailureLog failureLog;
-        Check(ShouldLogOverlayFailure(failureLog, 0x887A0005u),
-              "mod API: the first overlay texture failure code is logged");
-        Check(!ShouldLogOverlayFailure(failureLog, 0x887A0005u),
-              "mod API: the same overlay texture failure code is not logged again");
-        Check(ShouldLogOverlayFailure(failureLog, 0x8007000Eu),
-              "mod API: a different overlay texture failure code is logged once");
-        Check(!ShouldLogOverlayFailure(failureLog, 0x8007000Eu),
-              "mod API: each distinct overlay texture failure code logs once");
-
-        // 640x480 game coordinates into the letterboxed image.
-        const LetterboxViewport native{0, 0, 640, 480};
-        const OverlayRect identity = MapOverlayRectToClient(native, 0, 0, 640, 480);
-        Check(identity.x == 0 && identity.y == 0 && identity.width == 640 && identity.height == 480,
-              "mod API: the native 640x480 viewport is the identity");
-        const LetterboxViewport pillarbox{240, 0, 1440, 1080};
-        const OverlayRect scaled = MapOverlayRectToClient(pillarbox, 10, 20, 64, 32);
-        Check(scaled.x == 262 && scaled.y == 45 && scaled.width == 144 && scaled.height == 72,
-              "mod API: game (10,20,64,32) maps to (262,45,144,72) in a 1440x1080 viewport at x 240");
-
-        // Hook state and detach: callbacks run only while the hooks are installed and not detached.
-        Check(HookState() == RR95_HOOK_STATE_NOT_INSTALLED, "mod API: the hook state starts not installed");
-        SetHookState(RR95_HOOK_STATE_ACTIVE);
-        Check(HookState() == RR95_HOOK_STATE_ACTIVE, "mod API: the hook state reports the installed hooks");
-        SetHookState(RR95_HOOK_STATE_FAILED);
-        Check(HookState() == RR95_HOOK_STATE_FAILED, "mod API: the hook state reports the failed hooks");
-
-        // Appended version 1 fields (rr95-music-standalone S2): the graphics menu state and the
-        // item-text detour flag, so a client can decide without guessing.
-        Check(api->getMenuState() == RR95_MENU_STATE_UNKNOWN && !ItemTextDetourInstalled(),
-              "mod API: the graphics menu starts unknown and the item text detour is absent");
-        Check(NextGraphicsMenuState(RR95_MENU_STATE_UNKNOWN, GraphicsMenuEvent::InstallWithMenu) ==
-                      RR95_MENU_STATE_PENDING,
-              "mod API: installing with a menu requests the deferred build (PENDING)");
-        Check(NextGraphicsMenuState(RR95_MENU_STATE_UNKNOWN, GraphicsMenuEvent::InstallWithoutMenu) ==
-                      RR95_MENU_STATE_NOT_USED,
-              "mod API: installing without a menu reports NOT_USED");
-        Check(NextGraphicsMenuState(RR95_MENU_STATE_PENDING, GraphicsMenuEvent::BuildApplied) ==
-                      RR95_MENU_STATE_APPLIED,
-              "mod API: the deferred build applies the menu (APPLIED)");
-        Check(NextGraphicsMenuState(RR95_MENU_STATE_PENDING, GraphicsMenuEvent::BuildFailed) ==
-                      RR95_MENU_STATE_FAILED,
-              "mod API: a refused deferred build reports FAILED");
-        Check(NextGraphicsMenuState(RR95_MENU_STATE_NOT_USED, GraphicsMenuEvent::BuildApplied) ==
-                      RR95_MENU_STATE_NOT_USED,
-              "mod API: a menu that was never requested cannot become APPLIED");
-        Check(NextGraphicsMenuState(RR95_MENU_STATE_PENDING, GraphicsMenuEvent::Removed) ==
-                      RR95_MENU_STATE_NOT_USED &&
-                  NextGraphicsMenuState(RR95_MENU_STATE_APPLIED, GraphicsMenuEvent::Removed) ==
-                      RR95_MENU_STATE_NOT_USED &&
-                  NextGraphicsMenuState(RR95_MENU_STATE_FAILED, GraphicsMenuEvent::Removed) ==
-                      RR95_MENU_STATE_NOT_USED,
-              "mod API: removing the menu reports NOT_USED from every state");
-        const GraphicsMenuBuildOutcome built = DecideGraphicsMenuBuildOutcome(true);
-        const GraphicsMenuBuildOutcome rolledBack = DecideGraphicsMenuBuildOutcome(false);
-        Check(built.menuState == RR95_MENU_STATE_APPLIED && built.itemTextDetourInstalled &&
-                  rolledBack.menuState == RR95_MENU_STATE_FAILED && !rolledBack.itemTextDetourInstalled,
-              "mod API: a failed relocation rolls the item text detour back with the FAILED state");
-        Check(RR95_MENU_STATE_UNKNOWN == 4 && RR95_MENU_STATE_NOT_USED == 0 &&
-                  RR95_MENU_STATE_PENDING == 1 && RR95_MENU_STATE_APPLIED == 2 &&
-                  RR95_MENU_STATE_FAILED == 3,
-              "mod API: the unknown menu state is appended without changing the existing values");
-
-        SetGraphicsMenuState(RR95_MENU_STATE_PENDING);
-        Check(GraphicsMenuState() == RR95_MENU_STATE_PENDING &&
-                  api->getMenuState() == RR95_MENU_STATE_PENDING,
-              "mod API: the graphics menu state reports pending");
-        SetGraphicsMenuState(RR95_MENU_STATE_APPLIED);
-        SetItemTextDetourInstalled(true);
-        Check(GraphicsMenuState() == RR95_MENU_STATE_APPLIED &&
-                  api->getMenuState() == RR95_MENU_STATE_APPLIED &&
-                  api->isItemTextDetourInstalled() != 0 && ItemTextDetourInstalled(),
-              "mod API: the graphics menu state reports applied with the item text detour");
-        SetGraphicsMenuState(RR95_MENU_STATE_FAILED);
-        SetItemTextDetourInstalled(false);
-        Check(api->getMenuState() == RR95_MENU_STATE_FAILED &&
-                  api->isItemTextDetourInstalled() == 0 && !ItemTextDetourInstalled(),
-              "mod API: the graphics menu state reports failed without the item text detour");
-        SetGraphicsMenuState(RR95_MENU_STATE_NOT_USED);
-
-        Check(ShouldInvokeCallback(false) && !ShouldInvokeCallback(true),
-              "mod API: no callback runs after DLL_PROCESS_DETACH");
-
-        // The process-wide table drives the four detours through Global().
-        State& global = Global();
-        global = State{};
-        g_modApiRaceCalls = 0;
-        g_modApiMenuCalls = 0;
-        g_modApiTextCalls = 0;
-        g_modApiOverlayCalls = 0;
-        g_modApiOverlayFrame = RR95OverlayFrame{};
-        Check(api->registerRaceFrameCallback(ModApiRaceCallback, &g_modApiRaceCalls) == RR95_STATUS_OK &&
-                  api->registerMenuFrameCallback(ModApiMenuCallback, &g_modApiMenuCalls) == RR95_STATUS_OK,
-              "mod API: the table registers frame callbacks on the process-wide state");
-        OnRaceFrame();
-        OnMenuFrame();
-        Check(g_modApiRaceCalls == 1 && g_modApiMenuCalls == 1, "mod API: each detour calls its callback once");
-        Check(api->registerItemTextProvider(ModApiItemTextProvider, &g_modApiTextCalls) == RR95_STATUS_OK &&
-                  std::strcmp(ItemTextFor(nullptr), g_modApiText) == 0 && g_modApiTextCalls == 1,
-              "mod API: the item text detour asks the provider");
-        g_modApiOverlayFrame.pixels = nullptr;
-        g_modApiOverlayFrame.width = 64;
-        g_modApiOverlayFrame.height = 32;
-        g_modApiOverlayFrame.changeCounter = 7;
-        Check(api->setOverlayLayer(ModApiOverlaySource, &g_modApiOverlayCalls) == RR95_STATUS_OK &&
-                  OverlayRegistered() && OverlayFrame() == &g_modApiOverlayFrame && g_modApiOverlayCalls == 1,
-              "mod API: the presenter asks the overlay source once per presented frame");
-        Check(api->addGraphicsMenuRow(&row) == RR95_STATUS_OK && GraphicsMenuRowRegistered(),
-              "mod API: the table exposes the graphics menu row slot");
-        const int globalRowTextCalls = calls;
-        SetDetached();
-        OnRaceFrame();
-        OnMenuFrame();
-        Check(g_modApiRaceCalls == 1 && g_modApiMenuCalls == 1 && ItemTextFor(nullptr) == nullptr &&
-                  OverlayFrame() == nullptr,
-              "mod API: no callback or provider runs after DLL_PROCESS_DETACH");
-        Check(std::strcmp(GraphicsMenuRowText(), "") == 0 && calls == globalRowTextCalls,
-              "mod API: the global row text is empty and does not call the client after detach");
     }
 
     TestDrawDistance();

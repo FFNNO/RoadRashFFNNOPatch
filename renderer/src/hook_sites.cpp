@@ -11,7 +11,6 @@
 #include "options_menu.h"
 #include "hud_icons.h"
 #include "draw_distance.h"
-#include "mod_api.h"
 #include <windows.h>
 #include <commdlg.h>
 #include <algorithm>
@@ -22,20 +21,11 @@
 #include <string>
 #include <vector>
 
-// Called at the game's first menu frame; defined after the detours and the hook sites.
-static bool InstallGraphicsMenuItems();
-
 namespace {
 
 HMODULE g_hostModule = nullptr;
 std::atomic<uint64_t> g_gdiStretchDIBitsCalls{0};
 bool g_iatStretchDIBitsInstalled = false;
-
-// The graphics menu and its item text hook are installed at the game's first menu frame, not on
-// the first DirectDrawCreate, so a mod API client can register its row until then. The pending
-// request is consumed exactly once; a failed build closes the client row slot for good.
-GraphicsMenuInstall g_graphicsMenuInstall;
-bool g_graphicsMenuHasClientRow = false;
 
 uintptr_t Rebase(uint32_t preferredVa) {
     return reinterpret_cast<uintptr_t>(g_hostModule) + (preferredVa - rr95::kPreferredImageBase);
@@ -494,7 +484,6 @@ const uint32_t* BuildHudIconLayer(int width, int height) {
 }
 
 void __fastcall Detour_FUN_0046e630(uint8_t* buffer, int pitch, int palette) {
-    rr95::modapi::OnRaceFrame();
     const int width = *GlobalPtr<int>(kVaBufferWidth);
     const int height = *GlobalPtr<int>(kVaBufferHeight);
 
@@ -579,18 +568,6 @@ void __fastcall Detour_FUN_0046e630(uint8_t* buffer, int pitch, int palette) {
 }
 
 void __cdecl Detour_FUN_0046ded0() {
-    rr95::modapi::OnMenuFrame();
-    if (TakeGraphicsMenuInstallRequest(g_graphicsMenuInstall)) {
-        const bool applied = InstallGraphicsMenuItems();
-        FinishGraphicsMenuInstall(g_graphicsMenuInstall, applied);
-        // The state and the item-text flag are set together: a failed relocation has already rolled
-        // the detour back, so no client reads APPLIED with the detour missing.
-        const rr95::modapi::GraphicsMenuBuildOutcome outcome =
-            rr95::modapi::DecideGraphicsMenuBuildOutcome(applied);
-        rr95::modapi::SetGraphicsMenuState(outcome.menuState);
-        rr95::modapi::SetItemTextDetourInstalled(outcome.itemTextDetourInstalled);
-        rr95::modapi::CloseGraphicsMenuRowSlot();
-    }
     if (!GetConfig().presenterEnabled) {
         if (g_orig_FUN_0046ded0) {
             g_orig_FUN_0046ded0();
@@ -946,12 +923,8 @@ constexpr uint8_t kItemRedrawPrologue[9] = {0x55, 0x8B, 0xEC, 0x81, 0xEC, 0x94, 
 using FUN_00439160_Fn = void(__fastcall*)(void* item, void* selected);
 
 // The relocated menu 19. The engine keeps pointers to its items while the menu is open, so it lives
-// as long as the DLL; RemoveHooks points the engine back at its own array. The buffer is sized for
-// the largest menu (10 items with a mod API client row), never the 9-item one, so
-// BuildRelocatedGraphicsMenu cannot write past its end.
-alignas(4) uint8_t g_graphicsMenuItems[kRelocatedGraphicsMenuMaxSize] = {};
-static_assert(sizeof(g_graphicsMenuItems) == kRelocatedGraphicsMenuMaxSize,
-              "g_graphicsMenuItems must hold kRelocatedGraphicsMenuMaxSize bytes");
+// as long as the DLL; RemoveHooks points the engine back at its own array.
+alignas(4) uint8_t g_graphicsMenuItems[kRelocatedGraphicsMenuSize] = {};
 GraphicsMenuRelocation g_graphicsMenu;
 std::string g_menuOnText;
 std::string g_menuOffText;
@@ -963,42 +936,18 @@ const void* GraphicsMenuItem(int slot) {
 }
 
 const char* __fastcall Detour_FUN_0045b930(void* item) {
-    const bool menuApplied = g_graphicsMenu.applied;
-    const bool ownedItem =
-        menuApplied && (item == GraphicsMenuItem(kGraphicsMenuWidescreenSlot) ||
-                        item == GraphicsMenuItem(kGraphicsMenuFarViewSlot));
-    const bool clientRowSlot =
-        menuApplied && g_graphicsMenuHasClientRow && item == GraphicsMenuItem(kGraphicsMenuClientSlot);
-    const bool providerRegistered = rr95::modapi::Global().itemTextProvider != nullptr;
-    switch (rr95::modapi::DecideItemTextSource(ownedItem, clientRowSlot, menuApplied, providerRegistered)) {
-    case rr95::modapi::ItemTextSource::Owned:
-        if (item == GraphicsMenuItem(kGraphicsMenuWidescreenSlot)) {
-            // The language is read on every draw: the game sets it at startup, before any menu opens.
-            const std::string text =
-                WidescreenMenuText(g_menuWidescreenOn.load(), g_menuOnText.c_str(), g_menuOffText.c_str(),
-                                   *GlobalPtr<const uint32_t>(kVaGameLanguage));
-            strncpy_s(g_widescreenMenuText, text.c_str(), _TRUNCATE);
-            return g_widescreenMenuText;
-        }
-        {
-            const std::string text =
-                FarViewMenuText(g_menuFarViewOn.load(), g_menuOnText.c_str(), g_menuOffText.c_str(),
-                                *GlobalPtr<const uint32_t>(kVaGameLanguage));
-            strncpy_s(g_farViewMenuText, text.c_str(), _TRUNCATE);
-            return g_farViewMenuText;
-        }
-    case rr95::modapi::ItemTextSource::ClientRow:
-        return rr95::modapi::GraphicsMenuRowText();
-    case rr95::modapi::ItemTextSource::Client: {
-        const char* clientText = rr95::modapi::ItemTextFor(item);
-        if (clientText != nullptr) {
-            return clientText;
-        }
-        break;
+    if (g_graphicsMenu.applied && item == GraphicsMenuItem(kGraphicsMenuWidescreenSlot)) {
+        // The language is read on every draw: the game sets it at startup, before any menu opens.
+        const std::string text = WidescreenMenuText(g_menuWidescreenOn.load(), g_menuOnText.c_str(),
+                                                    g_menuOffText.c_str(), *GlobalPtr<const uint32_t>(kVaGameLanguage));
+        strncpy_s(g_widescreenMenuText, text.c_str(), _TRUNCATE);
+        return g_widescreenMenuText;
     }
-    case rr95::modapi::ItemTextSource::Original:
-    default:
-        break;
+    if (g_graphicsMenu.applied && item == GraphicsMenuItem(kGraphicsMenuFarViewSlot)) {
+        const std::string text = FarViewMenuText(g_menuFarViewOn.load(), g_menuOnText.c_str(), g_menuOffText.c_str(),
+                                                 *GlobalPtr<const uint32_t>(kVaGameLanguage));
+        strncpy_s(g_farViewMenuText, text.c_str(), _TRUNCATE);
+        return g_farViewMenuText;
     }
     return g_orig_FUN_0045b930(item);
 }
@@ -1237,13 +1186,11 @@ static void InstallDistanceFadeHooks() {
 // Relocates graphics menu 19 with the widescreen and far view items when GpuWorld is configured on
 // and the world and race-init hooks are installed (the caller checks the hooks). Any unexpected byte
 // leaves the menu exactly as shipped.
-// Returns true only when the relocated menu and its item text hook are in place. Any other result
-// leaves the game's menu untouched, and the caller closes the mod API client row slot.
-static bool InstallGraphicsMenuItems() {
+static void InstallGraphicsMenuItems() {
     const Config& cfg = GetConfig();
     if (!cfg.gpuWorld || !cfg.presenterEnabled) {
         LOG_INFO("Options menu: GpuWorld is off; the Widescreen and Far view items are not added");
-        return false;
+        return;
     }
     uint8_t* module = reinterpret_cast<uint8_t*>(g_hostModule);
     const uint8_t* onOff = GlobalPtr<const uint8_t>(kVaOnOffStrings);
@@ -1255,56 +1202,40 @@ static bool InstallGraphicsMenuItems() {
         LOG_WARN("Options menu: unexpected engine bytes (menu 19: %s, On/Off strings ok=%d, FUN_00439160 ok=%d); "
                  "the graphics menu is left unchanged",
                  GraphicsMenuCheckToString(menu), stringsOk ? 1 : 0, redrawOk ? 1 : 0);
-        return false;
+        return;
     }
     g_menuOnText.assign(reinterpret_cast<const char*>(onOff));
     g_menuOffText.assign(reinterpret_cast<const char*>(onOff + 4));
     if (!rr95::InstallHook(g_site_FUN_0045b930, g_hostModule)) {
         LOG_WARN("Options menu: failed to install the hook on FUN_0045b930; the graphics menu is left unchanged");
-        return false;
+        return;
     }
-    rr95::modapi::SetItemTextDetourInstalled(true);
     const EffectiveWidescreenSetting widescreen = CurrentWidescreenSetting();
     const EffectiveFarViewSetting farView = CurrentFarViewSetting();
     g_menuWidescreenOn = widescreen.setting.mode != WidescreenMode::Off;
     g_menuFarViewOn = FarViewSettingIsOn(farView);
-    const bool withClientRow = rr95::modapi::GraphicsMenuRowRegistered();
-    const uint32_t clientHandler =
-        withClientRow ? rr95::modapi::Global().menuRow.selectHandler : 0;
     const GraphicsMenuCheck relocated = RelocateGraphicsMenu(
-        module, g_graphicsMenuItems, sizeof(g_graphicsMenuItems),
-        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&WidescreenMenuSelect)),
-        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&FarViewMenuSelect)), g_graphicsMenu, withClientRow,
-        clientHandler);
+        module, g_graphicsMenuItems, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&WidescreenMenuSelect)),
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&FarViewMenuSelect)), g_graphicsMenu);
     if (relocated != GraphicsMenuCheck::Ok || !g_graphicsMenu.applied) {
         LOG_WARN("Options menu: menu 19 changed during the install (%s); the graphics menu is left unchanged",
                  GraphicsMenuCheckToString(relocated));
         rr95::RemoveHook(g_site_FUN_0045b930, g_hostModule);
         g_orig_FUN_0045b930 = nullptr;
-        rr95::modapi::SetItemTextDetourInstalled(false);
-        return false;
+        return;
     }
-    g_graphicsMenuHasClientRow = withClientRow;
-    LOG_INFO("Options menu: graphics menu relocated to 0x%08X with %d items (Widescreen in slot 5 showing %s, "
-             "setting %s from %s; Far view in slot 6 showing %s, %d segments and distance fade %s from %s; "
-             "mod API client row: %s)",
-             static_cast<unsigned>(reinterpret_cast<uintptr_t>(g_graphicsMenuItems)),
-             RelocatedGraphicsMenuCount(withClientRow), g_menuWidescreenOn.load() ? "On" : "Off",
-             DescribeWidescreenSetting(widescreen.setting).c_str(), WidescreenSettingSourceToString(widescreen.source),
-             g_menuFarViewOn.load() ? "On" : "Off", farView.drawSegments, farView.distanceFade ? "on" : "off",
-             WidescreenSettingSourceToString(farView.source), withClientRow ? "yes" : "no");
-    return true;
+    LOG_INFO("Options menu: graphics menu relocated to 0x%08X with %u items (Widescreen in slot 5 showing %s, "
+             "setting %s from %s; Far view in slot 6 showing %s, %d segments and distance fade %s from %s)",
+             static_cast<unsigned>(reinterpret_cast<uintptr_t>(g_graphicsMenuItems)), kRelocatedGraphicsMenuCount,
+             g_menuWidescreenOn.load() ? "On" : "Off", DescribeWidescreenSetting(widescreen.setting).c_str(),
+             WidescreenSettingSourceToString(widescreen.source), g_menuFarViewOn.load() ? "On" : "Off",
+             farView.drawSegments, farView.distanceFade ? "on" : "off", WidescreenSettingSourceToString(farView.source));
 }
 
 static void RemoveGraphicsMenuItems(HMODULE hostModule) {
     RestoreGraphicsMenu(reinterpret_cast<uint8_t*>(hostModule), g_graphicsMenu);
     rr95::RemoveHook(g_site_FUN_0045b930, hostModule);
     g_orig_FUN_0045b930 = nullptr;
-    g_graphicsMenuHasClientRow = false;
-    ResetGraphicsMenuInstall(g_graphicsMenuInstall);
-    rr95::modapi::SetItemTextDetourInstalled(false);
-    rr95::modapi::SetGraphicsMenuState(
-        rr95::modapi::NextGraphicsMenuState(rr95::modapi::GraphicsMenuState(), rr95::modapi::GraphicsMenuEvent::Removed));
 }
 
 // First 6 bytes at 0x0043f580 in both original and patched exes:
@@ -1427,9 +1358,7 @@ bool InstallHooks(ExeBuild build) {
             LOG_INFO("Widescreen: effective setting %s (source: %s)",
                      DescribeWidescreenSetting(effective.setting).c_str(),
                      WidescreenSettingSourceToString(effective.source));
-            RequestGraphicsMenuInstall(g_graphicsMenuInstall);  // built at the game's first menu frame
-            rr95::modapi::SetGraphicsMenuState(rr95::modapi::NextGraphicsMenuState(
-                rr95::modapi::GraphicsMenuState(), rr95::modapi::GraphicsMenuEvent::InstallWithMenu));
+            InstallGraphicsMenuItems();
             if (cfg.drawSegmentsAdjusted) {
                 LOG_WARN("[World] DrawSegments is outside %d..%d or not a number; using %d",
                          rr95::kEngineDrawSegments, rr95::kMaxDrawSegments, cfg.drawSegments);
@@ -1448,14 +1377,6 @@ bool InstallHooks(ExeBuild build) {
         InstallSaveHooks();
     } else {
         LOG_INFO("[Save] Enabled=0: original save/open dialogs, no save message");
-    }
-
-    if (!GraphicsMenuRowSlotOpen(g_graphicsMenuInstall)) {
-        // The graphics menu will never be built (GpuWorld off or a required hook failed), so no
-        // mod API client can add its row any more.
-        rr95::modapi::CloseGraphicsMenuRowSlot();
-        rr95::modapi::SetGraphicsMenuState(rr95::modapi::NextGraphicsMenuState(
-            rr95::modapi::GraphicsMenuState(), rr95::modapi::GraphicsMenuEvent::InstallWithoutMenu));
     }
 
     LOG_INFO("Hooks on FUN_0046e630, FUN_0046ded0, and FUN_00460b00 installed successfully");

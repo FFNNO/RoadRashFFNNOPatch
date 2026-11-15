@@ -13,21 +13,6 @@ struct LetterboxViewport {
 
 LetterboxViewport ComputeLetterboxViewport(int srcW, int srcH, int clientW, int clientH);
 
-// Mod API overlay layer (rr95-music-standalone S1): a client layer is expressed in the game's 640x480
-// coordinates and mapped into the letterboxed image, with the same integer truncation the engine's
-// own coordinate scaling uses (x * viewport.width / 640).
-constexpr int kOverlayGameWidth = 640;
-constexpr int kOverlayGameHeight = 480;
-
-struct OverlayRect {
-    int x;
-    int y;
-    int width;
-    int height;
-};
-
-OverlayRect MapOverlayRectToClient(const LetterboxViewport& viewport, int x, int y, int width, int height);
-
 struct PresenterFailureState {
     int failureCount = 0;
     uint64_t firstFailureMs = 0;

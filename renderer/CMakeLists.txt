@@ -30,7 +30,6 @@ add_library(ddraw SHARED
   src/overlay_text.cpp
   src/widescreen.cpp
   src/options_menu.cpp
-  src/mod_api.cpp
   src/hud_icons.cpp
   src/draw_distance.cpp
   src/ddraw.def
@@ -60,7 +59,6 @@ add_executable(hook_test
   src/overlay_text.cpp
   src/widescreen.cpp
   src/options_menu.cpp
-  src/mod_api.cpp
   src/hud_icons.cpp
   src/draw_distance.cpp
 )
