@@ -2,12 +2,12 @@
 ; Build with installer\build.bat (builds ddraw.dll first) or:
 ;   ISCC.exe [/DAppVersion=x.y.z] installer\RoadRashFFNNOPatch.iss
 ; Silent install example:
-;   RoadRashFFNNOPatch-Setup-0.1.0.exe /VERYSILENT /CURRENTUSER /DIR="C:\...\RoadRash"
+;   RoadRashFFNNOPatch-Setup-0.1.4.exe /VERYSILENT /CURRENTUSER /DIR="C:\...\RoadRash"
 ;     /TASKS="gpuworld,save,texturepack" /PACKDIR="D:\texture-pack"
 ; The HD texture pack is never bundled: it is derived from the game's art.
 
 #ifndef AppVersion
-  #define AppVersion "0.1.0"
+  #define AppVersion "0.1.4"
 #endif
 #define AppName "Road Rash 95 FFNNO Patch"
 #define AppURL "https://github.com/FFNNO/RoadRashFFNNOPatch"

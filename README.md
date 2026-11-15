@@ -58,7 +58,7 @@ Existing `ddraw.dll`, `rr95gpu.ini` and `texture-pack\` are kept as `*.pre-ffnno
 
 Some antivirus tools may flag the proxy `ddraw.dll`, because it patches the game's code in memory. It does not modify any game file.
 
-Silent install, for example: `RoadRashFFNNOPatch-Setup-0.1.3.exe /VERYSILENT /CURRENTUSER /DIR="<game folder>" /TASKS="gpuworld,save,texturepack" /PACKDIR="<pack folder>"`. To test the installer without touching your game, run `python -I installer/tests/test_installer.py`. It installs into temporary fake game folders and uninstalls again.
+Silent install, for example: `RoadRashFFNNOPatch-Setup-0.1.4.exe /VERYSILENT /CURRENTUSER /DIR="<game folder>" /TASKS="gpuworld,save,texturepack" /PACKDIR="<pack folder>"`. To test the installer without touching your game, run `python -I installer/tests/test_installer.py`. It installs into temporary fake game folders and uninstalls again.
 
 ## 1. Requirements
 
@@ -143,7 +143,7 @@ Dump=0              ; 1 = save every new texture the game draws to texture-dump/
 
 ### In-game options
 
-With `GpuWorld=1` the game's "Opciones Gráficas y de Sonido" (graphics and sound options) menu has 9 items with wider buttons, including two On/Off items labelled in the game's language:
+With `GpuWorld=1` the game's "Opciones Gráficas y de Sonido" (graphics and sound options) menu has 9 items with wider buttons (10 when an add-on adds its row, see [Mod API for add-on DLLs](#mod-api-for-add-on-dlls)), including two On/Off items labelled in the game's language:
 
 | Item (English / Spanish) | Registry value | On | Off |
 |---|---|---|---|
@@ -230,6 +230,29 @@ Git-ignored local folders: `original/`, `patched/`, `ghidra/`, `ghidra-home/`, `
 - **Diagnostic log lines:** with `GpuWorld=1`, `rr95gpu.log` writes `ThinQuads:` (why thin far rows were kept or culled) and `RoadSlices:` (road slices dropped by the engine's horizon rule) every 5 seconds during a race, and `Draw distance: <n> segments for this race` at race start.
 - **The game closes by itself:** the last lines of `rr95gpu.log` start with `Crash:` and give the address and the code that called it. Please attach the log to an issue.
 
+## Mod API for add-on DLLs
+
+Since v0.1.4, `ddraw.dll` exports `RR95_GetModApi`, so other DLLs can add features on top of this mod without patching the same game code. The contract is the self-contained C/C++ header [`renderer/src/rr95_mod_api.h`](renderer/src/rr95_mod_api.h).
+
+**What it offers.** A client can register:
+
+- a callback once per race frame and once per menu frame;
+- one overlay layer (premultiplied BGRA in 640x480 game coordinates), drawn above the HUD and below the save/load message, scaled like the game image;
+- one extra row in the graphics options menu, after this mod's own rows and before "Ya está", with its own select handler and label;
+- an item text provider for menu items this mod does not own.
+
+It can also read whether this mod's hooks are installed (`getHookState`), whether this mod owns the graphics menu (`getMenuState`), and whether the item text hook is in place (`isItemTextDetourInstalled`). The menu row and the item text work only with `GpuWorld=1`, because only then does this mod rebuild the graphics menu.
+
+**Version 1.** `RR95_GetModApi(1)` returns a static table; any other version returns null. The table starts with `version` and `size`; a client checks both before it uses a field. `getMenuState` and `isItemTextDetourInstalled` were appended to version 1, so a client checks `size` before it calls them.
+
+**When to call it.** Register on the game thread, from the game's first call into the add-on's own exported function (for example its `DirectSoundCreate`). Never call it from `DllMain`, which runs under the loader lock. This mod builds its graphics menu at the game's first menu frame, and a menu row added after that returns `RR95_STATUS_TOO_LATE`. Callbacks run on the game thread only, and never after this DLL is unloaded.
+
+**One client per capability.** Each capability has one slot. A second registration of the same capability returns `RR95_STATUS_REJECTED`. Registering null clears the slot while it is still open.
+
+Without an add-on, the mod behaves as in v0.1.3. The only difference is that the graphics menu is now built at the first menu frame instead of when the hooks are installed, so an add-on can add its row first.
+
+**Add-on: Road Rash Music Player.** [Road Rash Music Player](https://github.com/FFNNO/RoadRashMusicPlayer) uses this API for its menu row and on-screen display. It needs v0.1.4 or later of this mod to run together with it.
+
 ## Known issues
 
 - **Missing roadside ground textures on some PCs.** Some players report roadside ground without textures. It has not been reproduced yet and is under investigation. To help, open an issue with:
@@ -237,3 +260,7 @@ Git-ignored local folders: `original/`, `patched/`, `ghidra/`, `ghidra-home/`, `
   - your GPU model and driver version;
   - whether it also happens in software mode: press Scroll Lock in race to switch between the GPU world and the original renderer and compare.
 - **Gaps in the far road over crests.** On some hills, mostly in city sections, thin bands of sky can show between far road rows for a moment. This is under investigation.
+
+## Changelog
+
+**Mod API for add-on DLLs (v0.1.4).** `ddraw.dll` now exports `RR95_GetModApi` (version 1), which add-on DLLs use to register race and menu frame callbacks, an overlay layer, an item text provider and one row in the graphics options menu (see [Mod API for add-on DLLs](#mod-api-for-add-on-dlls)). The first add-on is [Road Rash Music Player](https://github.com/FFNNO/RoadRashMusicPlayer). To leave room for an add-on's row, the graphics menu is now built at the game's first menu frame instead of at hook install. Without an add-on, the mod behaves as in v0.1.3, including its mid-race crash fixes and crash log.
